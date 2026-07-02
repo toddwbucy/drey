@@ -16,8 +16,10 @@ use rand::Rng;
 
 /// Decision-point exploration budget for `shortest_path` (M3 finding F1): a
 /// consumer at a decision point bounds the search to keep worst-case latency
-/// inside its budget, accepting `None` when a path is farther than this. Chosen
-/// so `shortest_path` p95 stays under its 10 ms budget at representative scale.
+/// under control, accepting `None` when the target is farther than this many
+/// node expansions. A representative decision-point value; it does not by itself
+/// guarantee any particular p95 (a single mega-hub expansion can still be
+/// expensive — see `specs/shortest-path-bound.md`).
 pub const SHORTEST_PATH_MAX_STEPS: usize = 512;
 
 /// Direction for neighbor/traversal ops.

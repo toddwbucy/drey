@@ -175,20 +175,22 @@ fn shortest_path_respects_step_budget() {
     g.add_edge(b, c, knows(), 1.0, props(&[])).unwrap();
     g.add_edge(c, d, knows(), 1.0, props(&[])).unwrap();
 
-    // Budget of 1 expansion can't reach d → None (not an error).
-    let bounded = g
-        .shortest_path(a, d, ShortestPathOptions { max_steps: Some(1), ..Default::default() })
+    // Reaching d requires expanding a, b, c (3 expansions); then d is popped and
+    // returned. So max_steps=3 is the exact boundary: it succeeds, and one less
+    // (2) fails. The tight pair catches a `>` → `>=` off-by-one regression.
+    let too_small = g
+        .shortest_path(a, d, ShortestPathOptions { max_steps: Some(2), ..Default::default() })
         .unwrap();
-    assert!(bounded.is_none(), "one expansion cannot reach a 3-hop target");
+    assert!(too_small.is_none(), "2 expansions cannot reach a 3-expansion target");
 
-    // A sufficient budget finds the same path an unbounded search does.
-    let generous = g
-        .shortest_path(a, d, ShortestPathOptions { max_steps: Some(100), ..Default::default() })
+    let exact = g
+        .shortest_path(a, d, ShortestPathOptions { max_steps: Some(3), ..Default::default() })
         .unwrap()
         .unwrap();
+    // The bounded result at the exact boundary matches the default (unbounded) search.
     let unbounded = g.shortest_path(a, d, ShortestPathOptions::default()).unwrap().unwrap();
-    assert_eq!(generous.nodes, vec![a, b, c, d]);
-    assert_eq!(generous.nodes, unbounded.nodes);
+    assert_eq!(exact.nodes, vec![a, b, c, d]);
+    assert_eq!(exact.nodes, unbounded.nodes);
 
     // The bound applies to weighted mode too.
     let weighted_bounded = g

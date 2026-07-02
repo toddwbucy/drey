@@ -1,10 +1,14 @@
 //! Neighbor listing, bounded traversal, and shortest path (PRD §9.3).
 //!
 //! All three run entirely against the in-memory adjacency indexes (PRD §10.1)
-//! and are internally deterministic: neighbors are expanded in ascending edge-id
-//! order, so with a `max_paths` cap the *set* of returned paths is stable across
-//! runs (the property the harness's counter repeatability depends on, spec
-//! §4.1 / §5.4).
+//! and are internally deterministic. The ordering contract is fixed but not a
+//! global edge-id sort: neighbors are yielded in `(edge_type, edge_id)` order
+//! (the adjacency is a `BTreeMap` over edge types, each type's edge list kept
+//! id-sorted), and for `Direction::Both` all outbound steps precede all inbound.
+//! That order is stable across runs, so with a `max_paths` cap the returned
+//! paths are reproducible — the property the harness's counter repeatability
+//! depends on (spec §4.1 / §5.4). No public API guarantees a particular order;
+//! only that it is deterministic.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -211,7 +215,7 @@ impl Graph {
     }
 
     /// Bounded n-hop traversal returning paths (PRD §9.3). Depth-first with
-    /// ascending edge-id expansion; stops at `max_hops` and at `max_paths`.
+    /// `(edge_type, edge_id)`-ordered expansion; stops at `max_hops` and at `max_paths`.
     pub fn traverse(&self, from: NodeId, mut opts: TraversalOptions) -> Result<Vec<Path>> {
         if !self.store.nodes.contains_key(&from.0) {
             return Err(Error::NodeNotFound(from));

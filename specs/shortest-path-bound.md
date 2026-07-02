@@ -1,8 +1,8 @@
 # Spec: Bounded `shortest_path` (M3 finding F1)
 
-Status: v0.1, 2026-07-02. Implements the revision recommended by
-`m3-findings.md` F1, against PRD §9.3 (`shortest_path` / `ShortestPathOptions`).
-The PRD governs on any conflict.
+Status: v0.2, 2026-07-02. Implemented — the first v0.2 change. Realizes the
+revision recommended by `m3-findings.md` F1, against PRD §9.3 (`shortest_path` /
+`ShortestPathOptions`). The PRD governs on any conflict.
 
 ## Problem (from M3)
 
