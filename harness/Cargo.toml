@@ -1,0 +1,15 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false # throwaway M0 apparatus — never published (spec §5.1, §2)
+description = "M0 fixture generator and measurement harness for drey. Test apparatus, not part of the publishable crate."
+
+[dependencies]
+drey = { path = "../drey" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+rand_xoshiro = "0.6"
+sha2 = "0.10"

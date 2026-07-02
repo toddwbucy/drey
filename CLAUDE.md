@@ -4,24 +4,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**Pre-code.** This directory contains one artifact: `drey-PRD-v0_8.md`, the
-authoritative product spec. There is no Cargo project, no source, and no git repository
-yet. The crate is named `drey` (renamed 2026-07-02 from the working name `weaver-graph`).
-Read the PRD in full before doing any design or implementation work — it is the single
-source of truth, and it records not just decisions but the rationale and the rejected
-alternatives.
+**v0.1 implemented.** `drey-PRD-v0_8.md` is the authoritative spec; `specs/` holds the
+implementation specs beneath it. The crate is named `drey` (renamed 2026-07-02 from the
+working name `weaver-graph`). Read the PRD before structural work — it records not just
+decisions but their rationale and the rejected alternatives.
 
-`specs/` holds implementation specs that supply the "how" beneath the PRD's "what", one
-per concern, keyed to milestones (`m0-fixture-harness.md` first). Specs cite the PRD
-sections they implement and mark any call the PRD left open as **[spec decision]** with
-rationale. The PRD governs on any conflict. Before implementing M0 apparatus, read
-`specs/m0-implementation-checklist.md` alongside the spec — it enumerates the defaults an
-implementing session is likely to reach for that would silently violate the contract.
+The milestones M1–M5 are built and tested; M0/M3 apparatus runs. Remaining budget-gate
+overruns at representative scale are documented in `specs/m3-findings.md` (the PRD §16.3
+"written reason to revise" exit), and the M5 query-layer decision is in
+`specs/m5-query-seam-decision.md` (defer Cypher; ship the seam).
 
-When the crate is scaffolded, it will be a standard single Cargo crate (`cargo build`,
-`cargo test`, `cargo test <name>` for one test). When initializing git, follow the
-workspace convention in `/home/todd/git/CLAUDE.md`: personal projects push via the
-`github-toddwbucy:` SSH host alias.
+### Workspace layout
+- `drey/` — the publishable crate. Single crate, `serde` its only dependency.
+  - `types` `error` `config` `mutation` — data model and API-support types (PRD §7, §9, §19).
+  - `store` `interner` — memory-primary graph + §8 index set (nested `node → edge_type →
+    [edge]` adjacency, ordered scalar property index).
+  - `graph` — public mutation API; every mutation logs one `Mutation` for the WAL.
+  - `query` `traverse` `similarity` — reads (PRD §9.3, §9.4).
+  - `export` (`GraphFeatureExport`, M4) `read` (`PropertyGraphRead` seam, M5).
+  - `persist/` — WAL + snapshot durability, hand-rolled binary codec (M2).
+- `harness/` — **throwaway M0 apparatus, `publish = false`, never a `drey` dependency**
+  (the dependency arrow points harness → drey only). Fixture generator, workload plans,
+  `GraphDriver` (`NaiveDriver`/`DreyDriver`), runner, JSON output; `generate` + `bench` bins.
+
+### Commands
+- Build / test everything: `cargo build`, `cargo test`. One test: `cargo test <name>`.
+- Generate a fixture: `cargo run --release -p harness --bin generate -- <small|representative|stress> <low|medium|high> <seed> <out_dir>`.
+- Run the budget gate: `cargo run --release -p harness --bin bench -- <fixture_dir> <drey|naive> [per_bucket]` — emits one run-JSON document; exits non-zero if a real-driver bucket fails its budget. **Measure in `--release`**; debug tails are meaningless.
+
+Git: personal project, pushes via the `github-toddwbucy:` SSH host alias (workspace
+convention in `/home/todd/git/CLAUDE.md`). Work for v0.1 lives on `feat/drey-v0.1`.
+
+Before implementing more M0 apparatus, read `specs/m0-implementation-checklist.md`
+alongside the spec — it enumerates the defaults a session is likely to reach for that
+would silently violate the contract.
 
 ## What this project is
 
