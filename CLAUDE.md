@@ -11,6 +11,13 @@ Read the PRD in full before doing any design or implementation work — it is th
 source of truth, and it records not just decisions but the rationale and the rejected
 alternatives.
 
+`specs/` holds implementation specs that supply the "how" beneath the PRD's "what", one
+per concern, keyed to milestones (`m0-fixture-harness.md` first). Specs cite the PRD
+sections they implement and mark any call the PRD left open as **[spec decision]** with
+rationale. The PRD governs on any conflict. Before implementing M0 apparatus, read
+`specs/m0-implementation-checklist.md` alongside the spec — it enumerates the defaults an
+implementing session is likely to reach for that would silently violate the contract.
+
 When the crate is scaffolded, it will be a standard single Cargo crate (`cargo build`,
 `cargo test`, `cargo test <name>` for one test). When initializing git, follow the
 workspace convention in `/home/todd/git/CLAUDE.md`: personal projects push via the
