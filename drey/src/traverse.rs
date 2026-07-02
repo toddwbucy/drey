@@ -124,28 +124,31 @@ impl Graph {
         min_weight: Option<f32>,
     ) -> Vec<(u64, u64)> {
         let mut out: Vec<(u64, u64)> = Vec::new();
-        let mut push_from = |adj: &HashMap<(u64, u32), Vec<u64>>, take_to: bool| {
-            for ((n, etype), edges) in adj {
-                if *n != node {
-                    continue;
-                }
-                if let Some(types) = type_ids {
-                    if !types.contains(etype) {
-                        continue;
-                    }
-                }
-                for e in edges {
-                    let rec = &self.store.edges[e];
-                    if let Some(min) = min_weight {
-                        if rec.weight < min {
+        // O(degree): look up the node's own adjacency, then only the requested
+        // edge types — never a scan of the whole index.
+        let mut push_from =
+            |adj: &HashMap<u64, std::collections::BTreeMap<u32, Vec<u64>>>, take_to: bool| {
+                let Some(by_type) = adj.get(&node) else {
+                    return;
+                };
+                for (etype, edges) in by_type {
+                    if let Some(types) = type_ids {
+                        if !types.contains(etype) {
                             continue;
                         }
                     }
-                    let other = if take_to { rec.to } else { rec.from };
-                    out.push((*e, other));
+                    for e in edges {
+                        let rec = &self.store.edges[e];
+                        if let Some(min) = min_weight {
+                            if rec.weight < min {
+                                continue;
+                            }
+                        }
+                        let other = if take_to { rec.to } else { rec.from };
+                        out.push((*e, other));
+                    }
                 }
-            }
-        };
+            };
         match direction {
             Direction::Outbound => push_from(&self.store.out_adj, true),
             Direction::Inbound => push_from(&self.store.in_adj, false),

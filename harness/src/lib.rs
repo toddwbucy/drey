@@ -12,13 +12,11 @@
 //! [`rng`] and [`canonical`].
 
 pub mod canonical;
+pub mod driver;
+pub mod fixture;
+pub mod generator;
+pub mod output;
 pub mod params;
 pub mod rng;
-
-// Landing in subsequent M0 increments, in dependency order:
-//   pub mod manifest;    // manifest.json + checksums
-//   pub mod generator;   // graph, properties, embeddings, self-checks (§3)
-//   pub mod workload;    // deterministic plan generation (§4)
-//   pub mod driver;      // GraphDriver trait, NaiveDriver, DreyDriver stub (§5.1)
-//   pub mod runner;      // measurement loop, nearest-rank percentiles (§5.2)
-//   pub mod output;      // run JSON schema (§5.3)
+pub mod runner;
+pub mod workload;

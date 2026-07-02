@@ -57,10 +57,12 @@ pub(crate) struct Store {
     pub(crate) embedding_dim: HashMap<u32, Option<usize>>,
 
     // ---- Index set (PRD §8) ----
-    /// Outbound adjacency: `(from_node, edge_type) -> [edge_id]`.
-    pub(crate) out_adj: HashMap<(u64, u32), Vec<u64>>,
-    /// Inbound adjacency: `(to_node, edge_type) -> [edge_id]`.
-    pub(crate) in_adj: HashMap<(u64, u32), Vec<u64>>,
+    /// Outbound adjacency: `from_node -> edge_type -> [edge_id]`. Nested so a
+    /// node's edges resolve in O(degree), and a type-filtered lookup is a single
+    /// inner-map hit — never a scan of the whole index.
+    pub(crate) out_adj: HashMap<u64, BTreeMap<u32, Vec<u64>>>,
+    /// Inbound adjacency: `to_node -> edge_type -> [edge_id]`.
+    pub(crate) in_adj: HashMap<u64, BTreeMap<u32, Vec<u64>>>,
     /// Node type → node ids.
     pub(crate) nodes_by_type: HashMap<u32, Vec<u64>>,
     /// Edge type → edge ids.
@@ -173,8 +175,8 @@ impl Store {
         let id = self.next_edge_id;
         self.next_edge_id += 1;
 
-        self.out_adj.entry((from.0, type_id)).or_default().push(id);
-        self.in_adj.entry((to.0, type_id)).or_default().push(id);
+        adj_insert(&mut self.out_adj, from.0, type_id, id);
+        adj_insert(&mut self.in_adj, to.0, type_id, id);
         self.edges_by_type.entry(type_id).or_default().push(id);
         self.edges.insert(
             id,
@@ -197,8 +199,8 @@ impl Store {
 
     pub(crate) fn remove_edge(&mut self, edge: EdgeId) -> Result<()> {
         let rec = self.edges.remove(&edge.0).ok_or(Error::EdgeNotFound(edge))?;
-        remove_from_vec(&mut self.out_adj, (rec.from, rec.edge_type), edge.0);
-        remove_from_vec(&mut self.in_adj, (rec.to, rec.edge_type), edge.0);
+        adj_remove(&mut self.out_adj, rec.from, rec.edge_type, edge.0);
+        adj_remove(&mut self.in_adj, rec.to, rec.edge_type, edge.0);
         remove_from_vec(&mut self.edges_by_type, rec.edge_type, edge.0);
         Ok(())
     }
@@ -226,16 +228,16 @@ impl Store {
         Ok(())
     }
 
-    /// Every edge id incident to a node, in either direction.
+    /// Every edge id incident to a node, in either direction. O(degree).
     pub(crate) fn incident_edges(&self, node: u64) -> Vec<u64> {
         let mut out = Vec::new();
-        for ((n, _), edges) in &self.out_adj {
-            if *n == node {
+        if let Some(types) = self.out_adj.get(&node) {
+            for edges in types.values() {
                 out.extend_from_slice(edges);
             }
         }
-        for ((n, _), edges) in &self.in_adj {
-            if *n == node {
+        if let Some(types) = self.in_adj.get(&node) {
+            for edges in types.values() {
                 out.extend_from_slice(edges);
             }
         }
@@ -323,8 +325,8 @@ impl Store {
 
     /// Insert an edge with an explicit id during load.
     pub(crate) fn insert_edge_raw(&mut self, id: u64, rec: EdgeRecord) {
-        self.out_adj.entry((rec.from, rec.edge_type)).or_default().push(id);
-        self.in_adj.entry((rec.to, rec.edge_type)).or_default().push(id);
+        adj_insert(&mut self.out_adj, rec.from, rec.edge_type, id);
+        adj_insert(&mut self.in_adj, rec.to, rec.edge_type, id);
         self.edges_by_type.entry(rec.edge_type).or_default().push(id);
         self.edges.insert(id, rec);
     }
@@ -332,11 +334,15 @@ impl Store {
     /// After raw inserts, adjacency/type buckets are in insertion order. Sort
     /// them so load order does not affect query result order (determinism).
     pub(crate) fn sort_indexes(&mut self) {
-        for v in self.out_adj.values_mut() {
-            v.sort_unstable();
+        for types in self.out_adj.values_mut() {
+            for v in types.values_mut() {
+                v.sort_unstable();
+            }
         }
-        for v in self.in_adj.values_mut() {
-            v.sort_unstable();
+        for types in self.in_adj.values_mut() {
+            for v in types.values_mut() {
+                v.sort_unstable();
+            }
         }
         for v in self.nodes_by_type.values_mut() {
             v.sort_unstable();
@@ -377,12 +383,32 @@ impl Store {
 }
 
 /// Remove a value from a `HashMap<K, Vec<u64>>` bucket, dropping the bucket if
-/// it empties. Used for adjacency and type indexes.
+/// it empties. Used for the type indexes.
 fn remove_from_vec<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Vec<u64>>, key: K, value: u64) {
     if let Some(v) = map.get_mut(&key) {
         v.retain(|x| *x != value);
         if v.is_empty() {
             map.remove(&key);
+        }
+    }
+}
+
+/// Insert an edge id into a nested `node -> edge_type -> [edge_id]` adjacency.
+fn adj_insert(adj: &mut HashMap<u64, BTreeMap<u32, Vec<u64>>>, node: u64, etype: u32, edge: u64) {
+    adj.entry(node).or_default().entry(etype).or_default().push(edge);
+}
+
+/// Remove an edge id from a nested adjacency, pruning empty levels.
+fn adj_remove(adj: &mut HashMap<u64, BTreeMap<u32, Vec<u64>>>, node: u64, etype: u32, edge: u64) {
+    if let Some(types) = adj.get_mut(&node) {
+        if let Some(v) = types.get_mut(&etype) {
+            v.retain(|x| *x != edge);
+            if v.is_empty() {
+                types.remove(&etype);
+            }
+        }
+        if types.is_empty() {
+            adj.remove(&node);
         }
     }
 }
