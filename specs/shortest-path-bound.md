@@ -77,3 +77,16 @@ With this in place, a consumer running `shortest_path` at a decision point sets
 `max_steps` to keep worst-case latency inside its budget, trading completeness
 (a `None` when the path is beyond the budget) for a bounded response — which is
 the correct posture for a hot-path graph consultation (PRD §16.1).
+
+**Residual (separate from F1).** `max_steps` bounds the *number* of expansions,
+not the cost of any single one. On the synthetic `representative` fixture the top
+Zipf node has ~90k incident edges (it is an endpoint of ~18% of all edges), and
+one expansion of it costs ~10 ms because `steps()` allocates and sorts that whole
+adjacency. So `max_steps` alone cannot bring the representative `shortest_path`
+p95 under 10 ms — the harness confirms it passes at `small` scale (~0.3 ms) but
+not `representative`. Closing that is a distinct optimization: drop the redundant
+per-call sort in `steps()` (the `(edge_type, edge_id)` iteration order is already
+deterministic without it), making a hub expansion O(degree) instead of
+O(degree·log degree). It is also partly a synthetic-fixture artifact — that Zipf
+concentration is more extreme than a captured agent graph is likely to be (ties
+to M3 F2 and the provisional-budget caveat). Both are tracked, not fixed here.

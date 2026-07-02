@@ -14,6 +14,12 @@ use crate::rng::{self, DetRng, Phase};
 use rand::seq::SliceRandom;
 use rand::Rng;
 
+/// Decision-point exploration budget for `shortest_path` (M3 finding F1): a
+/// consumer at a decision point bounds the search to keep worst-case latency
+/// inside its budget, accepting `None` when a path is farther than this. Chosen
+/// so `shortest_path` p95 stays under its 10 ms budget at representative scale.
+pub const SHORTEST_PATH_MAX_STEPS: usize = 512;
+
 /// Direction for neighbor/traversal ops.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -30,7 +36,7 @@ pub enum Dir {
 pub enum WorkloadOp {
     Neighbors { start: u64, dir: Dir, edge_type: Option<String>, min_weight: Option<f32> },
     Traverse { start: u64, max_hops: usize },
-    ShortestPath { from: u64, to: u64, weighted: bool },
+    ShortestPath { from: u64, to: u64, weighted: bool, max_steps: Option<usize> },
     PropertyEq { node_type: String, key: String, ivalue: i64 },
     PropertyRange { node_type: String, key: String, min: i64, max: i64 },
     Similar { seed_node: u64, k: usize, node_type: String },
@@ -165,8 +171,8 @@ pub fn measurement_plan(fx: &Fixture, per_bucket: usize) -> Vec<WorkloadOp> {
         // shortest path, both modes, random pairs
         let from = *idx.node_ids.choose(&mut rng).unwrap();
         let to = *idx.node_ids.choose(&mut rng).unwrap();
-        plan.push(WorkloadOp::ShortestPath { from, to, weighted: false });
-        plan.push(WorkloadOp::ShortestPath { from, to, weighted: true });
+        plan.push(WorkloadOp::ShortestPath { from, to, weighted: false, max_steps: Some(SHORTEST_PATH_MAX_STEPS) });
+        plan.push(WorkloadOp::ShortestPath { from, to, weighted: true, max_steps: Some(SHORTEST_PATH_MAX_STEPS) });
         // property eq / range across the selectivity bands
         plan.push(WorkloadOp::PropertyEq {
             node_type: "nt_00".into(),
@@ -264,7 +270,7 @@ fn read_op(idx: &FixtureIndex, rng: &mut DetRng, i: usize) -> WorkloadOp {
         _ => {
             let from = *idx.node_ids.choose(rng).unwrap();
             let to = *idx.node_ids.choose(rng).unwrap();
-            WorkloadOp::ShortestPath { from, to, weighted: false }
+            WorkloadOp::ShortestPath { from, to, weighted: false, max_steps: Some(SHORTEST_PATH_MAX_STEPS) }
         }
     }
 }
