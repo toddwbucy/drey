@@ -1,10 +1,14 @@
 //! Neighbor listing, bounded traversal, and shortest path (PRD §9.3).
 //!
 //! All three run entirely against the in-memory adjacency indexes (PRD §10.1)
-//! and are internally deterministic: neighbors are expanded in ascending edge-id
-//! order, so with a `max_paths` cap the *set* of returned paths is stable across
-//! runs (the property the harness's counter repeatability depends on, spec
-//! §4.1 / §5.4).
+//! and are internally deterministic. The ordering contract is fixed but not a
+//! global edge-id sort: neighbors are yielded in `(edge_type, edge_id)` order
+//! (the adjacency is a `BTreeMap` over edge types, each type's edge list kept
+//! id-sorted), and for `Direction::Both` all outbound steps precede all inbound.
+//! That order is stable across runs, so with a `max_paths` cap the returned
+//! paths are reproducible — the property the harness's counter repeatability
+//! depends on (spec §4.1 / §5.4). No public API guarantees a particular order;
+//! only that it is deterministic.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -106,6 +110,11 @@ pub struct ShortestPathOptions {
     pub edge_types: Vec<EdgeType>,
     pub min_weight: Option<f32>,
     pub cost_mode: CostMode,
+    /// Optional exploration budget: the maximum number of nodes the search may
+    /// expand before giving up and returning `None`. Bounds worst-case latency
+    /// on large or disconnected graphs, where an unbounded search can walk an
+    /// entire component (M3 finding F1). `None` (the default) is unbounded.
+    pub max_steps: Option<usize>,
 }
 
 /// A path: alternating nodes and the edges taken between them
@@ -119,7 +128,8 @@ pub struct Path {
 }
 
 impl Graph {
-    /// Directed steps out of `node`, in ascending edge-id order, after applying
+    /// Directed steps out of `node`, in deterministic `(edge_type, edge_id)`
+    /// order (outbound before inbound for `Both`), after applying
     /// the edge-type and weight filters. `(edge_id, other_endpoint)`.
     pub(crate) fn steps(
         &self,
@@ -162,7 +172,12 @@ impl Graph {
                 push_from(&self.store.in_adj, false);
             }
         }
-        out.sort_unstable(); // ascending edge id → deterministic expansion
+        // Already deterministic without a sort: the adjacency yields
+        // `(edge_type, edge_id)` order (BTreeMap over types, each type's edge
+        // list kept id-sorted), and for `Both` all outbound steps precede all
+        // inbound. Dropping the sort makes expanding a high-degree hub O(degree)
+        // instead of O(degree·log degree) — the cost that dominated the M3
+        // `shortest_path` / hub-`neighbors` tails.
         out
     }
 
@@ -200,7 +215,7 @@ impl Graph {
     }
 
     /// Bounded n-hop traversal returning paths (PRD §9.3). Depth-first with
-    /// ascending edge-id expansion; stops at `max_hops` and at `max_paths`.
+    /// `(edge_type, edge_id)`-ordered expansion; stops at `max_hops` and at `max_paths`.
     pub fn traverse(&self, from: NodeId, mut opts: TraversalOptions) -> Result<Vec<Path>> {
         if !self.store.nodes.contains_key(&from.0) {
             return Err(Error::NodeNotFound(from));
@@ -304,9 +319,14 @@ impl Graph {
         let mut prev: HashMap<u64, (u64, u64)> = HashMap::new(); // node -> (prev_node, via_edge)
         let mut seen: HashSet<u64> = HashSet::from([from]);
         let mut q = VecDeque::from([from]);
+        let mut steps = 0usize;
         while let Some(cur) = q.pop_front() {
             if cur == to {
                 return Some(self.reconstruct(from, to, &prev, CostMode::UnweightedHops));
+            }
+            steps += 1;
+            if opts.max_steps.is_some_and(|max| steps > max) {
+                return None; // exploration budget exhausted (M3 F1)
             }
             for (edge, other) in self.steps(cur, opts.direction.into(), type_ids, opts.min_weight) {
                 if seen.insert(other) {
@@ -329,12 +349,17 @@ impl Graph {
         let mut prev: HashMap<u64, (u64, u64)> = HashMap::new();
         let mut heap: BinaryHeap<DijkstraState> =
             BinaryHeap::from([DijkstraState { cost: 0.0, node: from }]);
+        let mut steps = 0usize;
         while let Some(DijkstraState { cost, node }) = heap.pop() {
             if node == to {
                 return Some(self.reconstruct(from, to, &prev, CostMode::WeightedCost));
             }
             if cost > *dist.get(&node).unwrap_or(&f32::INFINITY) {
-                continue;
+                continue; // stale heap entry — not a real expansion, do not count
+            }
+            steps += 1;
+            if opts.max_steps.is_some_and(|max| steps > max) {
+                return None; // exploration budget exhausted (M3 F1)
             }
             for (edge, other) in self.steps(node, opts.direction.into(), type_ids, opts.min_weight) {
                 let w = self.store.edges[&edge].weight.max(0.0);

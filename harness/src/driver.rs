@@ -169,9 +169,10 @@ impl GraphDriver for DreyDriver {
                     .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("paths_returned", paths.len() as u64)])))
             }
-            WorkloadOp::ShortestPath { from, to, weighted } => {
+            WorkloadOp::ShortestPath { from, to, weighted, max_steps } => {
                 let opts = ShortestPathOptions {
                     cost_mode: if *weighted { CostMode::WeightedCost } else { CostMode::UnweightedHops },
+                    max_steps: *max_steps,
                     ..Default::default()
                 };
                 let path = self.g().shortest_path(NodeId(*from), NodeId(*to), opts).map_err(|e| e.to_string())?;
