@@ -124,7 +124,8 @@ pub struct Path {
 }
 
 impl Graph {
-    /// Directed steps out of `node`, in ascending edge-id order, after applying
+    /// Directed steps out of `node`, in deterministic `(edge_type, edge_id)`
+    /// order (outbound before inbound for `Both`), after applying
     /// the edge-type and weight filters. `(edge_id, other_endpoint)`.
     pub(crate) fn steps(
         &self,
@@ -167,7 +168,12 @@ impl Graph {
                 push_from(&self.store.in_adj, false);
             }
         }
-        out.sort_unstable(); // ascending edge id → deterministic expansion
+        // Already deterministic without a sort: the adjacency yields
+        // `(edge_type, edge_id)` order (BTreeMap over types, each type's edge
+        // list kept id-sorted), and for `Both` all outbound steps precede all
+        // inbound. Dropping the sort makes expanding a high-degree hub O(degree)
+        // instead of O(degree·log degree) — the cost that dominated the M3
+        // `shortest_path` / hub-`neighbors` tails.
         out
     }
 

@@ -80,13 +80,22 @@ the correct posture for a hot-path graph consultation (PRD §16.1).
 
 **Residual (separate from F1).** `max_steps` bounds the *number* of expansions,
 not the cost of any single one. On the synthetic `representative` fixture the top
-Zipf node has ~90k incident edges (it is an endpoint of ~18% of all edges), and
-one expansion of it costs ~10 ms because `steps()` allocates and sorts that whole
-adjacency. So `max_steps` alone cannot bring the representative `shortest_path`
-p95 under 10 ms — the harness confirms it passes at `small` scale (~0.3 ms) but
-not `representative`. Closing that is a distinct optimization: drop the redundant
-per-call sort in `steps()` (the `(edge_type, edge_id)` iteration order is already
-deterministic without it), making a hub expansion O(degree) instead of
-O(degree·log degree). It is also partly a synthetic-fixture artifact — that Zipf
-concentration is more extreme than a captured agent graph is likely to be (ties
-to M3 F2 and the provisional-budget caveat). Both are tracked, not fixed here.
+Zipf node has ~90k incident edges (it is an endpoint of ~18% of all edges), so
+one expansion of it is inherently expensive: the search must examine all ~90k
+edges and enqueue all ~90k neighbors. `max_steps` cannot bound that — it caps
+expansions, and a single hub expansion is one expansion. So `shortest_path`
+passes at `small` scale (~0.3 ms) but not `representative` (~16–26 ms p95).
+
+Dropping the redundant per-call sort in `steps()` (this change — the
+`(edge_type, edge_id)` iteration order is already deterministic) removes an
+`O(degree·log degree)` term and is worth keeping, but it is **not** the fix: the
+harness showed it moves the hub-bound p95 only marginally, because the dominant
+cost is the linear edge/neighbor processing, not the sort. Two real mitigations,
+both out of scope here and tracked for later:
+- A **work budget** that counts *edges examined* (not nodes expanded) and returns
+  `None` when exceeded — this would bound latency even through a hub, at the cost
+  of a different bound semantics than `max_steps`.
+- A **less concentrated fixture / a captured workload** — an 18%-on-one-node Zipf
+  is more extreme than a real agent graph is likely to be (M3 F2 and the
+  provisional-budget caveat). The right budget for hub-touching search is a
+  question the captured workload answers, not the synthetic one.
