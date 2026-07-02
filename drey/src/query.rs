@@ -107,6 +107,14 @@ impl Graph {
             }
             ScalarPredicate::Range { min, max } => {
                 use std::ops::Bound;
+                // Inverted bounds (min > max) match nothing. `BTreeMap::range`
+                // panics on inverted bounds, so return empty early — matching the
+                // scan path's behavior.
+                if let (Some(lo), Some(hi)) = (min, max) {
+                    if lo.total_order(hi) == std::cmp::Ordering::Greater {
+                        return out;
+                    }
+                }
                 let lower = min
                     .as_ref()
                     .map(|m| Bound::Included(ScalarKey(m.clone())))

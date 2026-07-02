@@ -74,11 +74,15 @@ fn main() {
         }
     };
 
-    let raw_payload = manifest
-        .checksums
-        .keys()
-        .filter_map(|f| std::fs::metadata(dir.join(f)).ok().map(|m| m.len()))
-        .sum();
+    // Sum the payload file sizes, but never silently drop a file: a metadata
+    // failure would undercount raw_payload_bytes invisibly, so warn per file.
+    let mut raw_payload: u64 = 0;
+    for f in manifest.checksums.keys() {
+        match std::fs::metadata(dir.join(f)) {
+            Ok(m) => raw_payload += m.len(),
+            Err(e) => eprintln!("warning: raw_payload skips {f}: {e}"),
+        }
+    }
 
     let output = RunOutput {
         harness_version: env!("CARGO_PKG_VERSION").into(),

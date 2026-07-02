@@ -224,11 +224,22 @@ fn recovery_snapshot_crash_before_wal_truncation_skips_stale_wal() {
     // Simulate the crash: restore the old-epoch WAL as if truncation never ran.
     fs::write(dir.join("wal.log"), &stale_wal).unwrap();
 
+    let c;
+    {
+        let mut g = Graph::open(&dir, config()).unwrap();
+        // The stale WAL is recognized as older than the snapshot and skipped, so
+        // the decay applies exactly once — weight is 0.5, not 0.25.
+        assert_eq!(g.edge(e).unwrap().unwrap().weight, 0.5);
+        assert!(g.node(b).unwrap().is_some());
+        // A post-recovery write must survive another reopen: this only holds if
+        // open repaired the stale WAL (rewrote a header at the snapshot epoch)
+        // rather than appending behind the stale bytes.
+        c = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
     let g = Graph::open(&dir, config()).unwrap();
-    // The stale WAL is recognized as older than the snapshot and skipped, so the
-    // decay applies exactly once — weight is 0.5, not 0.25.
+    assert!(g.node(c).unwrap().is_some(), "post-recovery commit was lost");
     assert_eq!(g.edge(e).unwrap().unwrap().weight, 0.5);
-    assert!(g.node(b).unwrap().is_some());
 }
 
 #[test]

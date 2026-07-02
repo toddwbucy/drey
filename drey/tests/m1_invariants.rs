@@ -73,6 +73,20 @@ fn property_index_equality_and_range() {
         })
         .unwrap();
     assert_eq!(range, vec![ids[1], ids[2], ids[3]]);
+
+    // Inverted bounds (min > max) match nothing on the indexed path — and must
+    // not panic (BTreeMap::range panics on inverted bounds).
+    let inverted = g
+        .nodes_by_property(PropertyQuery {
+            node_type: person(),
+            key: "age".into(),
+            predicate: ScalarPredicate::Range {
+                min: Some(Scalar::I64(35)),
+                max: Some(Scalar::I64(25)),
+            },
+        })
+        .unwrap();
+    assert!(inverted.is_empty());
 }
 
 #[test]

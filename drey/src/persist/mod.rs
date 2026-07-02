@@ -184,22 +184,42 @@ impl Graph {
 
         // 2. Replay the committed WAL prefix, unless the WAL is stale (its epoch
         //    predates the snapshot, i.e. a crash left it un-truncated).
-        let mut wal_epoch = snap_epoch;
+        let mut replay = WalReplay { epoch: snap_epoch, valid_len: WAL_HEADER_LEN, stale: true };
         if dir.join(WAL_FILE).exists() {
             let bytes = fs::read(dir.join(WAL_FILE))?;
-            wal_epoch = replay_wal(&mut graph, &bytes, snap_epoch)?;
+            replay = replay_wal(&mut graph, &bytes, snap_epoch)?;
         }
 
         graph.store.sort_indexes();
 
-        // 3. Read-only opens attach no writer (PRD §9.1); writable opens do.
+        // 3. Read-only opens attach no writer (PRD §9.1); writable opens do — and
+        //    must normalize the on-disk WAL first, so new commits are not stranded
+        //    behind stale or torn bytes. A stale WAL (or none) is rewritten to a
+        //    header-only file at the snapshot epoch; a replayed WAL is truncated to
+        //    its last committed frame, dropping any torn trailing bytes.
         if !config.read_only {
             let locked = acquire_lock(&dir, &config)?;
-            let epoch = snap_epoch.max(wal_epoch);
-            let wal = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(WAL_FILE))?;
+            let wal_path = dir.join(WAL_FILE);
+            let epoch = if replay.stale || !wal_path.exists() {
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&wal_path)?;
+                f.write_all(&wal_header(snap_epoch))?;
+                f.sync_all()?;
+                fsync_dir(&dir)?;
+                snap_epoch
+            } else {
+                let f = OpenOptions::new().write(true).open(&wal_path)?;
+                if f.metadata()?.len() > replay.valid_len as u64 {
+                    f.set_len(replay.valid_len as u64)?;
+                    f.sync_all()?;
+                    fsync_dir(&dir)?;
+                }
+                replay.epoch
+            };
+            let wal = OpenOptions::new().append(true).open(&wal_path)?;
             graph.persist = Some(Persister {
                 dir,
                 wal,
@@ -295,13 +315,26 @@ fn acquire_lock(dir: &Path, config: &GraphConfig) -> Result<bool> {
 
 // ---- WAL replay ----
 
-/// Replay the committed prefix of the WAL, returning the WAL's epoch. Parses and
-/// version-gates the header first; if the WAL epoch predates `snap_epoch` the
-/// WAL is stale (already folded into the snapshot) and nothing is replayed.
-fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<u64> {
-    // A WAL shorter than its header carries no committed frames.
+/// The outcome of a WAL replay, used to normalize the on-disk WAL on open.
+struct WalReplay {
+    /// The WAL's epoch (or `snap_epoch` when the WAL was stale/absent).
+    epoch: u64,
+    /// Byte length of the WAL through its last committed frame — the truncation
+    /// point that drops any torn trailing bytes.
+    valid_len: usize,
+    /// The WAL was skipped (its epoch predates the snapshot, or it was too short
+    /// to hold a valid header): its content is discarded on repair.
+    stale: bool,
+}
+
+/// Replay the committed prefix of the WAL. Parses and version-gates the header
+/// first; if the WAL epoch predates `snap_epoch` the WAL is stale (already folded
+/// into the snapshot) and nothing is replayed. Returns where the committed prefix
+/// ends so the caller can repair the file.
+fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalReplay> {
+    // A WAL shorter than its header carries no valid content.
     if bytes.len() < WAL_HEADER_LEN {
-        return Ok(snap_epoch);
+        return Ok(WalReplay { epoch: snap_epoch, valid_len: WAL_HEADER_LEN, stale: true });
     }
     if &bytes[0..4] != MAGIC {
         return Err(Error::Codec("bad WAL magic".into()));
@@ -314,13 +347,15 @@ fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<u64> {
     if wal_epoch < snap_epoch {
         // Stale WAL left by a crash mid-snapshot: its frames are already in the
         // snapshot. Skip to avoid double-applying (e.g. non-idempotent decay).
-        return Ok(snap_epoch);
+        return Ok(WalReplay { epoch: snap_epoch, valid_len: WAL_HEADER_LEN, stale: true });
     }
 
     // Decode frames after the header, buffering records between commit markers.
     // Only fully committed batches are applied; a trailing incomplete or torn
-    // batch is discarded (PRD §10.2.1).
+    // batch is discarded (PRD §10.2.1). `last_commit_end` tracks the byte offset
+    // just past the last commit marker — the repair truncation point.
     let mut pos = WAL_HEADER_LEN;
+    let mut last_commit_end = WAL_HEADER_LEN;
     let mut staged: Vec<Mutation> = Vec::new();
     let mut committed: Vec<Mutation> = Vec::new();
 
@@ -347,6 +382,7 @@ fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<u64> {
             TAG_COMMIT => {
                 committed.append(&mut staged); // promote the batch
                 staged.clear();
+                last_commit_end = pos; // durable through here
             }
             t => return Err(Error::Codec(format!("bad WAL frame tag {t}"))),
         }
@@ -360,7 +396,7 @@ fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<u64> {
     }
     graph.store.next_node_id = graph.store.next_node_id.max(max_node);
     graph.store.next_edge_id = graph.store.next_edge_id.max(max_edge);
-    Ok(wal_epoch)
+    Ok(WalReplay { epoch: wal_epoch, valid_len: last_commit_end, stale: false })
 }
 
 /// Apply a committed mutation during replay, using explicit ids (no allocation)
