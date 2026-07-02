@@ -38,10 +38,10 @@ impl ScalarPredicate {
             ScalarPredicate::Range { min, max } => {
                 let ge = min
                     .as_ref()
-                    .map_or(true, |m| value.total_order(m) != std::cmp::Ordering::Less);
+                    .is_none_or(|m| value.total_order(m) != std::cmp::Ordering::Less);
                 let le = max
                     .as_ref()
-                    .map_or(true, |m| value.total_order(m) != std::cmp::Ordering::Greater);
+                    .is_none_or(|m| value.total_order(m) != std::cmp::Ordering::Greater);
                 ge && le
             }
         }

@@ -140,7 +140,7 @@ fn p_cat(within: u64, pop: u64) -> String {
         "cat_common".into()
     } else {
         // Filler categories, ~1% each, so none rivals the distinguished bands.
-        let filler = (within % 100) as u64;
+        let filler = within % 100;
         format!("cat_f{filler:02}")
     }
 }

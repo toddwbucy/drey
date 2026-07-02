@@ -203,7 +203,7 @@ fn export_import_restores_exact_id_space() {
     fs::create_dir_all(&dir).unwrap();
     let (a, b, e);
     {
-        let mut g = Graph::create(&dir.join("live"), config()).unwrap();
+        let mut g = Graph::create(dir.join("live"), config()).unwrap();
         g.register_node_type(person(), Some(2)).unwrap();
         a = g.add_node(person(), props(&[])).unwrap();
         // Force a gap in the id space by removing an intermediate node.

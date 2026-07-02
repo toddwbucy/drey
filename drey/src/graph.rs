@@ -222,7 +222,7 @@ impl Graph {
             .into_iter()
             .filter(|id| {
                 let w = self.store.edges[id].weight;
-                filter.min_weight.map_or(true, |min| w >= min)
+                filter.min_weight.is_none_or(|min| w >= min)
             })
             .collect();
         out.sort_unstable(); // deterministic order (spec §5.4 / §4.1)
