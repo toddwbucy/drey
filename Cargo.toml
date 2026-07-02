@@ -1,0 +1,10 @@
+# Workspace root. `drey` is the publishable crate (empty at M0, per the PRD);
+# `harness` is throwaway M0 apparatus that depends on `drey`, never the reverse
+# (spec §5.1). Keep it that way: nothing in `drey/` may depend on `harness`.
+[workspace]
+resolver = "2"
+members = ["drey", "harness"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"

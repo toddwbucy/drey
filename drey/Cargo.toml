@@ -1,0 +1,9 @@
+[package]
+name = "drey"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Embedded, memory-primary property-graph substrate crate (pre-release, no public API yet)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
