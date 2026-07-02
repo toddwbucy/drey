@@ -60,6 +60,11 @@ struct ZipfTable {
 
 impl ZipfTable {
     fn new(n: usize, s: f64) -> Self {
+        // `powf` is the one libm call on the generation path. It is deterministic
+        // on a fixed host but not IEEE-754 correctly-rounded, so it is the reason
+        // cross-host bit-identity is best-effort rather than contractual (see the
+        // reproducibility contract in `crate::rng`). Same-host generation — what
+        // the manifest checksums assert — is unaffected.
         let mut cdf = Vec::with_capacity(n);
         let mut cum = 0.0;
         for k in 1..=n {

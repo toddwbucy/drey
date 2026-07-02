@@ -13,6 +13,11 @@ use crate::error::{Error, Result};
 use crate::graph::Graph;
 use crate::types::{Direction, EdgeId, EdgeType, NodeId};
 
+/// Hard upper bound on traversal depth, so a large caller `max_hops` cannot
+/// drive unbounded DFS recursion (stack safety). Also clamps reachability
+/// search depth.
+pub(crate) const MAX_TRAVERSAL_HOPS: usize = 64;
+
 /// One step out of a node (PRD §9.3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Neighbor {
@@ -116,7 +121,7 @@ pub struct Path {
 impl Graph {
     /// Directed steps out of `node`, in ascending edge-id order, after applying
     /// the edge-type and weight filters. `(edge_id, other_endpoint)`.
-    fn steps(
+    pub(crate) fn steps(
         &self,
         node: u64,
         direction: Direction,
@@ -161,7 +166,7 @@ impl Graph {
         out
     }
 
-    fn resolve_type_ids(&self, types: &[EdgeType]) -> Option<HashSet<u32>> {
+    pub(crate) fn resolve_type_ids(&self, types: &[EdgeType]) -> Option<HashSet<u32>> {
         if types.is_empty() {
             return None;
         }
@@ -196,10 +201,14 @@ impl Graph {
 
     /// Bounded n-hop traversal returning paths (PRD §9.3). Depth-first with
     /// ascending edge-id expansion; stops at `max_hops` and at `max_paths`.
-    pub fn traverse(&self, from: NodeId, opts: TraversalOptions) -> Result<Vec<Path>> {
+    pub fn traverse(&self, from: NodeId, mut opts: TraversalOptions) -> Result<Vec<Path>> {
         if !self.store.nodes.contains_key(&from.0) {
             return Err(Error::NodeNotFound(from));
         }
+        // Hard cap on recursion depth: the DFS recurses one frame per hop, so an
+        // unbounded caller value could blow the stack. A graph deeper than this
+        // is out of scope for bounded traversal.
+        opts.max_hops = opts.max_hops.min(MAX_TRAVERSAL_HOPS);
         let type_ids = self.resolve_type_ids(&opts.edge_types);
         let mut paths: Vec<Path> = Vec::new();
         let mut nodes_stack = vec![from.0];

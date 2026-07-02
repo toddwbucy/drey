@@ -179,6 +179,38 @@ fn similarity_composes_with_filters_and_enforces_dimension() {
 }
 
 #[test]
+fn similarity_within_reachability_is_bounded_by_hops() {
+    use drey::similarity::ReachabilityFilter;
+    use drey::traverse::DirectionOpt;
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let b = g.add_node(person(), props(&[])).unwrap();
+    let c = g.add_node(person(), props(&[])).unwrap();
+    let d = g.add_node(person(), props(&[])).unwrap(); // unreachable from a
+    for n in [a, b, c, d] {
+        g.set_node_embedding(n, Embedding::new(vec![1.0, 0.0, 0.0, 0.0])).unwrap();
+    }
+    g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap(); // a -> b (1 hop)
+    g.add_edge(b, c, knows(), 1.0, props(&[])).unwrap(); // b -> c (2 hops)
+
+    // Within 1 hop of a (outbound): only a (0 hops) and b (1 hop) qualify.
+    let q = SimilarityQuery {
+        within: Some(ReachabilityFilter {
+            from: a,
+            max_hops: 1,
+            edge_types: vec![],
+            min_weight: None,
+            direction: DirectionOpt::Outbound,
+        }),
+        ..SimilarityQuery::new(Embedding::new(vec![1.0, 0.0, 0.0, 0.0]), SimilarityMetric::Cosine, 10)
+    };
+    let ids: Vec<NodeId> = g.similar_nodes(q).unwrap().into_iter().map(|(n, _)| n).collect();
+    assert!(ids.contains(&a) && ids.contains(&b));
+    assert!(!ids.contains(&c), "c is 2 hops away, must be excluded");
+    assert!(!ids.contains(&d), "d is unreachable, must be excluded");
+}
+
+#[test]
 fn remove_node_mode_default_rejects_incident_edges() {
     let mut g = base_graph();
     let a = g.add_node(person(), props(&[])).unwrap();

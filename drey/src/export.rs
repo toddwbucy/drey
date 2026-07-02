@@ -5,7 +5,7 @@
 //! reproducibility), filterable by edge type and minimum weight, and
 //! framework-agnostic. GraphSAGE and RGCN are example consumers only.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::graph::Graph;
 use crate::mutation::EdgeFilter;
 use crate::types::NodeId;
@@ -101,8 +101,14 @@ impl GraphFeatureExport for Graph {
         let mut out = Vec::with_capacity(ids.len());
         for e in ids {
             let rec = &self.store.edges[&e];
-            let src = map.index_of(NodeId(rec.from)).unwrap();
-            let dst = map.index_of(NodeId(rec.to)).unwrap();
+            // An edge whose endpoint is absent from the index means the loaded
+            // graph is inconsistent; surface a recoverable error, never panic.
+            let src = map.index_of(NodeId(rec.from)).ok_or_else(|| {
+                Error::IndexCorruption(format!("edge {e} references missing source node {}", rec.from))
+            })?;
+            let dst = map.index_of(NodeId(rec.to)).ok_or_else(|| {
+                Error::IndexCorruption(format!("edge {e} references missing target node {}", rec.to))
+            })?;
             out.push((src, dst));
         }
         Ok(out)

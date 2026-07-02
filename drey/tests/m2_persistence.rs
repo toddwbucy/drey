@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 
 use drey::config::GraphConfig;
-use drey::mutation::RemoveNodeMode;
+use drey::mutation::{EdgeFilter, RemoveNodeMode};
 use drey::query::{PropertyQuery, ScalarPredicate};
 use drey::types::{Embedding, NodeType, Scalar, Value};
 use drey::{EdgeType, Error, Graph, NodeId};
@@ -185,8 +185,9 @@ fn snapshot_compacts_wal_and_preserves_state() {
         g.add_node(person(), props(&[])).unwrap();
         g.commit().unwrap();
         g.snapshot().unwrap();
-        // WAL is truncated after snapshot.
-        assert_eq!(fs::metadata(dir.join("wal.log")).unwrap().len(), 0);
+        // WAL is reset after snapshot to just its 16-byte versioned header
+        // (no committed frames).
+        assert_eq!(fs::metadata(dir.join("wal.log")).unwrap().len(), 16);
         // Further mutation after snapshot still persists.
         g.remove_node(a, RemoveNodeMode::RejectIfEdgesExist).unwrap();
         g.commit().unwrap();
@@ -194,6 +195,40 @@ fn snapshot_compacts_wal_and_preserves_state() {
     let g = Graph::open(&dir, config()).unwrap();
     assert_eq!(g.counts().0, 1); // two added, one removed
     assert!(g.node(a).unwrap().is_none());
+}
+
+#[test]
+fn recovery_snapshot_crash_before_wal_truncation_skips_stale_wal() {
+    // A crash between the snapshot rename and the WAL reset leaves a fresh
+    // snapshot beside an un-truncated (old-epoch) WAL. Replaying that WAL would
+    // double-apply the non-idempotent decay. The epoch guard must skip it.
+    let dir = tmp("snapshot_crash_window");
+    let a;
+    let b;
+    let e;
+    let stale_wal;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g.add_node(person(), props(&[])).unwrap();
+        b = g.add_node(person(), props(&[])).unwrap();
+        e = g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
+        // Decay to 0.5 and commit — this lands in the (epoch-0) WAL.
+        g.decay_edges(EdgeFilter::new(), 0.5).unwrap();
+        g.commit().unwrap();
+        // Capture the pre-snapshot WAL (old epoch, contains the decay).
+        stale_wal = fs::read(dir.join("wal.log")).unwrap();
+        // Snapshot bakes weight 0.5 in and bumps to epoch 1, resetting the WAL.
+        g.snapshot().unwrap();
+    }
+    // Simulate the crash: restore the old-epoch WAL as if truncation never ran.
+    fs::write(dir.join("wal.log"), &stale_wal).unwrap();
+
+    let g = Graph::open(&dir, config()).unwrap();
+    // The stale WAL is recognized as older than the snapshot and skipped, so the
+    // decay applies exactly once — weight is 0.5, not 0.25.
+    assert_eq!(g.edge(e).unwrap().unwrap().weight, 0.5);
+    assert!(g.node(b).unwrap().is_some());
 }
 
 #[test]

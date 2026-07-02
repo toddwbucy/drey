@@ -156,9 +156,11 @@ and ~10% selectivity cases; don't let random draws collapse the sweep.
 filters; sweep candidate targets 100/1k/10k (±25%); record actual candidate
 count. Never a global unfiltered scan.
 
-**24. Mishandling mutation operations.** All three `WeightOp` variants,
-bounds present 50% of the time (stopgap semantics: apply op, then clamp);
-`decay_edges` with edge-type filter, factor 0.9, batches 1k/10k/100k.
+**24. Mishandling mutation operations.** All three `WeightUpdate` op variants
+(`Set`/`Add`/`Multiply`), bounds present 50% of the time (stopgap semantics:
+apply op, then clamp); `decay_edges` with edge-type filter, factor 0.9, batches
+1k/10k/100k. (The spec names the update `WeightUpdate` throughout — the enum it
+carries is `WeightOp`, but reference the update by one name.)
 
 **25. Treating `commit` and `open` as fully active in M0.** Keep the rows in
 the schema with `"status": "n/a"` until M2 — don't implement persistence

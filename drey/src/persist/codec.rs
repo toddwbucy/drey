@@ -65,6 +65,20 @@ impl<'a> Reader<'a> {
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
+    /// Reject an impossible element count before reserving memory: a claimed
+    /// count of `n` items, each at least `min_elem_bytes`, cannot exceed the
+    /// bytes still in the buffer. Guards against a corrupt length triggering a
+    /// huge `Vec::with_capacity` (checklist / codec bounds).
+    pub fn checked_len(&self, n: usize, min_elem_bytes: usize) -> Result<usize> {
+        let need = n.checked_mul(min_elem_bytes);
+        if need.is_none_or(|bytes| bytes > self.remaining()) {
+            return Err(Error::Codec(format!(
+                "claimed length {n} exceeds {} remaining bytes",
+                self.remaining()
+            )));
+        }
+        Ok(n)
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.pos + n > self.buf.len() {
             return Err(Error::Codec(format!(
@@ -180,7 +194,9 @@ pub(crate) fn read_value(r: &mut Reader) -> Result<Value> {
         4 => Value::String(r.str()?),
         5 => Value::Bytes(r.bytes()?),
         6 => {
+            // Each scalar is at least 2 bytes (tag + payload).
             let n = r.u32()? as usize;
+            let n = r.checked_len(n, 2)?;
             let mut items = Vec::with_capacity(n);
             for _ in 0..n {
                 items.push(read_scalar(r)?);
@@ -233,7 +249,9 @@ pub(crate) fn read_node_record(r: &mut Reader) -> Result<NodeRecord> {
     let embedding = match r.u8()? {
         0 => None,
         1 => {
+            // Each embedding component is 4 bytes (f32 LE).
             let n = r.u32()? as usize;
+            let n = r.checked_len(n, 4)?;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 v.push(r.f32()?);

@@ -176,27 +176,33 @@ impl Graph {
 
     /// The set of nodes reachable from `filter.from` within `max_hops`,
     /// honoring direction, edge types, and min weight.
+    ///
+    /// A bounded node-only BFS with a visited set — never full path enumeration,
+    /// which would blow up exponentially on hub-heavy graphs. Work is O(V + E)
+    /// within the hop bound.
     fn reachable_set(&self, filter: &ReachabilityFilter) -> Result<HashSet<u64>> {
-        use crate::traverse::{CyclePolicy, TraversalOptions};
-        let paths = self.traverse(
-            filter.from,
-            TraversalOptions {
-                max_hops: filter.max_hops,
-                direction: filter.direction,
-                edge_types: filter.edge_types.clone(),
-                min_weight: filter.min_weight,
-                max_paths: usize::MAX,
-                cycle_policy: CyclePolicy::NoRevisit,
-            },
-        )?;
-        let mut set = HashSet::new();
-        for p in paths {
-            for n in p.nodes {
-                set.insert(n.0);
-            }
-        }
+        let type_ids = self.resolve_type_ids(&filter.edge_types);
+        let max_hops = filter.max_hops.min(crate::traverse::MAX_TRAVERSAL_HOPS);
+
         // `from` itself is reachable at zero hops.
-        set.insert(filter.from.0);
-        Ok(set)
+        let mut visited: HashSet<u64> = HashSet::from([filter.from.0]);
+        let mut frontier = vec![filter.from.0];
+        for _ in 0..max_hops {
+            let mut next = Vec::new();
+            for node in frontier.drain(..) {
+                for (_edge, other) in
+                    self.steps(node, filter.direction.into(), &type_ids, filter.min_weight)
+                {
+                    if visited.insert(other) {
+                        next.push(other);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        Ok(visited)
     }
 }

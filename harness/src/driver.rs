@@ -65,13 +65,17 @@ pub trait GraphDriver {
     fn run_op(&mut self, op: &WorkloadOp) -> Result<OpOutcome, String>;
 }
 
+/// Convert a fixture JSON property value to a drey `Value`. Fixtures only ever
+/// carry the scalar shapes below; anything else (array, object, JSON null) means
+/// the generator produced something unexpected, so fail loudly rather than
+/// silently coercing it to `Null` and hiding the problem.
 fn to_value(j: &Json) -> Value {
     match j {
         Json::Bool(b) => Value::Bool(*b),
         Json::Number(n) if n.is_i64() => Value::I64(n.as_i64().unwrap()),
         Json::Number(n) => Value::F64(n.as_f64().unwrap()),
         Json::String(s) => Value::String(s.clone()),
-        _ => Value::Null,
+        other => panic!("unexpected fixture property value (not a supported scalar): {other}"),
     }
 }
 

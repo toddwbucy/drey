@@ -49,16 +49,23 @@ impl ScalarPredicate {
 }
 
 impl Graph {
+    /// Resolve a node type to its interned id, or error if it is not registered.
+    /// Shared by the type and property queries so both stay in sync.
+    fn resolve_registered_type(&self, node_type: &NodeType) -> Result<u32> {
+        self.store
+            .node_types
+            .get(node_type.as_str())
+            .filter(|id| self.store.embedding_dim.contains_key(id))
+            .ok_or_else(|| {
+                Error::InvalidNodeType(format!("node type {:?} not registered", node_type.as_str()))
+            })
+    }
+
     /// All node ids of a registered type (PRD §9.3). Returns an empty vector,
     /// never an error, for a registered type with zero members; querying an
     /// unregistered type errors.
     pub fn nodes_by_type(&self, node_type: &NodeType) -> Result<Vec<NodeId>> {
-        let tid = self
-            .store
-            .node_types
-            .get(node_type.as_str())
-            .filter(|id| self.store.embedding_dim.contains_key(id))
-            .ok_or_else(|| Error::InvalidNodeType(format!("node type {:?} not registered", node_type.as_str())))?;
+        let tid = self.resolve_registered_type(node_type)?;
         let mut ids: Vec<NodeId> = self
             .store
             .nodes_by_type
@@ -72,12 +79,7 @@ impl Graph {
     /// Nodes matching a property query (PRD §9.3). Empty vector, never an error,
     /// for a registered type with no matches; unregistered type errors.
     pub fn nodes_by_property(&self, query: PropertyQuery) -> Result<Vec<NodeId>> {
-        let tid = self
-            .store
-            .node_types
-            .get(query.node_type.as_str())
-            .filter(|id| self.store.embedding_dim.contains_key(id))
-            .ok_or_else(|| Error::InvalidNodeType(format!("node type {:?} not registered", query.node_type.as_str())))?;
+        let tid = self.resolve_registered_type(&query.node_type)?;
 
         let indexed = self.config.is_indexed(&query.node_type, &query.key);
         let mut out: Vec<NodeId> = if indexed {

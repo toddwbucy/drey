@@ -18,7 +18,18 @@ fn main() {
     }
     let dir = std::path::PathBuf::from(&args[1]);
     let driver_kind = args[2].as_str();
-    let per_bucket: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1000);
+    // Default 1000, but a present-yet-unparseable value is a user error, not a
+    // silent fallback.
+    let per_bucket: usize = match args.get(3) {
+        None => 1000,
+        Some(s) => match s.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("per_bucket must be a non-negative integer, got {s:?}");
+                exit(2);
+            }
+        },
+    };
 
     let (fixture, manifest, checksum_ok) = match read_fixture(&dir) {
         Ok(v) => v,

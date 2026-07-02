@@ -159,6 +159,13 @@ impl Graph {
 
     pub fn update_edge_properties(&mut self, edge: EdgeId, patch: PropertyPatch) -> Result<()> {
         self.ensure_writable()?;
+        // Validate patched values before mutating, mirroring
+        // `update_node_properties` so invalid values cannot be committed on edges.
+        for v in patch.0.values().flatten() {
+            if !v.is_valid() {
+                return Err(Error::InvalidPropertyValue("edge property".into()));
+            }
+        }
         let rec = self.store.edges.get_mut(&edge.0).ok_or(Error::EdgeNotFound(edge))?;
         apply_patch(&mut rec.properties, &patch.0);
         self.log(Mutation::UpdateEdgeProperties { edge, patch: patch.0 })
@@ -180,7 +187,9 @@ impl Graph {
         for id in &ids {
             let current = self.store.edges[id].weight;
             let new = update.apply(current);
-            self.store.edges.get_mut(id).unwrap().weight = new;
+            // Route through the same write path as `update_edge_weight` so any
+            // validation/bookkeeping in the store applies to both.
+            self.store.set_edge_weight(EdgeId(*id), new)?;
         }
         // A single log record captures the batch for replay.
         self.log(Mutation::DecayEdges {

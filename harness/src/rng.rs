@@ -9,11 +9,16 @@
 //! "splitmix64-seeded xoshiro": `SeedableRng::seed_from_u64` fills the state
 //! with SplitMix64 output.
 //!
-//! Cross-platform note: generation deliberately avoids transcendental
-//! functions (`ln`, `cos`, …), whose results can differ across libm versions.
-//! Only IEEE-754 correctly-rounded operations (`+`, `*`, `sqrt`) appear on the
-//! generation path, so a fixture is reproducible across machines, not just
-//! across runs on one host.
+//! Reproducibility contract: byte-for-byte identical for a given
+//! `(generator version, seed, parameters)` **on a fixed host/toolchain** — this
+//! is what the manifest checksums assert and what the M0 tests verify. Most of
+//! the generation path uses only IEEE-754 correctly-rounded operations (`+`,
+//! `*`, `sqrt`) and so is also bit-identical across machines; the one exception
+//! is the Zipf degree/edge-type CDF, which calls `f64::powf` (see
+//! [`crate::generator`]). `powf` is not required by IEEE-754 to be
+//! correctly-rounded, so a fixture *may* differ by a ULP across libm versions.
+//! Cross-host bit-identity is therefore best-effort, not contractual; the
+//! manifest records the host so any gap is visible rather than hidden.
 
 use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;

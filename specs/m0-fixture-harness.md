@@ -152,11 +152,17 @@ carried in JSON.
 
 Canonical JSON, defined so byte-for-byte determinism is checkable: UTF-8, one
 complete object per line, LF line endings, every file ends with a final LF,
-fields serialized in exactly the order shown above, no whitespace beyond the
-JSON separators serde_json emits in compact mode, floats rendered as shortest
-round-trip decimal (Ryu — serde_json's default), integers rendered without
-exponent or leading zeros. Records are written in ascending ID order.
-Checksums in the manifest are over these canonical bytes.
+top-level fields serialized in exactly the order shown above, no whitespace
+beyond the JSON separators serde_json emits in compact mode, floats rendered as
+shortest round-trip decimal (Ryu — serde_json's default), integers rendered
+without exponent or leading zeros. **Nested object keys are sorted recursively**
+— every nested object (the `props` map in `nodes.jsonl`/`edges.jsonl`, and
+`parameters` and any sub-object in `manifest.json`) serializes its keys in
+ascending byte order at every depth, so two runs cannot disagree on key order.
+(The implementation gets this for free: `props` is a sorted map and the manifest
+uses `BTreeMap` sub-objects.) Records are written in ascending ID order.
+Checksum generation and verification operate on exactly this recursively-sorted
+canonical byte representation.
 
 ### 3.6 Workload plan file
 
