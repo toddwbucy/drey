@@ -22,10 +22,6 @@ pub struct Interner {
 }
 
 impl Interner {
-    pub fn new() -> Self {
-        Interner::default()
-    }
-
     /// Intern a label, returning its id (assigning a fresh one if new).
     pub fn intern(&mut self, label: &str) -> u32 {
         if let Some(&id) = self.index.get(label) {
@@ -47,12 +43,20 @@ impl Interner {
         self.labels.get(id as usize).map(|s| s.as_str())
     }
 
-    pub fn len(&self) -> usize {
-        self.labels.len()
+    /// The interned labels in id order — the persisted source of truth.
+    pub(crate) fn labels(&self) -> &[String] {
+        &self.labels
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.labels.is_empty()
+    /// Reconstruct an interner from its persisted label vector, rebuilding the
+    /// lookup index. Ids are the vector positions, so they match what was saved.
+    pub(crate) fn from_labels(labels: Vec<String>) -> Self {
+        let mut it = Interner {
+            labels,
+            index: std::collections::HashMap::new(),
+        };
+        it.rebuild_index();
+        it
     }
 
     /// Rebuild the `index` side after deserialization (the `labels` vector is
@@ -71,7 +75,7 @@ mod tests {
 
     #[test]
     fn interning_is_stable_and_bidirectional() {
-        let mut it = Interner::new();
+        let mut it = Interner::default();
         let a = it.intern("alpha");
         let b = it.intern("beta");
         assert_eq!(it.intern("alpha"), a); // stable
@@ -83,7 +87,7 @@ mod tests {
 
     #[test]
     fn rebuild_index_restores_lookups() {
-        let mut it = Interner::new();
+        let mut it = Interner::default();
         it.intern("x");
         it.intern("y");
         it.index.clear(); // simulate a fresh deserialize (index is #[serde(skip)])

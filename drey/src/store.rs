@@ -303,6 +303,54 @@ impl Store {
         self.index_node_properties(type_id, &node_type, node, new);
     }
 
+    // ---- Load-time raw inserts (persistence reconstruction, PRD §10.1) ----
+    //
+    // These insert records with explicit, caller-supplied ids and rebuild the
+    // derived indexes, but do not allocate ids or validate. They exist so a
+    // snapshot/WAL replay restores the exact id space (PRD §7.4) rather than
+    // renumbering, and so indexes are rebuilt from the source-of-truth records
+    // rather than persisted (guaranteeing index consistency after reload, §17).
+
+    /// Insert a node with an explicit id during load.
+    pub(crate) fn insert_node_raw(&mut self, id: u64, rec: NodeRecord) {
+        let type_id = rec.node_type;
+        self.nodes_by_type.entry(type_id).or_default().push(id);
+        let node_type = NodeType(self.node_types.label(type_id).unwrap().to_string());
+        let props = rec.properties.clone();
+        self.nodes.insert(id, rec);
+        self.index_node_properties(type_id, &node_type, id, &props);
+    }
+
+    /// Insert an edge with an explicit id during load.
+    pub(crate) fn insert_edge_raw(&mut self, id: u64, rec: EdgeRecord) {
+        self.out_adj.entry((rec.from, rec.edge_type)).or_default().push(id);
+        self.in_adj.entry((rec.to, rec.edge_type)).or_default().push(id);
+        self.edges_by_type.entry(rec.edge_type).or_default().push(id);
+        self.edges.insert(id, rec);
+    }
+
+    /// After raw inserts, adjacency/type buckets are in insertion order. Sort
+    /// them so load order does not affect query result order (determinism).
+    pub(crate) fn sort_indexes(&mut self) {
+        for v in self.out_adj.values_mut() {
+            v.sort_unstable();
+        }
+        for v in self.in_adj.values_mut() {
+            v.sort_unstable();
+        }
+        for v in self.nodes_by_type.values_mut() {
+            v.sort_unstable();
+        }
+        for v in self.edges_by_type.values_mut() {
+            v.sort_unstable();
+        }
+        for tree in self.prop_index.values_mut() {
+            for bucket in tree.values_mut() {
+                bucket.sort_unstable();
+            }
+        }
+    }
+
     // ---- Materializers ----
 
     pub(crate) fn materialize_node(&self, id: NodeId) -> Option<Node> {
