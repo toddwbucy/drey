@@ -43,6 +43,11 @@ then the budget for `shortest_path` must reflect unbounded search on the
 representative graph, i.e. widen to tens of ms, and the decision should be
 explicit rather than implied.
 
+**Status: implemented (v0.2).** `ShortestPathOptions` now carries an optional
+`max_steps` node-expansion budget, enforced in both BFS and Dijkstra, returning
+`None` when exhausted. See `specs/shortest-path-bound.md`. (`max_cost` was
+deemed a semantic, not latency, concern and left for later.)
+
 ### F2. Hub `neighbors` / `traverse` are O(degree) and the budget is
 per-median, not per-hub
 

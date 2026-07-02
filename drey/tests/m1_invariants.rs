@@ -164,6 +164,44 @@ fn shortest_path_unweighted_and_weighted() {
 }
 
 #[test]
+fn shortest_path_respects_step_budget() {
+    // Chain a -> b -> c -> d; reaching d requires expanding a, b, c.
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let b = g.add_node(person(), props(&[])).unwrap();
+    let c = g.add_node(person(), props(&[])).unwrap();
+    let d = g.add_node(person(), props(&[])).unwrap();
+    g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
+    g.add_edge(b, c, knows(), 1.0, props(&[])).unwrap();
+    g.add_edge(c, d, knows(), 1.0, props(&[])).unwrap();
+
+    // Budget of 1 expansion can't reach d → None (not an error).
+    let bounded = g
+        .shortest_path(a, d, ShortestPathOptions { max_steps: Some(1), ..Default::default() })
+        .unwrap();
+    assert!(bounded.is_none(), "one expansion cannot reach a 3-hop target");
+
+    // A sufficient budget finds the same path an unbounded search does.
+    let generous = g
+        .shortest_path(a, d, ShortestPathOptions { max_steps: Some(100), ..Default::default() })
+        .unwrap()
+        .unwrap();
+    let unbounded = g.shortest_path(a, d, ShortestPathOptions::default()).unwrap().unwrap();
+    assert_eq!(generous.nodes, vec![a, b, c, d]);
+    assert_eq!(generous.nodes, unbounded.nodes);
+
+    // The bound applies to weighted mode too.
+    let weighted_bounded = g
+        .shortest_path(
+            a,
+            d,
+            ShortestPathOptions { max_steps: Some(1), cost_mode: CostMode::WeightedCost, ..Default::default() },
+        )
+        .unwrap();
+    assert!(weighted_bounded.is_none());
+}
+
+#[test]
 fn similarity_composes_with_filters_and_enforces_dimension() {
     let mut g = base_graph();
     let a = g.add_node(person(), props(&[("age", Value::I64(30))])).unwrap();

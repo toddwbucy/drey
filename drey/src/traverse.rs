@@ -106,6 +106,11 @@ pub struct ShortestPathOptions {
     pub edge_types: Vec<EdgeType>,
     pub min_weight: Option<f32>,
     pub cost_mode: CostMode,
+    /// Optional exploration budget: the maximum number of nodes the search may
+    /// expand before giving up and returning `None`. Bounds worst-case latency
+    /// on large or disconnected graphs, where an unbounded search can walk an
+    /// entire component (M3 finding F1). `None` (the default) is unbounded.
+    pub max_steps: Option<usize>,
 }
 
 /// A path: alternating nodes and the edges taken between them
@@ -304,9 +309,14 @@ impl Graph {
         let mut prev: HashMap<u64, (u64, u64)> = HashMap::new(); // node -> (prev_node, via_edge)
         let mut seen: HashSet<u64> = HashSet::from([from]);
         let mut q = VecDeque::from([from]);
+        let mut steps = 0usize;
         while let Some(cur) = q.pop_front() {
             if cur == to {
                 return Some(self.reconstruct(from, to, &prev, CostMode::UnweightedHops));
+            }
+            steps += 1;
+            if opts.max_steps.is_some_and(|max| steps > max) {
+                return None; // exploration budget exhausted (M3 F1)
             }
             for (edge, other) in self.steps(cur, opts.direction.into(), type_ids, opts.min_weight) {
                 if seen.insert(other) {
@@ -329,12 +339,17 @@ impl Graph {
         let mut prev: HashMap<u64, (u64, u64)> = HashMap::new();
         let mut heap: BinaryHeap<DijkstraState> =
             BinaryHeap::from([DijkstraState { cost: 0.0, node: from }]);
+        let mut steps = 0usize;
         while let Some(DijkstraState { cost, node }) = heap.pop() {
             if node == to {
                 return Some(self.reconstruct(from, to, &prev, CostMode::WeightedCost));
             }
             if cost > *dist.get(&node).unwrap_or(&f32::INFINITY) {
-                continue;
+                continue; // stale heap entry — not a real expansion, do not count
+            }
+            steps += 1;
+            if opts.max_steps.is_some_and(|max| steps > max) {
+                return None; // exploration budget exhausted (M3 F1)
             }
             for (edge, other) in self.steps(node, opts.direction.into(), type_ids, opts.min_weight) {
                 let w = self.store.edges[&edge].weight.max(0.0);
