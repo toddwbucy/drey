@@ -27,7 +27,7 @@ use rand::Rng;
 /// under control, accepting `None` when the target is farther than this many
 /// node expansions. A representative decision-point value; it does not by itself
 /// guarantee any particular p95 (a single mega-hub expansion can still be
-/// expensive — see `specs/shortest-path-bound.md`).
+/// expensive — see `docs/specs/shortest-path-bound.md`).
 pub const SHORTEST_PATH_MAX_STEPS: usize = 512;
 
 /// Warmup samples discarded per bucket before retention (spec §5.2).

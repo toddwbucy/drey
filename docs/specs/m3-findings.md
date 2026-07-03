@@ -24,7 +24,7 @@ sub-microsecond to low-microsecond; the crate is fast on the common path.
 `representative` (50k / 250k, dim 1024): p50s remain tiny, but four op classes
 exceed their p95 budget. All four are p95-*tail* overruns driven by the
 degree-stratified workload deliberately including the mega-hub (spec §4.1,
-"hub cost visible rather than averaged away") or by unbounded worst cases —
+"hub cost visible rather than averaged away") or by unbounded worst cases -
 not by common-case regressions.
 
 | Op | p50 | p95 | Budget (p95) | Verdict |
@@ -54,7 +54,7 @@ explicit rather than implied.
 
 **Status: implemented (v0.2).** `ShortestPathOptions` now carries an optional
 `max_steps` node-expansion budget, enforced in both BFS and Dijkstra, returning
-`None` when exhausted. See `specs/shortest-path-bound.md`. (`max_cost` was
+`None` when exhausted. See `docs/specs/shortest-path-bound.md`. (`max_cost` was
 deemed a semantic, not latency, concern and left for later.)
 
 ### F2. Hub `neighbors` / `traverse` are O(degree) and the budget is
@@ -63,7 +63,7 @@ per-median, not per-hub
 The mega-hub (top Zipf node) has a very high degree; listing or expanding it is
 genuinely O(degree), so 1/3 of stratified samples (the hub stratum) blow a
 budget derived from median behavior. This is the intended visibility of hub
-cost, not a regression — the p50 (median/low strata) is sub-microsecond.
+cost, not a regression - the p50 (median/low strata) is sub-microsecond.
 **Revision:** budgets should be recorded per degree stratum (low / median /
 hub), so the gate compares like with like, rather than one budget across a
 distribution the spec deliberately made bimodal. The crate itself needs no
@@ -74,7 +74,7 @@ change; the finding is about budget derivation (spec §4.3).
 were never truncated at `max_degree`, so the top node reached ~50× the
 declared cap (out-degree ~49,855 vs 1,000). With `GENERATOR_VERSION` 2
 enforcing the cap, hub-stratum samples pass their budgets outright (neighbors
-p95 7 µs, traverse p95 ~200–290 µs, shortest_path p95 8–10 ms — see Addendum)
+p95 7 µs, traverse p95 ~200–290 µs, shortest_path p95 8–10 ms - see Addendum)
 and the per-stratum budget split is moot. The original analysis conflated a
 fixture bug with a design posture.
 
@@ -82,13 +82,13 @@ fixture bug with a design posture.
 
 `Graph::decay_edges(filter, factor)` decays *all* edges matching the filter;
 there is no count limit, so the workload's nominal batch sizes (1k/10k/100k) do
-not control the number of edges touched — batch=1000 with a hot edge-type
+not control the number of edges touched - batch=1000 with a hot edge-type
 filter still decays every edge of that type. The three decay buckets therefore
 measure filter-selectivity, not batch size, and the batch=1000 budget (1 ms) is
 mismatched to the realized work. **Revision:** either (a) the harness should
 size the filter to the intended batch and label buckets by realized
 `edges_decayed` (already in counters), or (b) if consumers need count-bounded
-decay, that is a v0.2 API question — not assumed now. No v0.1 crate change.
+decay, that is a v0.2 API question - not assumed now. No v0.1 crate change.
 
 **Status: still open (2026-07-03).** Re-measured p95 ~5.3 ms vs the 1 ms
 batch=1000 budget; all three batch buckets show the same ~5.3 ms p95,
@@ -111,21 +111,21 @@ case exceeds its budget. See F5.
 ### F5. 10k-candidate similarity misses its budget (new visibility, 2026-07-03)
 
 `similar_nodes` with ~10k candidates at dim 1024 measures p50 16.7 ms / p95
-18.8 ms against the 10 ms budget. This bucket did not exist before the audit —
+18.8 ms against the 10 ms budget. This bucket did not exist before the audit -
 the spec §4.2 100/1k/10k candidate sweep was added to the harness during the
 issue #5 remediation (PR #7), so this is the corrected workload exposing a
 real cost the old single-filter plan masked, not a regression: exhaustive scan
 is linear in candidates, and ~10k × 1024 f32 costs what it costs.
 **Revision options:** (a) revise the 10k-candidate budget to reflect linear
-scan cost (consistent with "budgets, not comparisons" — the budget was
+scan cost (consistent with "budgets, not comparisons" - the budget was
 synthetic); (b) treat this as the PRD §13.2 ANN-seam trigger and evaluate an
 ANN integration behind the now-extant `SimilarityEvaluator` seam
-(`specs/persistence-seam-decision.md`); or (c) constrain consumers to ≤~5k
+(`docs/specs/persistence-seam-decision.md`); or (c) constrain consumers to ≤~5k
 candidates via filters, per the §13.1 filters-first posture. A real captured
 workload (spec §6) should decide which; do not integrate ANN on synthetic
 evidence alone.
 
-## Addendum — 2026-07-03 re-measurement (post-audit remediation)
+## Addendum - 2026-07-03 re-measurement (post-audit remediation)
 
 Re-measured after the issue #5 audit remediation (PRs #6–#15), against a
 regenerated seed-42 `representative`/`medium` fixture. Measurement context
@@ -151,7 +151,7 @@ fingerprint in the run JSON.
 
 Gate result: 16 of 18 buckets pass; exits non-zero on the two flagged
 overruns. Note `shortest_path:weighted` p99 (11.5 ms) exceeds the p95 budget
-figure — the gate compares at p95; a future budget pass that gates p99 should
+figure - the gate compares at p95; a future budget pass that gates p99 should
 set p99 budgets explicitly.
 
 ## Disposition
@@ -160,9 +160,9 @@ None of F1–F5 is a correctness defect. F1 is implemented (v0.2); F2 dissolved
 with the fixture fix (the overrun was a generator artifact); F4 is confirmed
 posture. The two live items for the next budget pass are F3 (size decay
 filters to the intended batch, or revise the small-batch budget) and F5
-(revise the 10k-candidate budget, or treat it as the §13.2 ANN-seam trigger —
+(revise the 10k-candidate budget, or treat it as the §13.2 ANN-seam trigger -
 decide on a real captured workload, not synthetic budgets). The one
-crate-level defect found during M3 — `steps()` scanning the whole adjacency
-index — was fixed in the same milestone (nested `node → edge_type → [edge]`
+crate-level defect found during M3 - `steps()` scanning the whole adjacency
+index - was fixed in the same milestone (nested `node → edge_type → [edge]`
 adjacency, O(degree) lookups). M3 exits on the §16.3 "written reason to
 revise" clause, with F3 and F5 as the concrete revisions carried forward.
