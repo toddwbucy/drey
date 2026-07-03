@@ -21,7 +21,8 @@ use serde::Serialize;
 
 /// One canonical line: compact JSON plus a trailing `\n`.
 pub fn line<T: Serialize>(value: &T) -> String {
-    let mut s = serde_json::to_string(value).expect("canonical JSON serialization is infallible for fixture types");
+    let mut s = serde_json::to_string(value)
+        .expect("canonical JSON serialization is infallible for fixture types");
     s.push('\n');
     s
 }
@@ -78,7 +79,10 @@ mod tests {
     fn field_order_follows_declaration() {
         // `id` precedes `weight` because that is the struct's field order,
         // regardless of alphabetization.
-        let r = Rec { id: 1, weight: 0.25 };
+        let r = Rec {
+            id: 1,
+            weight: 0.25,
+        };
         let s = line(&r);
         assert!(s.find("\"id\"").unwrap() < s.find("\"weight\"").unwrap());
     }

@@ -156,7 +156,10 @@ mod tests {
 
     #[test]
     fn edges_are_derived_from_fanout() {
-        assert_eq!(Parameters::new(SizeClass::Small, Fanout::Medium, 0).edges, 5_000);
+        assert_eq!(
+            Parameters::new(SizeClass::Small, Fanout::Medium, 0).edges,
+            5_000
+        );
         assert_eq!(
             Parameters::new(SizeClass::Representative, Fanout::Medium, 0).edges,
             250_000

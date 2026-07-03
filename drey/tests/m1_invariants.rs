@@ -18,7 +18,10 @@ fn knows() -> EdgeType {
 }
 
 fn props(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect()
 }
 
 fn base_graph() -> Graph {
@@ -31,7 +34,9 @@ fn base_graph() -> Graph {
 #[test]
 fn add_and_lookup_roundtrip() {
     let mut g = base_graph();
-    let a = g.add_node(person(), props(&[("age", Value::I64(30))])).unwrap();
+    let a = g
+        .add_node(person(), props(&[("age", Value::I64(30))]))
+        .unwrap();
     let node = g.node(a).unwrap().unwrap();
     assert_eq!(node.node_type, person());
     assert_eq!(node.properties.get("age"), Some(&Value::I64(30)));
@@ -50,7 +55,10 @@ fn property_index_equality_and_range() {
     let mut g = base_graph();
     let mut ids = Vec::new();
     for age in [20i64, 25, 30, 35, 40] {
-        ids.push(g.add_node(person(), props(&[("age", Value::I64(age))])).unwrap());
+        ids.push(
+            g.add_node(person(), props(&[("age", Value::I64(age))]))
+                .unwrap(),
+        );
     }
     // Equality
     let eq = g
@@ -93,8 +101,12 @@ fn property_index_equality_and_range() {
 fn unindexed_property_falls_back_to_scan() {
     // "name" is not indexed; the query must still be correct.
     let mut g = base_graph();
-    let a = g.add_node(person(), props(&[("name", Value::String("ada".into()))])).unwrap();
-    let _ = g.add_node(person(), props(&[("name", Value::String("bob".into()))])).unwrap();
+    let a = g
+        .add_node(person(), props(&[("name", Value::String("ada".into()))]))
+        .unwrap();
+    let _ = g
+        .add_node(person(), props(&[("name", Value::String("bob".into()))]))
+        .unwrap();
     let hits = g
         .nodes_by_property(PropertyQuery {
             node_type: person(),
@@ -120,14 +132,26 @@ fn neighbors_and_traversal_respect_filters() {
     assert_eq!(ns[0].node, b);
 
     // 2-hop traversal reaches c
-    let paths = g.traverse(a, TraversalOptions { max_hops: 2, ..Default::default() }).unwrap();
+    let paths = g
+        .traverse(
+            a,
+            TraversalOptions {
+                max_hops: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert!(paths.iter().any(|p| p.nodes.last() == Some(&c)));
 
     // min_weight 0.5 prunes the b->c edge, so c is unreachable
     let pruned = g
         .traverse(
             a,
-            TraversalOptions { max_hops: 2, min_weight: Some(0.5), ..Default::default() },
+            TraversalOptions {
+                max_hops: 2,
+                min_weight: Some(0.5),
+                ..Default::default()
+            },
         )
         .unwrap();
     assert!(!pruned.iter().any(|p| p.nodes.last() == Some(&c)));
@@ -144,14 +168,20 @@ fn shortest_path_unweighted_and_weighted() {
     g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
     g.add_edge(b, c, knows(), 1.0, props(&[])).unwrap();
 
-    let hops = g.shortest_path(a, c, ShortestPathOptions::default()).unwrap().unwrap();
+    let hops = g
+        .shortest_path(a, c, ShortestPathOptions::default())
+        .unwrap()
+        .unwrap();
     assert_eq!(hops.nodes, vec![a, c]); // fewest hops = direct
 
     let weighted = g
         .shortest_path(
             a,
             c,
-            ShortestPathOptions { cost_mode: CostMode::WeightedCost, ..Default::default() },
+            ShortestPathOptions {
+                cost_mode: CostMode::WeightedCost,
+                ..Default::default()
+            },
         )
         .unwrap()
         .unwrap();
@@ -160,7 +190,10 @@ fn shortest_path_unweighted_and_weighted() {
 
     // Disconnected pair returns None.
     let d = g.add_node(person(), props(&[])).unwrap();
-    assert!(g.shortest_path(a, d, ShortestPathOptions::default()).unwrap().is_none());
+    assert!(g
+        .shortest_path(a, d, ShortestPathOptions::default())
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -179,16 +212,36 @@ fn shortest_path_respects_step_budget() {
     // returned. So max_steps=3 is the exact boundary: it succeeds, and one less
     // (2) fails. The tight pair catches a `>` → `>=` off-by-one regression.
     let too_small = g
-        .shortest_path(a, d, ShortestPathOptions { max_steps: Some(2), ..Default::default() })
+        .shortest_path(
+            a,
+            d,
+            ShortestPathOptions {
+                max_steps: Some(2),
+                ..Default::default()
+            },
+        )
         .unwrap();
-    assert!(too_small.is_none(), "2 expansions cannot reach a 3-expansion target");
+    assert!(
+        too_small.is_none(),
+        "2 expansions cannot reach a 3-expansion target"
+    );
 
     let exact = g
-        .shortest_path(a, d, ShortestPathOptions { max_steps: Some(3), ..Default::default() })
+        .shortest_path(
+            a,
+            d,
+            ShortestPathOptions {
+                max_steps: Some(3),
+                ..Default::default()
+            },
+        )
         .unwrap()
         .unwrap();
     // The bounded result at the exact boundary matches the default (unbounded) search.
-    let unbounded = g.shortest_path(a, d, ShortestPathOptions::default()).unwrap().unwrap();
+    let unbounded = g
+        .shortest_path(a, d, ShortestPathOptions::default())
+        .unwrap()
+        .unwrap();
     assert_eq!(exact.nodes, vec![a, b, c, d]);
     assert_eq!(exact.nodes, unbounded.nodes);
 
@@ -197,7 +250,11 @@ fn shortest_path_respects_step_budget() {
         .shortest_path(
             a,
             d,
-            ShortestPathOptions { max_steps: Some(1), cost_mode: CostMode::WeightedCost, ..Default::default() },
+            ShortestPathOptions {
+                max_steps: Some(1),
+                cost_mode: CostMode::WeightedCost,
+                ..Default::default()
+            },
         )
         .unwrap();
     assert!(weighted_bounded.is_none());
@@ -206,12 +263,21 @@ fn shortest_path_respects_step_budget() {
 #[test]
 fn similarity_composes_with_filters_and_enforces_dimension() {
     let mut g = base_graph();
-    let a = g.add_node(person(), props(&[("age", Value::I64(30))])).unwrap();
-    let b = g.add_node(person(), props(&[("age", Value::I64(30))])).unwrap();
-    let c = g.add_node(person(), props(&[("age", Value::I64(99))])).unwrap();
-    g.set_node_embedding(a, Embedding::new(vec![1.0, 0.0, 0.0, 0.0])).unwrap();
-    g.set_node_embedding(b, Embedding::new(vec![0.9, 0.1, 0.0, 0.0])).unwrap();
-    g.set_node_embedding(c, Embedding::new(vec![1.0, 0.0, 0.0, 0.0])).unwrap();
+    let a = g
+        .add_node(person(), props(&[("age", Value::I64(30))]))
+        .unwrap();
+    let b = g
+        .add_node(person(), props(&[("age", Value::I64(30))]))
+        .unwrap();
+    let c = g
+        .add_node(person(), props(&[("age", Value::I64(99))]))
+        .unwrap();
+    g.set_node_embedding(a, Embedding::new(vec![1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
+    g.set_node_embedding(b, Embedding::new(vec![0.9, 0.1, 0.0, 0.0]))
+        .unwrap();
+    g.set_node_embedding(c, Embedding::new(vec![1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
 
     // Query near a's vector, restricted to age=30 → c (age 99) excluded even
     // though its vector is identical to the query.
@@ -221,7 +287,11 @@ fn similarity_composes_with_filters_and_enforces_dimension() {
             key: "age".into(),
             predicate: ScalarPredicate::Eq(Scalar::I64(30)),
         }),
-        ..SimilarityQuery::new(Embedding::new(vec![1.0, 0.0, 0.0, 0.0]), SimilarityMetric::Cosine, 10)
+        ..SimilarityQuery::new(
+            Embedding::new(vec![1.0, 0.0, 0.0, 0.0]),
+            SimilarityMetric::Cosine,
+            10,
+        )
     };
     let hits = g.similar_nodes(q).unwrap();
     let ids: Vec<NodeId> = hits.iter().map(|(n, _)| *n).collect();
@@ -229,7 +299,9 @@ fn similarity_composes_with_filters_and_enforces_dimension() {
     assert!(!ids.contains(&c));
 
     // Wrong-dimension embedding is a dimension error.
-    assert!(g.set_node_embedding(a, Embedding::new(vec![1.0, 2.0])).is_err());
+    assert!(g
+        .set_node_embedding(a, Embedding::new(vec![1.0, 2.0]))
+        .is_err());
 }
 
 #[test]
@@ -242,7 +314,8 @@ fn similarity_within_reachability_is_bounded_by_hops() {
     let c = g.add_node(person(), props(&[])).unwrap();
     let d = g.add_node(person(), props(&[])).unwrap(); // unreachable from a
     for n in [a, b, c, d] {
-        g.set_node_embedding(n, Embedding::new(vec![1.0, 0.0, 0.0, 0.0])).unwrap();
+        g.set_node_embedding(n, Embedding::new(vec![1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
     }
     g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap(); // a -> b (1 hop)
     g.add_edge(b, c, knows(), 1.0, props(&[])).unwrap(); // b -> c (2 hops)
@@ -256,9 +329,18 @@ fn similarity_within_reachability_is_bounded_by_hops() {
             min_weight: None,
             direction: DirectionOpt::Outbound,
         }),
-        ..SimilarityQuery::new(Embedding::new(vec![1.0, 0.0, 0.0, 0.0]), SimilarityMetric::Cosine, 10)
+        ..SimilarityQuery::new(
+            Embedding::new(vec![1.0, 0.0, 0.0, 0.0]),
+            SimilarityMetric::Cosine,
+            10,
+        )
     };
-    let ids: Vec<NodeId> = g.similar_nodes(q).unwrap().into_iter().map(|(n, _)| n).collect();
+    let ids: Vec<NodeId> = g
+        .similar_nodes(q)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     assert!(ids.contains(&a) && ids.contains(&b));
     assert!(!ids.contains(&c), "c is 2 hops away, must be excluded");
     assert!(!ids.contains(&d), "d is unreachable, must be excluded");
@@ -272,11 +354,25 @@ fn remove_node_mode_default_rejects_incident_edges() {
     g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
 
     // Default mode refuses to orphan edges.
-    assert!(g.remove_node(a, RemoveNodeMode::RejectIfEdgesExist).is_err());
+    assert!(g
+        .remove_node(a, RemoveNodeMode::RejectIfEdgesExist)
+        .is_err());
     // Explicit cascade succeeds and leaves no dangling edge.
-    g.remove_node(a, RemoveNodeMode::RemoveIncidentEdges).unwrap();
+    g.remove_node(a, RemoveNodeMode::RemoveIncidentEdges)
+        .unwrap();
     assert!(g.node(a).unwrap().is_none());
-    assert_eq!(g.neighbors(b, NeighborOptions { direction: drey::traverse::DirectionOpt::Inbound, ..Default::default() }).unwrap().len(), 0);
+    assert_eq!(
+        g.neighbors(
+            b,
+            NeighborOptions {
+                direction: drey::traverse::DirectionOpt::Inbound,
+                ..Default::default()
+            }
+        )
+        .unwrap()
+        .len(),
+        0
+    );
 }
 
 #[test]
@@ -286,7 +382,9 @@ fn weight_update_with_bounds_and_decay() {
     let b = g.add_node(person(), props(&[])).unwrap();
     let e = g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
 
-    let w = g.update_edge_weight(e, WeightUpdate::add(10.0).with_bounds(0.0, 2.0)).unwrap();
+    let w = g
+        .update_edge_weight(e, WeightUpdate::add(10.0).with_bounds(0.0, 2.0))
+        .unwrap();
     assert_eq!(w, 2.0); // clamped
 
     let report = g.decay_edges(EdgeFilter::new(), 0.5).unwrap();
@@ -298,7 +396,8 @@ fn weight_update_with_bounds_and_decay() {
 fn durable_ids_are_not_reused_after_removal() {
     let mut g = base_graph();
     let a = g.add_node(person(), props(&[])).unwrap();
-    g.remove_node(a, RemoveNodeMode::RejectIfEdgesExist).unwrap();
+    g.remove_node(a, RemoveNodeMode::RejectIfEdgesExist)
+        .unwrap();
     let b = g.add_node(person(), props(&[])).unwrap();
     assert_ne!(a, b); // monotonic allocator, no reuse (PRD §7.4)
 }
@@ -308,18 +407,26 @@ fn feature_export_is_deterministic() {
     let mut g = base_graph();
     let a = g.add_node(person(), props(&[])).unwrap();
     let b = g.add_node(person(), props(&[])).unwrap();
-    g.set_node_embedding(a, Embedding::new(vec![1.0, 2.0, 3.0, 4.0])).unwrap();
-    g.set_node_embedding(b, Embedding::new(vec![5.0, 6.0, 7.0, 8.0])).unwrap();
+    g.set_node_embedding(a, Embedding::new(vec![1.0, 2.0, 3.0, 4.0]))
+        .unwrap();
+    g.set_node_embedding(b, Embedding::new(vec![5.0, 6.0, 7.0, 8.0]))
+        .unwrap();
     g.add_edge(a, b, knows(), 0.5, props(&[])).unwrap();
 
     let map = g.node_index_map();
     assert_eq!(map.len(), 2);
-    let spec = FeatureSpec { include_embedding: true, numeric_properties: vec![] };
+    let spec = FeatureSpec {
+        include_embedding: true,
+        numeric_properties: vec![],
+    };
     let feats = g.node_features(&map, &spec).unwrap();
     // Row order follows the deterministic index map (sorted by NodeId).
     assert_eq!(feats[map.index_of(a).unwrap()], vec![1.0, 2.0, 3.0, 4.0]);
     let ei = g.edge_index(&map, &EdgeFilter::new()).unwrap();
-    assert_eq!(ei, vec![(map.index_of(a).unwrap(), map.index_of(b).unwrap())]);
+    assert_eq!(
+        ei,
+        vec![(map.index_of(a).unwrap(), map.index_of(b).unwrap())]
+    );
 }
 
 #[test]

@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::graph::Graph;
 use crate::query::PropertyQuery;
 use crate::traverse::DirectionOpt;
-use crate::types::{Embedding, EdgeType, NodeId, NodeType};
+use crate::types::{EdgeType, Embedding, NodeId, NodeType};
 
 /// Distance/similarity metric (PRD §9.4).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,9 +43,12 @@ impl SimilarityMetric {
                     dot(a, b) / (na * nb)
                 }
             }
-            SimilarityMetric::Euclidean => {
-                a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
-            }
+            SimilarityMetric::Euclidean => a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum::<f32>()
+                .sqrt(),
         }
     }
 }
@@ -160,8 +163,11 @@ impl Graph {
 
         // Intersect with the property filter.
         if let Some(pf) = &query.property_filter {
-            let allowed: HashSet<u64> =
-                self.nodes_by_property(pf.clone())?.into_iter().map(|n| n.0).collect();
+            let allowed: HashSet<u64> = self
+                .nodes_by_property(pf.clone())?
+                .into_iter()
+                .map(|n| n.0)
+                .collect();
             set.retain(|n| allowed.contains(n));
         }
 

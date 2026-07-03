@@ -17,7 +17,7 @@ use drey::traverse::{
     CostMode, DirectionOpt, NeighborOptions, ShortestPathOptions, TraversalOptions,
 };
 use drey::types::{Embedding, NodeType, Scalar, Value};
-use drey::{EdgeType, Graph, NodeId, EdgeId};
+use drey::{EdgeId, EdgeType, Graph, NodeId};
 
 use crate::generator::Fixture;
 use crate::workload::{Dir, WorkloadOp};
@@ -47,10 +47,16 @@ pub struct OpOutcome {
 
 impl OpOutcome {
     fn ok(counters: BTreeMap<String, u64>) -> Self {
-        OpOutcome { status: OpStatus::Ok, counters }
+        OpOutcome {
+            status: OpStatus::Ok,
+            counters,
+        }
     }
     fn na() -> Self {
-        OpOutcome { status: OpStatus::NotApplicable, counters: BTreeMap::new() }
+        OpOutcome {
+            status: OpStatus::NotApplicable,
+            counters: BTreeMap::new(),
+        }
     }
 }
 
@@ -127,12 +133,18 @@ impl GraphDriver for DreyDriver {
         }
         let mut g = Graph::in_memory(config);
         for t in 0..fx.params.node_types {
-            g.register_node_type(NodeType::new(format!("nt_{t:02}")), Some(fx.params.embed_dim as usize))
-                .map_err(|e| e.to_string())?;
+            g.register_node_type(
+                NodeType::new(format!("nt_{t:02}")),
+                Some(fx.params.embed_dim as usize),
+            )
+            .map_err(|e| e.to_string())?;
         }
         for n in &fx.nodes {
-            let props: BTreeMap<String, Value> =
-                n.props.iter().map(|(k, v)| (k.clone(), to_value(v))).collect();
+            let props: BTreeMap<String, Value> = n
+                .props
+                .iter()
+                .map(|(k, v)| (k.clone(), to_value(v)))
+                .collect();
             g.add_node(NodeType::new(n.node_type.clone()), props)
                 .map_err(|e| e.to_string())?;
         }
@@ -141,44 +153,87 @@ impl GraphDriver for DreyDriver {
                 .map_err(|e| e.to_string())?;
         }
         for e in &fx.edges {
-            let props: BTreeMap<String, Value> =
-                e.props.iter().map(|(k, v)| (k.clone(), to_value(v))).collect();
-            g.add_edge(NodeId(e.from), NodeId(e.to), EdgeType::new(e.edge_type.clone()), e.weight, props)
-                .map_err(|e| e.to_string())?;
+            let props: BTreeMap<String, Value> = e
+                .props
+                .iter()
+                .map(|(k, v)| (k.clone(), to_value(v)))
+                .collect();
+            g.add_edge(
+                NodeId(e.from),
+                NodeId(e.to),
+                EdgeType::new(e.edge_type.clone()),
+                e.weight,
+                props,
+            )
+            .map_err(|e| e.to_string())?;
         }
-        let stats = LoadStats { nodes: fx.nodes.len(), edges: fx.edges.len() };
+        let stats = LoadStats {
+            nodes: fx.nodes.len(),
+            edges: fx.edges.len(),
+        };
         self.graph = Some(g);
         Ok(stats)
     }
 
     fn run_op(&mut self, op: &WorkloadOp) -> Result<OpOutcome, String> {
         match op {
-            WorkloadOp::Neighbors { start, dir: d, edge_type, min_weight } => {
+            WorkloadOp::Neighbors {
+                start,
+                dir: d,
+                edge_type,
+                min_weight,
+            } => {
                 let opts = NeighborOptions {
                     direction: dir(*d),
                     edge_types: edge_type.iter().map(|t| EdgeType::new(t.clone())).collect(),
                     min_weight: *min_weight,
                 };
-                let ns = self.g().neighbors(NodeId(*start), opts).map_err(|e| e.to_string())?;
+                let ns = self
+                    .g()
+                    .neighbors(NodeId(*start), opts)
+                    .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("neighbors", ns.len() as u64)])))
             }
             WorkloadOp::Traverse { start, max_hops } => {
                 let paths = self
                     .g()
-                    .traverse(NodeId(*start), TraversalOptions { max_hops: *max_hops, max_paths: 1000, ..Default::default() })
+                    .traverse(
+                        NodeId(*start),
+                        TraversalOptions {
+                            max_hops: *max_hops,
+                            max_paths: 1000,
+                            ..Default::default()
+                        },
+                    )
                     .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("paths_returned", paths.len() as u64)])))
             }
-            WorkloadOp::ShortestPath { from, to, weighted, max_steps } => {
+            WorkloadOp::ShortestPath {
+                from,
+                to,
+                weighted,
+                max_steps,
+            } => {
                 let opts = ShortestPathOptions {
-                    cost_mode: if *weighted { CostMode::WeightedCost } else { CostMode::UnweightedHops },
+                    cost_mode: if *weighted {
+                        CostMode::WeightedCost
+                    } else {
+                        CostMode::UnweightedHops
+                    },
                     max_steps: *max_steps,
                     ..Default::default()
                 };
-                let path = self.g().shortest_path(NodeId(*from), NodeId(*to), opts).map_err(|e| e.to_string())?;
+                let path = self
+                    .g()
+                    .shortest_path(NodeId(*from), NodeId(*to), opts)
+                    .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("found", path.is_some() as u64)])))
             }
-            WorkloadOp::PropertyEq { node_type, key, ivalue } => {
+            WorkloadOp::PropertyEq {
+                node_type,
+                key,
+                ivalue,
+            } => {
                 let hits = self
                     .g()
                     .nodes_by_property(PropertyQuery {
@@ -189,7 +244,12 @@ impl GraphDriver for DreyDriver {
                     .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("hits", hits.len() as u64)])))
             }
-            WorkloadOp::PropertyRange { node_type, key, min, max } => {
+            WorkloadOp::PropertyRange {
+                node_type,
+                key,
+                min,
+                max,
+            } => {
                 let hits = self
                     .g()
                     .nodes_by_property(PropertyQuery {
@@ -203,7 +263,11 @@ impl GraphDriver for DreyDriver {
                     .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("hits", hits.len() as u64)])))
             }
-            WorkloadOp::Similar { seed_node, k, node_type } => {
+            WorkloadOp::Similar {
+                seed_node,
+                k,
+                node_type,
+            } => {
                 let emb = self
                     .g()
                     .node(NodeId(*seed_node))
@@ -219,22 +283,36 @@ impl GraphDriver for DreyDriver {
                 let hits = self.g().similar_nodes(query).map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("results", hits.len() as u64)])))
             }
-            WorkloadOp::UpdateEdgeWeight { edge, factor, bounded } => {
+            WorkloadOp::UpdateEdgeWeight {
+                edge,
+                factor,
+                bounded,
+            } => {
                 let update = if *bounded {
                     WeightUpdate::multiply(*factor).with_bounds(0.0, 1.0)
                 } else {
                     WeightUpdate::multiply(*factor)
                 };
-                self.g_mut().update_edge_weight(EdgeId(*edge), update).map_err(|e| e.to_string())?;
+                self.g_mut()
+                    .update_edge_weight(EdgeId(*edge), update)
+                    .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("updated", 1)])))
             }
-            WorkloadOp::DecayEdges { edge_type, factor, .. } => {
+            WorkloadOp::DecayEdges {
+                edge_type, factor, ..
+            } => {
                 let mut filter = EdgeFilter::new();
                 if let Some(t) = edge_type {
                     filter = filter.with_edge_type(EdgeType::new(t.clone()));
                 }
-                let report = self.g_mut().decay_edges(filter, *factor).map_err(|e| e.to_string())?;
-                Ok(OpOutcome::ok(c(&[("edges_decayed", report.edges_decayed as u64)])))
+                let report = self
+                    .g_mut()
+                    .decay_edges(filter, *factor)
+                    .map_err(|e| e.to_string())?;
+                Ok(OpOutcome::ok(c(&[(
+                    "edges_decayed",
+                    report.edges_decayed as u64,
+                )])))
             }
             // In-memory graph: commit is not a measured persistence op here (M2
             // measures file-backed commit); report n/a per spec.
@@ -287,7 +365,11 @@ impl GraphDriver for NaiveDriver {
         for n in &fx.nodes {
             self.nodes.insert(
                 n.id,
-                NaiveNode { node_type: n.node_type.clone(), props: n.props.clone().into_iter().collect(), embedding: None },
+                NaiveNode {
+                    node_type: n.node_type.clone(),
+                    props: n.props.clone().into_iter().collect(),
+                    embedding: None,
+                },
             );
         }
         for (id, v) in &fx.embeddings {
@@ -296,10 +378,21 @@ impl GraphDriver for NaiveDriver {
             }
         }
         for e in &fx.edges {
-            self.edges.insert(e.id, NaiveEdge { from: e.from, to: e.to, edge_type: e.edge_type.clone(), weight: e.weight });
+            self.edges.insert(
+                e.id,
+                NaiveEdge {
+                    from: e.from,
+                    to: e.to,
+                    edge_type: e.edge_type.clone(),
+                    weight: e.weight,
+                },
+            );
             self.adjacency.entry(e.from).or_default().push(e.id);
         }
-        Ok(LoadStats { nodes: self.nodes.len(), edges: self.edges.len() })
+        Ok(LoadStats {
+            nodes: self.nodes.len(),
+            edges: self.edges.len(),
+        })
     }
 
     fn run_op(&mut self, op: &WorkloadOp) -> Result<OpOutcome, String> {

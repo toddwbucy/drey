@@ -42,13 +42,22 @@ pub enum WeightOp {
 
 impl WeightUpdate {
     pub fn set(v: f32) -> Self {
-        WeightUpdate { op: WeightOp::Set(v), bounds: None }
+        WeightUpdate {
+            op: WeightOp::Set(v),
+            bounds: None,
+        }
     }
     pub fn add(v: f32) -> Self {
-        WeightUpdate { op: WeightOp::Add(v), bounds: None }
+        WeightUpdate {
+            op: WeightOp::Add(v),
+            bounds: None,
+        }
     }
     pub fn multiply(v: f32) -> Self {
-        WeightUpdate { op: WeightOp::Multiply(v), bounds: None }
+        WeightUpdate {
+            op: WeightOp::Multiply(v),
+            bounds: None,
+        }
     }
     pub fn with_bounds(mut self, min: f32, max: f32) -> Self {
         self.bounds = Some((min, max));

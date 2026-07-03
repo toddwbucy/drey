@@ -42,8 +42,7 @@ pub enum Phase {
 /// SplitMix64 finalizer — mixes the seed with a phase tag so phase streams are
 /// decorrelated. Deterministic and platform-independent (integer ops only).
 fn mix(seed: u64, tag: u64) -> u64 {
-    let mut z = seed
-        .wrapping_add(tag.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut z = seed.wrapping_add(tag.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)

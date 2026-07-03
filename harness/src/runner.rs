@@ -71,7 +71,11 @@ pub fn run(
             let p99 = nearest_rank(&sorted, 0.99);
             // Sustained throughput: retained ops per total retained seconds.
             let total_s: f64 = sorted.iter().sum::<f64>() / 1_000_000.0;
-            let tput = if total_s > 0.0 { sorted.len() as f64 / total_s } else { 0.0 };
+            let tput = if total_s > 0.0 {
+                sorted.len() as f64 / total_s
+            } else {
+                0.0
+            };
             (Some(p50), Some(p95), Some(p99), Some(tput))
         };
 

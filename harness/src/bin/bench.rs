@@ -6,7 +6,7 @@ use std::process::exit;
 
 use harness::driver::{DreyDriver, GraphDriver, NaiveDriver};
 use harness::fixture::read_fixture;
-use harness::output::{host_fingerprint, RunMeta, RunOutput, Resources};
+use harness::output::{host_fingerprint, Resources, RunMeta, RunOutput};
 use harness::runner;
 use harness::workload::measurement_plan;
 
@@ -60,7 +60,10 @@ fn main() {
             exit(1);
         }
     };
-    eprintln!("loaded {} nodes, {} edges; running plan…", load.nodes, load.edges);
+    eprintln!(
+        "loaded {} nodes, {} edges; running plan…",
+        load.nodes, load.edges
+    );
 
     let plan = measurement_plan(&fixture, per_bucket);
     // Warmup: discard up to 100 per bucket (spec §5.2), but never more than

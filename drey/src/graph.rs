@@ -9,13 +9,9 @@ use std::collections::HashSet;
 
 use crate::config::GraphConfig;
 use crate::error::{Error, Result};
-use crate::mutation::{
-    DecayReport, EdgeFilter, PropertyPatch, RemoveNodeMode, WeightUpdate,
-};
+use crate::mutation::{DecayReport, EdgeFilter, PropertyPatch, RemoveNodeMode, WeightUpdate};
 use crate::store::{apply_patch, Store};
-use crate::types::{
-    Edge, EdgeId, EdgeType, Embedding, Node, NodeId, NodeType, Properties,
-};
+use crate::types::{Edge, EdgeId, EdgeType, Embedding, Node, NodeId, NodeType, Properties};
 
 /// An embedded property graph (PRD §9). Single writer: mutations take `&mut
 /// self`, reads take `&self`, so the borrow checker forbids a read overlapping
@@ -110,7 +106,10 @@ impl Graph {
         }
         self.store.reindex_node(node.0, &old, &new);
         self.store.nodes.get_mut(&node.0).unwrap().properties = new;
-        self.log(Mutation::UpdateNodeProperties { node, patch: patch.0 })
+        self.log(Mutation::UpdateNodeProperties {
+            node,
+            patch: patch.0,
+        })
     }
 
     pub fn remove_node(&mut self, node: NodeId, mode: RemoveNodeMode) -> Result<()> {
@@ -166,9 +165,16 @@ impl Graph {
                 return Err(Error::InvalidPropertyValue("edge property".into()));
             }
         }
-        let rec = self.store.edges.get_mut(&edge.0).ok_or(Error::EdgeNotFound(edge))?;
+        let rec = self
+            .store
+            .edges
+            .get_mut(&edge.0)
+            .ok_or(Error::EdgeNotFound(edge))?;
         apply_patch(&mut rec.properties, &patch.0);
-        self.log(Mutation::UpdateEdgeProperties { edge, patch: patch.0 })
+        self.log(Mutation::UpdateEdgeProperties {
+            edge,
+            patch: patch.0,
+        })
     }
 
     pub fn remove_edge(&mut self, edge: EdgeId) -> Result<()> {
@@ -196,7 +202,9 @@ impl Graph {
             filter: filter.clone(),
             factor,
         })?;
-        Ok(DecayReport { edges_decayed: ids.len() })
+        Ok(DecayReport {
+            edges_decayed: ids.len(),
+        })
     }
 
     /// Make all prior mutations durable (PRD §9.2). In-memory graphs have
