@@ -590,6 +590,10 @@ fn nan_and_denormal_edge_weights_round_trip_byte_exact() {
     // weights too. (Whether NaN weights *should* be accepted is a separate
     // validation question; here we only lock the round-trip of whatever is
     // stored.)
+    // A negative NaN with a non-canonical payload: asserting exact bits proves
+    // sign + mantissa survive, not merely that "some NaN" came back (canonical
+    // f32::NAN would pass is_nan() even if the payload were laundered).
+    const HOSTILE_NAN: u32 = 0xFFC0_1234;
     let dir = tmp("nan_weight");
     let e_nan;
     let e_den;
@@ -598,13 +602,21 @@ fn nan_and_denormal_edge_weights_round_trip_byte_exact() {
         g.register_node_type(person(), None).unwrap();
         let a = g.add_node(person(), props(&[])).unwrap();
         let b = g.add_node(person(), props(&[])).unwrap();
-        e_nan = g.add_edge(a, b, knows(), f32::NAN, props(&[])).unwrap();
+        e_nan = g
+            .add_edge(a, b, knows(), f32::from_bits(HOSTILE_NAN), props(&[]))
+            .unwrap();
         e_den = g
             .add_edge(a, b, knows(), f32::from_bits(1), props(&[]))
             .unwrap();
         g.commit().unwrap();
     }
     let g = Graph::open(&dir, config()).unwrap();
-    assert!(g.edge(e_nan).unwrap().unwrap().weight.is_nan());
+    let w = g.edge(e_nan).unwrap().unwrap().weight;
+    assert!(w.is_nan());
+    assert_eq!(
+        w.to_bits(),
+        HOSTILE_NAN,
+        "NaN sign/payload bits not preserved byte-exact"
+    );
     assert_eq!(g.edge(e_den).unwrap().unwrap().weight.to_bits(), 1);
 }
