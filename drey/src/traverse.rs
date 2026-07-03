@@ -40,11 +40,13 @@ pub struct NeighborOptions {
     pub min_weight: Option<f32>,
 }
 
-/// Deprecated alias for [`Direction`]. The options structs used to carry a
-/// separate `DirectionOpt` enum, which made the PRD-sanctioned [`Direction`]
-/// (§9.1, §9.4) unusable in a public call. They are now the same type; the alias
-/// is retained so existing `DirectionOpt::Outbound`-style references keep
-/// compiling. Prefer [`Direction`].
+/// Backwards-compatibility alias for [`Direction`]. The options structs used to
+/// carry a separate `DirectionOpt` enum, which made the PRD-sanctioned
+/// [`Direction`] (§9.1, §9.4) unusable in a public call. They are now the same
+/// type; the alias is kept so existing `DirectionOpt::Outbound`-style references
+/// keep compiling. Prefer [`Direction`] in new code. (Not marked `#[deprecated]`
+/// because the option structs' own `direction` fields are still declared with
+/// this name, which would then warn under the crate's `-D warnings` gate.)
 pub type DirectionOpt = Direction;
 
 /// What happens when traversal revisits a node (PRD §9.3 `cycle_policy`).

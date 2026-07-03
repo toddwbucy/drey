@@ -227,12 +227,24 @@ impl Graph {
         }
         let ids = self.edges_matching(&filter);
         let update = WeightUpdate::multiply(factor);
+        // Compute and validate every result BEFORE mutating anything: a finite
+        // weight × finite factor can still overflow to ±inf, and applying edges
+        // one-by-one would otherwise leave the batch partially applied on such a
+        // result. Reject the whole batch instead (matches `update_edge_weight`).
+        let mut updates = Vec::with_capacity(ids.len());
         for id in &ids {
-            let current = self.store.edges[id].weight;
-            let new = update.apply(current);
+            let new = update.apply(self.store.edges[id].weight);
+            if !new.is_finite() {
+                return Err(Error::InvalidPropertyValue(
+                    "decay produced a non-finite edge weight".into(),
+                ));
+            }
+            updates.push((*id, new));
+        }
+        for (id, new) in &updates {
             // Route through the same write path as `update_edge_weight` so any
             // validation/bookkeeping in the store applies to both.
-            self.store.set_edge_weight(EdgeId(*id), new)?;
+            self.store.set_edge_weight(EdgeId(*id), *new)?;
         }
         // A single log record captures the batch for replay.
         self.log(Mutation::DecayEdges {

@@ -657,3 +657,19 @@ fn direction_enum_is_usable_in_public_options() {
         ..Default::default()
     };
 }
+
+#[test]
+fn decay_rejecting_non_finite_result_leaves_batch_unapplied() {
+    // A finite weight × finite factor can overflow to +inf; the whole decay
+    // batch must be rejected before any edge is mutated (no partial apply).
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let b = g.add_node(person(), props(&[])).unwrap();
+    let e = g.add_edge(a, b, knows(), f32::MAX, props(&[])).unwrap();
+    assert!(
+        g.decay_edges(EdgeFilter::new(), 10.0).is_err(),
+        "overflow to +inf must be rejected"
+    );
+    // Weight is untouched: the batch aborted before applying anything.
+    assert_eq!(g.edge(e).unwrap().unwrap().weight, f32::MAX);
+}
