@@ -2,7 +2,7 @@
 
 use drey::config::GraphConfig;
 use drey::export::{FeatureSpec, GraphFeatureExport};
-use drey::mutation::{EdgeFilter, RemoveNodeMode, WeightUpdate};
+use drey::mutation::{EdgeFilter, PropertyPatch, RemoveNodeMode, WeightUpdate};
 use drey::query::{PropertyQuery, ScalarPredicate};
 use drey::similarity::{SimilarityMetric, SimilarityQuery};
 use drey::traverse::{CostMode, NeighborOptions, ShortestPathOptions, TraversalOptions};
@@ -507,4 +507,80 @@ fn export_node_type_ids_align_and_features_are_rectangular() {
         .unwrap();
     assert_eq!(feats[0].len(), feats[1].len());
     assert_eq!(feats[map.index_of(b).unwrap()], vec![0.0, 0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn property_index_has_no_stale_hits_after_remove_or_update() {
+    // The scalar index must drop a node's entry on remove and on value change,
+    // so a query never returns a removed node or an old value (regression lock
+    // for the prop-index tombstone-leak fix).
+    let mut g = base_graph();
+    let a = g
+        .add_node(person(), props(&[("age", Value::I64(50))]))
+        .unwrap();
+    let b = g
+        .add_node(person(), props(&[("age", Value::I64(50))]))
+        .unwrap();
+    let eq = |v: i64| PropertyQuery {
+        node_type: person(),
+        key: "age".into(),
+        predicate: ScalarPredicate::Eq(Scalar::I64(v)),
+    };
+    g.remove_node(a, RemoveNodeMode::RejectIfEdgesExist)
+        .unwrap();
+    assert_eq!(
+        g.nodes_by_property(eq(50)).unwrap(),
+        vec![b],
+        "removed node still indexed"
+    );
+    // Update b's value: the old value must no longer match, the new one must.
+    g.update_node_properties(b, PropertyPatch::new().set("age", Value::I64(60)))
+        .unwrap();
+    assert!(
+        g.nodes_by_property(eq(50)).unwrap().is_empty(),
+        "stale index entry for the pre-update value"
+    );
+    assert_eq!(g.nodes_by_property(eq(60)).unwrap(), vec![b]);
+}
+
+#[test]
+fn shortest_path_from_equals_to_is_zero_length() {
+    // A node reaches itself with a trivial zero-cost path, and that self-target
+    // is found even under a zero step budget (the target check precedes the
+    // budget check).
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let p = g
+        .shortest_path(a, a, ShortestPathOptions::default())
+        .unwrap()
+        .expect("a node reaches itself");
+    assert_eq!(p.nodes, vec![a]);
+    assert!(p.edges.is_empty());
+    assert_eq!(p.cost, 0.0);
+    assert!(g
+        .shortest_path(
+            a,
+            a,
+            ShortestPathOptions {
+                max_steps: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn shortest_path_max_steps_zero_reaches_no_neighbor() {
+    // A zero step budget permits no expansion, so an adjacent target is
+    // unreachable — None, not a panic or an off-by-one hit.
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let b = g.add_node(person(), props(&[])).unwrap();
+    g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
+    let opts = ShortestPathOptions {
+        max_steps: Some(0),
+        ..Default::default()
+    };
+    assert!(g.shortest_path(a, b, opts).unwrap().is_none());
 }

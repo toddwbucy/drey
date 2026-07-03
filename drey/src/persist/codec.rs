@@ -287,15 +287,36 @@ pub(crate) fn read_edge_record(r: &mut Reader) -> Result<EdgeRecord> {
 }
 
 /// CRC-32 (IEEE 802.3), computed without a table so there is no dependency and
-/// the value is fixed across platforms. Used to detect a torn WAL record.
+/// the value is fixed across platforms. Used to detect a torn WAL record and to
+/// checksum the snapshot payload.
+///
+/// Table-driven (one byte per step) rather than bit-by-bit: the snapshot CRC
+/// runs over the whole payload (up to ~1 GB at stress size), where 8×
+/// per-byte work would eat into the process-start budget. The table is built at
+/// compile time from the same reflected polynomial, so the output is bit-
+/// identical to the bit-by-bit form — pinned by `crc32_matches_ieee_known_answer`.
+/// A pure-Rust table keeps the crate dependency-free (serde only).
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        crc = (crc >> 8) ^ CRC_TABLE[((crc ^ byte as u32) & 0xFF) as usize];
     }
     !crc
 }
@@ -303,6 +324,16 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crc32_matches_ieee_known_answer() {
+        // Pin the polynomial/reflection to the standard IEEE CRC-32. The suite is
+        // otherwise self-consistent under any CRC (write and read share the fn),
+        // so without this a reimplementation could change the value and silently
+        // invalidate every WAL frame written by an older build.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
 
     #[test]
     fn f32_round_trips_hostile_bit_patterns() {

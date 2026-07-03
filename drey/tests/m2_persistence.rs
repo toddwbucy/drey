@@ -4,9 +4,9 @@ use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 
 use drey::config::GraphConfig;
-use drey::mutation::{EdgeFilter, RemoveNodeMode};
+use drey::mutation::{EdgeFilter, PropertyPatch, RemoveNodeMode, WeightUpdate};
 use drey::query::{PropertyQuery, ScalarPredicate};
-use drey::types::{Embedding, NodeType, Scalar, Value};
+use drey::types::{Embedding, Node, NodeType, Scalar, Value};
 use drey::{EdgeType, Error, Graph, NodeId};
 use std::collections::BTreeMap;
 
@@ -341,4 +341,282 @@ fn read_only_open_sees_committed_and_rejects_writes() {
     assert!(g.node(a).unwrap().is_some());
     assert!(g.add_node(person(), props(&[])).is_err());
     let _ = NodeId(0); // silence unused import in some configs
+}
+
+/// All nodes materialized and sorted by id, for whole-graph equivalence checks.
+fn collect_nodes(g: &Graph) -> Vec<Node> {
+    let mut ids = g.node_ids();
+    ids.sort_by_key(|n| n.0);
+    ids.into_iter()
+        .map(|id| g.node(id).unwrap().unwrap())
+        .collect()
+}
+
+#[test]
+fn wal_crc_byteflip_inside_frame_loads_only_prior_prefix() {
+    // A bit-flip inside a committed frame's payload (length prefix intact) must
+    // reach the CRC check and be rejected — replay stops at the bad frame and
+    // loads only the prior committed prefix, never a blended/corrupt graph
+    // (PRD §10.2.1). Exercises the crc32 branch the framing-break tests miss.
+    let dir = tmp("wal_crc_flip");
+    let a;
+    let size_after_first;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        size_after_first = fs::metadata(dir.join("wal.log")).unwrap().len();
+        let _b = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    // Batch 2's first frame starts at `size_after_first`: len(4) + crc(4) +
+    // payload. Flip the last payload byte — inside the payload, length intact —
+    // so the corruption is caught by the CRC, not a framing mismatch.
+    let path = dir.join("wal.log");
+    let mut bytes = fs::read(&path).unwrap();
+    let off = size_after_first as usize;
+    let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+    let flip = off + 8 + len - 1;
+    bytes[flip] ^= 0xFF;
+    fs::write(&path, &bytes).unwrap();
+
+    let g = Graph::open(&dir, config()).unwrap();
+    assert_eq!(g.counts().0, 1, "corrupt batch 2 must be discarded");
+    assert!(g.node(a).unwrap().is_some());
+}
+
+#[test]
+fn corrupt_snapshot_truncation_fails_open() {
+    // PRD §10.2.1 row 3: a corrupt/truncated snapshot loads the last valid state
+    // or fails explicitly — never a silent partial load.
+    let dir = tmp("snap_truncate");
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap();
+    }
+    let path = dir.join("snapshot.bin");
+    let full = fs::metadata(&path).unwrap().len();
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(full / 2)
+        .unwrap();
+    match Graph::open(&dir, config()) {
+        Err(Error::Codec(_)) => {}
+        Err(other) => panic!("expected Codec on truncated snapshot, got {other}"),
+        Ok(_) => panic!("open succeeded on a truncated snapshot"),
+    }
+}
+
+#[test]
+fn corrupt_snapshot_payload_byte_fails_open() {
+    // A single bit-flip in the snapshot payload (no per-frame framing here) must
+    // be caught by the trailing snapshot checksum, not silently loaded as an
+    // altered weight/property (PRD §10.2.1: never a silent partial blend).
+    let dir = tmp("snap_payload");
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        let a = g
+            .add_node(person(), props(&[("age", Value::I64(7))]))
+            .unwrap();
+        let b = g.add_node(person(), props(&[])).unwrap();
+        g.add_edge(a, b, knows(), 0.5, props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap();
+    }
+    let path = dir.join("snapshot.bin");
+    let mut bytes = fs::read(&path).unwrap();
+    let mid = bytes.len() / 2; // deep in the payload, past the header, before the CRC
+    bytes[mid] ^= 0xFF;
+    fs::write(&path, &bytes).unwrap();
+    match Graph::open(&dir, config()) {
+        Err(Error::Codec(m)) => assert!(m.contains("checksum"), "unexpected message: {m}"),
+        Err(other) => panic!("expected a snapshot checksum error, got {other}"),
+        Ok(_) => panic!("open succeeded on a corrupt snapshot payload"),
+    }
+}
+
+#[test]
+fn all_five_previously_untested_wal_tags_replay() {
+    // UpdateNodeProperties(3), SetEdgeWeight(6), UpdateEdgeProperties(7),
+    // RemoveEdge(8), and DecayEdges(9) were never encoded-then-decoded by any
+    // test; a write/read field mismatch on the hand-rolled codec would ship
+    // undetected. Exercise each through commit -> reopen -> read.
+    let dir = tmp("five_tags");
+    let a;
+    let e;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g
+            .add_node(person(), props(&[("age", Value::I64(1))]))
+            .unwrap();
+        let b = g.add_node(person(), props(&[])).unwrap();
+        e = g
+            .add_edge(
+                a,
+                b,
+                knows(),
+                1.0,
+                props(&[("label", Value::String("x".into()))]),
+            )
+            .unwrap();
+        g.commit().unwrap();
+        // tag 3
+        g.update_node_properties(a, PropertyPatch::new().set("age", Value::I64(99)))
+            .unwrap();
+        // tag 6 (update_edge_weight logs the resolved SetEdgeWeight)
+        g.update_edge_weight(e, WeightUpdate::set(0.8)).unwrap();
+        // tag 7
+        g.update_edge_properties(
+            e,
+            PropertyPatch::new().set("label", Value::String("y".into())),
+        )
+        .unwrap();
+        // tag 8 (add then remove a throwaway edge)
+        let e2 = g.add_edge(a, b, knows(), 0.1, props(&[])).unwrap();
+        g.remove_edge(e2).unwrap();
+        // tag 9 (0.8 -> 0.4; e2 already gone, so only e decays)
+        g.decay_edges(EdgeFilter::new(), 0.5).unwrap();
+        g.commit().unwrap();
+    }
+    let g = Graph::open(&dir, config()).unwrap();
+    let na = g.node(a).unwrap().unwrap();
+    assert_eq!(na.properties.get("age"), Some(&Value::I64(99)), "tag 3");
+    let ee = g.edge(e).unwrap().unwrap();
+    assert_eq!(ee.weight, 0.4, "tags 6 + 9: set 0.8 then decay 0.5");
+    assert_eq!(
+        ee.properties.get("label"),
+        Some(&Value::String("y".into())),
+        "tag 7"
+    );
+    assert_eq!(g.counts().1, 1, "tag 8: removed edge stays gone");
+}
+
+#[test]
+fn full_state_equivalent_after_reopen() {
+    // Not a spot-check: the entire node set (ids, types, properties, embeddings)
+    // and the surviving edge must be byte-identical after a close/reopen cycle
+    // that exercised update/decay/remove paths.
+    let dir = tmp("state_equiv");
+    let live_nodes;
+    let live_edge;
+    let e1;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), Some(4)).unwrap();
+        let a = g
+            .add_node(
+                person(),
+                props(&[("age", Value::I64(30)), ("t", Value::Bytes(vec![1, 2, 3]))]),
+            )
+            .unwrap();
+        let b = g
+            .add_node(person(), props(&[("age", Value::I64(40))]))
+            .unwrap();
+        let c = g.add_node(person(), props(&[])).unwrap();
+        g.set_node_embedding(
+            a,
+            Embedding::new(vec![f32::from_bits(1), -0.0, 0.1, f32::MIN_POSITIVE]),
+        )
+        .unwrap();
+        e1 = g
+            .add_edge(
+                a,
+                b,
+                knows(),
+                0.75,
+                props(&[("k", Value::String("v".into()))]),
+            )
+            .unwrap();
+        let _e2 = g.add_edge(b, c, knows(), 0.5, props(&[])).unwrap();
+        // Exercise several mutation kinds before the snapshot of live state.
+        g.update_node_properties(b, PropertyPatch::new().set("age", Value::I64(41)))
+            .unwrap();
+        g.update_edge_weight(e1, WeightUpdate::multiply(0.5))
+            .unwrap(); // 0.375
+        g.remove_node(c, RemoveNodeMode::RemoveIncidentEdges)
+            .unwrap(); // drops e2
+        g.commit().unwrap();
+        live_nodes = collect_nodes(&g);
+        live_edge = g.edge(e1).unwrap();
+    }
+    let g = Graph::open(&dir, config()).unwrap();
+    assert_eq!(
+        collect_nodes(&g),
+        live_nodes,
+        "node set diverged after reopen"
+    );
+    assert_eq!(g.edge(e1).unwrap(), live_edge, "edge diverged after reopen");
+    assert_eq!(g.counts(), (2, 1));
+}
+
+#[test]
+fn id_allocator_resumes_after_reopen_without_collision() {
+    // Durable ids (design commitment 5): the allocator must resume past every id
+    // ever assigned, so a post-reopen insert never collides with a live or a
+    // removed id.
+    let dir = tmp("id_alloc");
+    let a;
+    let b;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g.add_node(person(), props(&[])).unwrap();
+        b = g.add_node(person(), props(&[])).unwrap();
+        g.remove_node(b, RemoveNodeMode::RejectIfEdgesExist)
+            .unwrap();
+        g.commit().unwrap();
+    }
+    let mut g = Graph::open(&dir, config()).unwrap();
+    let n = g.add_node(person(), props(&[])).unwrap();
+    assert_ne!(n, a);
+    assert_ne!(n, b, "a removed id must not be reused");
+    assert!(
+        n.0 > a.0 && n.0 > b.0,
+        "allocator must resume past all prior ids"
+    );
+}
+
+#[test]
+fn nan_and_denormal_edge_weights_round_trip_byte_exact() {
+    // The codec's byte-exact f32 contract (PRD §10.2) must hold for hostile
+    // weights too. (Whether NaN weights *should* be accepted is a separate
+    // validation question; here we only lock the round-trip of whatever is
+    // stored.)
+    // A negative NaN with a non-canonical payload: asserting exact bits proves
+    // sign + mantissa survive, not merely that "some NaN" came back (canonical
+    // f32::NAN would pass is_nan() even if the payload were laundered).
+    const HOSTILE_NAN: u32 = 0xFFC0_1234;
+    let dir = tmp("nan_weight");
+    let e_nan;
+    let e_den;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        let a = g.add_node(person(), props(&[])).unwrap();
+        let b = g.add_node(person(), props(&[])).unwrap();
+        e_nan = g
+            .add_edge(a, b, knows(), f32::from_bits(HOSTILE_NAN), props(&[]))
+            .unwrap();
+        e_den = g
+            .add_edge(a, b, knows(), f32::from_bits(1), props(&[]))
+            .unwrap();
+        g.commit().unwrap();
+    }
+    let g = Graph::open(&dir, config()).unwrap();
+    let w = g.edge(e_nan).unwrap().unwrap().weight;
+    assert!(w.is_nan());
+    assert_eq!(
+        w.to_bits(),
+        HOSTILE_NAN,
+        "NaN sign/payload bits not preserved byte-exact"
+    );
+    assert_eq!(g.edge(e_den).unwrap().unwrap().weight.to_bits(), 1);
 }
