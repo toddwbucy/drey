@@ -771,6 +771,48 @@ fn wal_header_version_mismatch_fails_explicitly() {
 }
 
 #[test]
+fn legacy_16_byte_v2_wal_fails_with_version_mismatch_not_silent_stale() {
+    // A v2 graph created and never committed to leaves a header-only 16-byte
+    // WAL — shorter than the 20-byte v3 header. Version must be checked before
+    // the full-header length guard, or the file is classified as a torn stale
+    // header and silently rewritten as an empty v3 graph instead of erroring.
+    let dir = tmp("legacy_v2_wal");
+    fs::create_dir_all(&dir).unwrap();
+    let mut header = Vec::new();
+    header.extend_from_slice(b"DREY");
+    header.extend_from_slice(&2u32.to_le_bytes()); // v2: no header CRC
+    header.extend_from_slice(&0u64.to_le_bytes()); // epoch 0
+    fs::write(dir.join("wal.log"), &header).unwrap();
+
+    match Graph::open(&dir, config()) {
+        Err(Error::VersionMismatch { found: 2, .. }) => {}
+        Err(other) => panic!("expected VersionMismatch for the v2 WAL, got {other}"),
+        Ok(_) => panic!("open silently accepted (and would rewrite) a legacy v2 WAL"),
+    }
+}
+
+#[test]
+fn torn_header_write_recovers_as_empty_stale_wal() {
+    // A crash mid-header-write leaves a prefix of a valid v3 header. Both torn
+    // shapes — under 8 bytes (no version to check) and 8..20 bytes (valid
+    // magic+version, missing epoch/CRC) — must recover as a stale empty WAL,
+    // not error: there is no committed content to lose.
+    for &torn_at in &[5usize, 12] {
+        let dir = tmp(&format!("torn_header_{torn_at}"));
+        {
+            let mut g = Graph::create(&dir, config()).unwrap();
+            g.register_node_type(person(), None).unwrap();
+        }
+        let bytes = fs::read(dir.join("wal.log")).unwrap();
+        fs::write(dir.join("wal.log"), &bytes[..torn_at]).unwrap();
+
+        let g = Graph::open(&dir, config())
+            .unwrap_or_else(|e| panic!("torn {torn_at}-byte header must recover, got {e}"));
+        assert_eq!(g.counts(), (0, 0), "torn at {torn_at}");
+    }
+}
+
+#[test]
 fn empty_committed_graph_roundtrips() {
     let dir = tmp("empty_graph");
     {

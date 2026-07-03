@@ -585,8 +585,14 @@ struct WalReplay {
 /// into the snapshot) and nothing is replayed. Returns where the committed prefix
 /// ends so the caller can repair the file.
 fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalReplay> {
-    // A WAL shorter than its header carries no valid content.
-    if bytes.len() < WAL_HEADER_LEN {
+    // Guard order matters for legacy files: magic + version live in the first
+    // 8 bytes, so they are checked before the full-header length guard. A
+    // 16-byte v2 WAL (header-only, zero commits) is shorter than the 20-byte v3
+    // header; length-first would classify it as a torn stale header and silently
+    // rewrite it, instead of the VersionMismatch the format contract promises.
+    // Anything under 8 bytes can only be a torn header write — a header prefix
+    // torn mid-create, carrying no version to check and no committed content.
+    if bytes.len() < 8 {
         return Ok(WalReplay {
             epoch: snap_epoch,
             valid_len: WAL_HEADER_LEN,
@@ -601,6 +607,15 @@ fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalRep
         return Err(Error::VersionMismatch {
             found: version,
             supported: FORMAT_VERSION,
+        });
+    }
+    // Right magic and version but shorter than the full header: a v3 header
+    // write torn mid-create. No epoch/CRC to trust, no committed content.
+    if bytes.len() < WAL_HEADER_LEN {
+        return Ok(WalReplay {
+            epoch: snap_epoch,
+            valid_len: WAL_HEADER_LEN,
+            stale: true,
         });
     }
     // Verify the header CRC before trusting the epoch (v3). The epoch is the sole
