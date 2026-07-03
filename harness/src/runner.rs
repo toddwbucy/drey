@@ -110,6 +110,7 @@ pub fn run(
             budget_throughput_per_s: budget.throughput_per_s,
             budget_source: "synthetic".into(),
             pass,
+            counters: std::mem::take(&mut b.last_counters),
         });
     }
     Ok(rows)

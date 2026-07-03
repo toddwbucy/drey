@@ -56,6 +56,11 @@ pub struct RunMeta {
     pub driver: String,
     pub fixture_size: String,
     pub fixture_source: String,
+    /// Fanout class and embedding dim — the budget table is defined at medium
+    /// fanout / dim 1024, so sweep runs at the same size class must be
+    /// distinguishable in the archived document (audit #5 / checklist trap 34).
+    pub fixture_fanout: String,
+    pub fixture_embed_dim: u32,
     pub checksum_verified: bool,
     pub ops_total: u64,
 }
@@ -75,6 +80,10 @@ pub struct ResultRow {
     pub budget_source: String,
     /// `null` until a real driver runs and a budget exists; the M3 gate.
     pub pass: Option<bool>,
+    /// Representative op counters (e.g. `paths_returned`, `hits`), carried so the
+    /// spec §5.4 exact-counter repeatability check can run off the emitted
+    /// document (audit #5: they were computed but silently dropped).
+    pub counters: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

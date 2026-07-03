@@ -93,6 +93,8 @@ fn main() {
             driver: driver.name(),
             fixture_size: format!("{:?}", manifest.parameters.size_class).to_lowercase(),
             fixture_source: format!("{:?}", manifest.source).to_lowercase(),
+            fixture_fanout: format!("{:?}", manifest.parameters.fanout).to_lowercase(),
+            fixture_embed_dim: manifest.parameters.embed_dim,
             checksum_verified: checksum_ok,
             ops_total: plan.len() as u64,
         },

@@ -212,6 +212,26 @@ pub fn self_check(fixture: &Fixture) -> Result<(), String> {
         return Err(format!("mean out-degree {mean} != {expected_mean}"));
     }
 
+    // No node exceeds the declared max_degree — the manifest must not assert a
+    // truncation bound the data violates (spec §3.2).
+    let mut degree = vec![0u32; fixture.nodes.len()];
+    for e in &fixture.edges {
+        if let Some(d) = degree.get_mut(e.from as usize) {
+            *d += 1;
+        }
+        if let Some(d) = degree.get_mut(e.to as usize) {
+            *d += 1;
+        }
+    }
+    if let Some(&max) = degree.iter().max() {
+        if max as u64 > p.max_degree as u64 {
+            return Err(format!(
+                "max node degree {max} exceeds declared max_degree {}",
+                p.max_degree
+            ));
+        }
+    }
+
     // Embedding coverage within tolerance of the parameter.
     let cov = fixture.embeddings.len() as f64 / p.nodes as f64;
     if (cov - p.embed_coverage).abs() > 0.05 {

@@ -402,22 +402,33 @@ impl GraphDriver for NaiveDriver {
                 Ok(OpOutcome::ok(c(&[("neighbors", n as u64)])))
             }
             WorkloadOp::Traverse { start, max_hops } => {
-                // Naive BFS frontier count.
+                // BFS with a visited set and a path cap, matching DreyDriver's
+                // bounds. Without them the hub-heavy graph makes the frontier grow
+                // geometrically and the driver OOMs (audit #5).
+                use std::collections::HashSet;
+                const MAX_PATHS: u64 = 1000;
                 let mut frontier = vec![*start];
-                let mut visited = 0u64;
-                for _ in 0..*max_hops {
+                let mut visited_set: HashSet<u64> = HashSet::from([*start]);
+                let mut paths = 0u64;
+                'outer: for _ in 0..*max_hops {
                     let mut next = Vec::new();
                     for node in frontier.drain(..) {
                         if let Some(edges) = self.adjacency.get(&node) {
                             for e in edges {
-                                next.push(self.edges[e].to);
-                                visited += 1;
+                                let to = self.edges[e].to;
+                                paths += 1;
+                                if paths >= MAX_PATHS {
+                                    break 'outer;
+                                }
+                                if visited_set.insert(to) {
+                                    next.push(to);
+                                }
                             }
                         }
                     }
                     frontier = next;
                 }
-                Ok(OpOutcome::ok(c(&[("visited", visited)])))
+                Ok(OpOutcome::ok(c(&[("paths_returned", paths)])))
             }
             WorkloadOp::PropertyEq { key, ivalue, .. } => {
                 let mut hits = 0u64;
