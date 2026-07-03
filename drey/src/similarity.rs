@@ -57,6 +57,52 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// The internal similarity-evaluation seam (design commitment 6 / PRD §13.2): so
+/// an ANN structure can replace the scan without an API change. The evaluator
+/// ranks an **already-filtered** candidate set, because PRD §13.1 fixes the order
+/// as *filters first, then vector search over survivors* — an ANN impl must then
+/// prove it restricts to the given candidates rather than returning global
+/// top-k. [`ExhaustiveScan`] is the only implementation today (closed decision:
+/// no ANN in v0.1 unless the M3 gate fails, which it does not).
+pub(crate) trait SimilarityEvaluator {
+    /// Rank `candidates` (each `(id, embedding)`, already structural/property
+    /// filtered and dimension-checked) against `query` by `metric`; return the
+    /// top `k` best-first with scores, tie-broken by node id for determinism.
+    fn top_k(
+        &self,
+        query: &[f32],
+        metric: SimilarityMetric,
+        candidates: &[(NodeId, &[f32])],
+        k: usize,
+    ) -> Vec<(NodeId, f32)>;
+}
+
+/// Bounded exhaustive scan: score every candidate, rank, truncate. O(candidates
+/// × dim); the caller bounds the candidate count against the config ceiling.
+pub(crate) struct ExhaustiveScan;
+
+impl SimilarityEvaluator for ExhaustiveScan {
+    fn top_k(
+        &self,
+        query: &[f32],
+        metric: SimilarityMetric,
+        candidates: &[(NodeId, &[f32])],
+        k: usize,
+    ) -> Vec<(NodeId, f32)> {
+        let mut scored: Vec<(NodeId, f32)> = candidates
+            .iter()
+            .map(|(n, emb)| (*n, metric.score(query, emb)))
+            .collect();
+        if metric.higher_is_better() {
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        } else {
+            scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        }
+        scored.truncate(k);
+        scored
+    }
+}
+
 /// A reachability constraint composed into a similarity query (PRD §9.4).
 #[derive(Clone, Debug)]
 pub struct ReachabilityFilter {
@@ -133,24 +179,21 @@ impl Graph {
             )));
         }
 
-        // 4. Exhaustive scan over survivors.
+        // 4–5. Score + rank the survivors behind the evaluation seam (PRD §13.2),
+        // so an ANN structure can replace the exhaustive scan without touching
+        // this method. Materialize the candidate `(id, embedding)` slice here —
+        // the seam ranks a pre-filtered set (PRD §13.1 order), it does not own the
+        // vector space.
         let q = query.vector.as_slice();
-        let mut scored: Vec<(NodeId, f32)> = candidates
+        let cand: Vec<(NodeId, &[f32])> = candidates
             .into_iter()
             .map(|n| {
                 let emb = self.store.nodes[&n].embedding.as_ref().unwrap();
-                (NodeId(n), query.metric.score(q, emb))
+                (NodeId(n), emb.as_slice())
             })
             .collect();
-
-        // 5. Rank; deterministic tie-break on node id.
-        if query.metric.higher_is_better() {
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        } else {
-            scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        }
-        scored.truncate(query.k);
-        Ok(scored)
+        let evaluator: &dyn SimilarityEvaluator = &ExhaustiveScan;
+        Ok(evaluator.top_k(q, query.metric, &cand, query.k))
     }
 
     /// The candidate node set surviving all non-vector filters.
@@ -225,5 +268,26 @@ impl Graph {
             frontier = next;
         }
         Ok(visited)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhaustive_scan_ranks_through_the_trait_object() {
+        // Dispatch the evaluation seam via a trait object (the swap point for a
+        // future ANN): the exhaustive scan ranks the pre-filtered candidates
+        // best-first with an id tie-break.
+        let a = [1.0f32, 0.0];
+        let b = [0.9f32, 0.1];
+        let c = [0.0f32, 1.0];
+        let cand = [(NodeId(1), &a[..]), (NodeId(2), &b[..]), (NodeId(3), &c[..])];
+        let eval: &dyn SimilarityEvaluator = &ExhaustiveScan;
+        let top = eval.top_k(&[1.0, 0.0], SimilarityMetric::Cosine, &cand, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, NodeId(1)); // exact match ranks first
+        assert_eq!(top[1].0, NodeId(2)); // near match second
     }
 }

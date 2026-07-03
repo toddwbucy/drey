@@ -20,7 +20,7 @@ pub struct Graph {
     pub(crate) store: Store,
     pub(crate) config: GraphConfig,
     /// The persistence backend, present when the graph is file-backed (M2).
-    pub(crate) persist: Option<crate::persist::Persister>,
+    pub(crate) persist: Option<Box<dyn crate::persist::Persistence>>,
 }
 
 impl Graph {
