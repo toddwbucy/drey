@@ -283,7 +283,11 @@ mod tests {
         let a = [1.0f32, 0.0];
         let b = [0.9f32, 0.1];
         let c = [0.0f32, 1.0];
-        let cand = [(NodeId(1), &a[..]), (NodeId(2), &b[..]), (NodeId(3), &c[..])];
+        let cand = [
+            (NodeId(1), &a[..]),
+            (NodeId(2), &b[..]),
+            (NodeId(3), &c[..]),
+        ];
         let eval: &dyn SimilarityEvaluator = &ExhaustiveScan;
         let top = eval.top_k(&[1.0, 0.0], SimilarityMetric::Cosine, &cand, 2);
         assert_eq!(top.len(), 2);
