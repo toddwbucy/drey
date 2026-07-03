@@ -234,9 +234,9 @@ fn snapshot_compacts_wal_and_preserves_state() {
         g.add_node(person(), props(&[])).unwrap();
         g.commit().unwrap();
         g.snapshot().unwrap();
-        // WAL is reset after snapshot to just its 16-byte versioned header
-        // (no committed frames).
-        assert_eq!(fs::metadata(dir.join("wal.log")).unwrap().len(), 16);
+        // WAL is reset after snapshot to just its versioned header — 20 bytes:
+        // magic(4) + version(4) + epoch(8) + header-crc(4) (no committed frames).
+        assert_eq!(fs::metadata(dir.join("wal.log")).unwrap().len(), 20);
         // Further mutation after snapshot still persists.
         g.remove_node(a, RemoveNodeMode::RejectIfEdgesExist)
             .unwrap();
@@ -717,4 +717,118 @@ fn recovery_mutation_frames_without_commit_marker_are_discarded() {
         "an unmarked (uncommitted) staged mutation must be discarded"
     );
     assert!(g.node(a).unwrap().is_some());
+}
+
+// ---- Regression coverage added by the repo ultrareview ----
+
+#[test]
+fn wal_header_epoch_corruption_is_detected_not_silently_stale() {
+    // The WAL header epoch decides replay-vs-discard. A bit-flip lowering it
+    // below the snapshot epoch would, without a header CRC, silently discard the
+    // post-snapshot WAL and lose acknowledged commits. The v3 header CRC turns
+    // that into a load-time error instead.
+    let dir = tmp("wal_header_crc");
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap(); // epoch -> 1, WAL re-headered at epoch 1
+        g.add_node(person(), props(&[])).unwrap(); // post-snapshot commit in epoch-1 WAL
+        g.commit().unwrap();
+    }
+    let mut bytes = fs::read(dir.join("wal.log")).unwrap();
+    bytes[8] ^= 0x01; // epoch 1 -> 0 (would read as stale without the CRC)
+    fs::write(dir.join("wal.log"), &bytes).unwrap();
+
+    match Graph::open(&dir, config()) {
+        Err(Error::Codec(_)) => {}
+        Err(other) => panic!("expected a Codec error for the corrupt WAL header, got {other}"),
+        Ok(_) => panic!("open silently accepted a corrupt WAL header"),
+    }
+}
+
+#[test]
+fn wal_header_version_mismatch_fails_explicitly() {
+    let dir = tmp("wal_version_mismatch");
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    // Corrupt the WAL format version (bytes 4..8, after the 4-byte magic). The
+    // version is checked before the header CRC, so this is a clean VersionMismatch.
+    let mut bytes = fs::read(dir.join("wal.log")).unwrap();
+    bytes[4] = bytes[4].wrapping_add(1);
+    fs::write(dir.join("wal.log"), &bytes).unwrap();
+
+    match Graph::open(&dir, config()) {
+        Err(Error::VersionMismatch { .. }) => {}
+        Err(other) => panic!("expected VersionMismatch for the WAL header, got {other}"),
+        Ok(_) => panic!("open silently accepted a WAL header with a wrong version"),
+    }
+}
+
+#[test]
+fn legacy_16_byte_v2_wal_fails_with_version_mismatch_not_silent_stale() {
+    // A v2 graph created and never committed to leaves a header-only 16-byte
+    // WAL — shorter than the 20-byte v3 header. Version must be checked before
+    // the full-header length guard, or the file is classified as a torn stale
+    // header and silently rewritten as an empty v3 graph instead of erroring.
+    let dir = tmp("legacy_v2_wal");
+    fs::create_dir_all(&dir).unwrap();
+    let mut header = Vec::new();
+    header.extend_from_slice(b"DREY");
+    header.extend_from_slice(&2u32.to_le_bytes()); // v2: no header CRC
+    header.extend_from_slice(&0u64.to_le_bytes()); // epoch 0
+    fs::write(dir.join("wal.log"), &header).unwrap();
+
+    match Graph::open(&dir, config()) {
+        Err(Error::VersionMismatch { found: 2, .. }) => {}
+        Err(other) => panic!("expected VersionMismatch for the v2 WAL, got {other}"),
+        Ok(_) => panic!("open silently accepted (and would rewrite) a legacy v2 WAL"),
+    }
+}
+
+#[test]
+fn torn_header_write_recovers_as_empty_stale_wal() {
+    // A crash mid-header-write leaves a prefix of a valid v3 header. Both torn
+    // shapes — under 8 bytes (no version to check) and 8..20 bytes (valid
+    // magic+version, missing epoch/CRC) — must recover as a stale empty WAL,
+    // not error: there is no committed content to lose.
+    for &torn_at in &[5usize, 12] {
+        let dir = tmp(&format!("torn_header_{torn_at}"));
+        {
+            let mut g = Graph::create(&dir, config()).unwrap();
+            g.register_node_type(person(), None).unwrap();
+        }
+        let bytes = fs::read(dir.join("wal.log")).unwrap();
+        fs::write(dir.join("wal.log"), &bytes[..torn_at]).unwrap();
+
+        let g = Graph::open(&dir, config())
+            .unwrap_or_else(|e| panic!("torn {torn_at}-byte header must recover, got {e}"));
+        assert_eq!(g.counts(), (0, 0), "torn at {torn_at}");
+    }
+}
+
+#[test]
+fn empty_committed_graph_roundtrips() {
+    let dir = tmp("empty_graph");
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), Some(2)).unwrap();
+        g.commit().unwrap(); // a graph with a registered type but zero nodes/edges
+    }
+    let g = Graph::open(&dir, config()).unwrap();
+    assert_eq!(g.counts(), (0, 0));
+    // Degenerate reads on an empty graph must not panic.
+    let sim = g
+        .similar_nodes(drey::similarity::SimilarityQuery::new(
+            Embedding::new(vec![1.0, 2.0]),
+            drey::similarity::SimilarityMetric::Cosine,
+            5,
+        ))
+        .unwrap();
+    assert!(sim.is_empty());
 }

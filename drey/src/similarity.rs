@@ -89,9 +89,22 @@ impl SimilarityEvaluator for ExhaustiveScan {
         candidates: &[(NodeId, &[f32])],
         k: usize,
     ) -> Vec<(NodeId, f32)> {
+        // Finite inputs do not guarantee a finite score: an f32 dot product can
+        // overflow to ±inf, and cosine's inf/inf is NaN. Under the descending
+        // `total_cmp` sort NaN ranks as the largest value, so an overflowed score
+        // would poison the top-k exactly as a non-finite *input* would (which we
+        // reject upstream). Map any non-finite score to the worst rank instead.
+        let worst = if metric.higher_is_better() {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        };
         let mut scored: Vec<(NodeId, f32)> = candidates
             .iter()
-            .map(|(n, emb)| (*n, metric.score(query, emb)))
+            .map(|(n, emb)| {
+                let s = metric.score(query, emb);
+                (*n, if s.is_finite() { s } else { worst })
+            })
             .collect();
         if metric.higher_is_better() {
             scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -107,6 +120,10 @@ impl SimilarityEvaluator for ExhaustiveScan {
 #[derive(Clone, Debug)]
 pub struct ReachabilityFilter {
     pub from: NodeId,
+    /// Reachability depth. Like [`crate::traverse::TraversalOptions::max_hops`],
+    /// any value above the internal cap of 64 ([`crate::traverse::MAX_TRAVERSAL_HOPS`])
+    /// is silently clamped to it, so nodes reachable only at hops 65.. are
+    /// excluded from the candidate set.
     pub max_hops: usize,
     pub edge_types: Vec<EdgeType>,
     pub min_weight: Option<f32>,
@@ -145,6 +162,12 @@ impl Graph {
     /// Top-`k` most similar nodes to a query vector, after structural and
     /// property filtering (PRD §9.4). Returns `(node, score)` best-first; the
     /// crate never ranks beyond the raw metric score.
+    ///
+    /// Only candidates whose stored embedding has the same dimension as `query`
+    /// are scored; others are dropped. A query vector whose dimension matches no
+    /// stored embedding therefore returns `Ok(vec![])`, not an error — the graph
+    /// may hold several node types at different embedding dimensions, so a
+    /// dimension that misses one type is not globally invalid.
     pub fn similar_nodes(&self, query: SimilarityQuery) -> Result<Vec<(NodeId, f32)>> {
         // A non-finite query vector degenerates every score to NaN and returns a
         // meaningless ranking; reject it (stored embeddings are already finite,
@@ -155,80 +178,97 @@ impl Graph {
             )));
         }
         // 1. Structural + property filters first (PRD §13.1 evaluation order).
-        let mut candidates = self.candidate_set(&query)?;
+        let candidates = self.candidate_set(&query)?;
 
-        // 2. Keep only nodes with a same-dimension embedding (enforces
-        //    dimensionality, PRD §9.4 / §17).
+        // 2. Keep only same-dimension embeddings (enforces dimensionality, PRD
+        //    §9.4 / §17) and materialize the `(id, embedding)` slice for the seam
+        //    in one pass — one hash lookup per candidate, not two. A query vector
+        //    whose dimension matches no stored embedding yields an empty set here
+        //    and so an empty result (documented on `similar_nodes`).
         let qdim = query.vector.dim();
-        candidates.retain(|n| {
-            self.store
-                .nodes
-                .get(n)
-                .and_then(|r| r.embedding.as_ref())
-                .map(|e| e.len() == qdim)
-                .unwrap_or(false)
-        });
+        let cand: Vec<(NodeId, &[f32])> = candidates
+            .into_iter()
+            .filter_map(|n| {
+                let emb = self.store.nodes.get(&n)?.embedding.as_ref()?;
+                (emb.len() == qdim).then_some((NodeId(n), emb.as_slice()))
+            })
+            .collect();
 
         // 3. Bound the scan (PRD §13.1).
         let ceiling = self.config.scan_ceiling.max_candidates;
-        if candidates.len() > ceiling && !query.allow_full_scan {
+        if cand.len() > ceiling && !query.allow_full_scan {
             return Err(Error::UnsupportedQuery(format!(
                 "similarity candidate set {} exceeds scan ceiling {}; narrow the filters or set allow_full_scan",
-                candidates.len(),
+                cand.len(),
                 ceiling
             )));
         }
 
         // 4–5. Score + rank the survivors behind the evaluation seam (PRD §13.2),
         // so an ANN structure can replace the exhaustive scan without touching
-        // this method. Materialize the candidate `(id, embedding)` slice here —
-        // the seam ranks a pre-filtered set (PRD §13.1 order), it does not own the
-        // vector space.
+        // this method. The seam ranks a pre-filtered set (PRD §13.1 order); it
+        // does not own the vector space.
         let q = query.vector.as_slice();
-        let cand: Vec<(NodeId, &[f32])> = candidates
-            .into_iter()
-            .map(|n| {
-                let emb = self.store.nodes[&n].embedding.as_ref().unwrap();
-                (NodeId(n), emb.as_slice())
-            })
-            .collect();
         let evaluator: &dyn SimilarityEvaluator = &ExhaustiveScan;
         Ok(evaluator.top_k(q, query.metric, &cand, query.k))
     }
 
     /// The candidate node set surviving all non-vector filters.
+    ///
+    /// Seeds from the most selective *available* constraint rather than always
+    /// materializing every node id and shrinking: a selective property filter is
+    /// index-backed and typically yields a few hundred nodes, so starting there
+    /// avoids allocating a set of the whole graph only to `retain` it away. The
+    /// whole-node-set path runs only when no filter constrains the query (and the
+    /// scan ceiling then bounds it).
     fn candidate_set(&self, query: &SimilarityQuery) -> Result<HashSet<u64>> {
-        // Start from the node-type filter, or all nodes.
-        let mut set: HashSet<u64> = match &query.node_types {
-            Some(types) => {
-                let mut s = HashSet::new();
-                for t in types {
-                    for id in self.nodes_by_type(t)? {
-                        s.insert(id.0);
-                    }
-                }
-                s
-            }
-            None => self.store.nodes.keys().copied().collect(),
-        };
+        let mut set: Option<HashSet<u64>> = None;
 
-        // Intersect with the property filter.
+        // Property filter first: it resolves through the ordered scalar index
+        // (equality/range) and is usually the tightest constraint.
         if let Some(pf) = &query.property_filter {
-            let allowed: HashSet<u64> = self
-                .nodes_by_property(pf.clone())?
-                .into_iter()
-                .map(|n| n.0)
-                .collect();
-            set.retain(|n| allowed.contains(n));
+            set = Some(
+                self.nodes_by_property(pf.clone())?
+                    .into_iter()
+                    .map(|n| n.0)
+                    .collect(),
+            );
         }
 
-        // Intersect with reachability.
+        // Node-type constraint: read the type buckets straight from the store
+        // (no intermediate sorted Vec — the set discards order anyway). An
+        // unregistered type in the filter errors, matching `nodes_by_type`.
+        if let Some(types) = &query.node_types {
+            let mut allowed: HashSet<u64> = HashSet::new();
+            for t in types {
+                let tid = self.resolve_registered_type(t)?;
+                if let Some(ids) = self.store.nodes_by_type.get(&tid) {
+                    allowed.extend(ids.iter().copied());
+                }
+            }
+            set = Some(match set {
+                Some(mut s) => {
+                    s.retain(|n| allowed.contains(n));
+                    s
+                }
+                None => allowed,
+            });
+        }
+
+        // Reachability constraint.
         if let Some(r) = &query.within {
             let reachable = self.reachable_set(r)?;
-            set.retain(|n| reachable.contains(n));
+            set = Some(match set {
+                Some(mut s) => {
+                    s.retain(|n| reachable.contains(n));
+                    s
+                }
+                None => reachable,
+            });
         }
 
-        Ok(set)
+        // No constraint named a subset → the whole node set (scan-ceiling bounded).
+        Ok(set.unwrap_or_else(|| self.store.nodes.keys().copied().collect()))
     }
 
     /// The set of nodes reachable from `filter.from` within `max_hops`,

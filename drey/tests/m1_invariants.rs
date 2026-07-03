@@ -693,3 +693,215 @@ fn traverse_max_hops_zero_returns_no_paths() {
         .unwrap();
     assert!(paths.is_empty());
 }
+
+// ---- Regression coverage added by the repo ultrareview ----
+
+#[test]
+fn nan_weight_update_with_bounds_is_rejected_not_coerced() {
+    // `NaN.max(min).min(max)` is `min` (f32 min/max drop NaN), so a bounded
+    // NaN update must be rejected explicitly rather than silently coerced to a
+    // finite in-bounds weight that passes the `is_finite` guard.
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let b = g.add_node(person(), props(&[])).unwrap();
+    let e = g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
+
+    let err = g.update_edge_weight(e, WeightUpdate::set(f32::NAN).with_bounds(0.0, 1.0));
+    assert!(
+        matches!(err, Err(Error::InvalidPropertyValue(_))),
+        "bounded NaN update must be rejected, got {err:?}"
+    );
+    // No phantom write: the weight is unchanged.
+    assert_eq!(g.edge(e).unwrap().unwrap().weight, 1.0);
+    // A finite bounded update still clamps as before.
+    let w = g
+        .update_edge_weight(e, WeightUpdate::add(10.0).with_bounds(0.0, 2.0))
+        .unwrap();
+    assert_eq!(w, 2.0);
+}
+
+#[test]
+fn self_loop_not_double_counted_and_allow_revisit_terminates() {
+    use drey::traverse::CyclePolicy;
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let self_e = g.add_edge(a, a, knows(), 1.0, props(&[])).unwrap();
+
+    // A self-loop lives in both out_adj and in_adj of its node; under `Both` it
+    // must be emitted exactly once, not twice.
+    let both = g
+        .neighbors(
+            a,
+            NeighborOptions {
+                direction: Direction::Both,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        both.len(),
+        1,
+        "self-loop double-counted under Direction::Both"
+    );
+    assert_eq!(both[0].via, self_e);
+    assert_eq!(both[0].node, a);
+
+    // AllowRevisit walks the self-loop but stays bounded by max_hops (one
+    // revisiting path per hop-depth, longest using max_hops edges).
+    let paths = g
+        .traverse(
+            a,
+            TraversalOptions {
+                max_hops: Some(3),
+                cycle_policy: CyclePolicy::AllowRevisit,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        paths.len(),
+        3,
+        "expected one revisiting path per hop up to max_hops"
+    );
+    assert!(paths.iter().all(|p| p.nodes.iter().all(|n| *n == a)));
+    assert_eq!(paths.iter().map(|p| p.edges.len()).max(), Some(3));
+}
+
+#[test]
+fn overflowed_similarity_score_does_not_rank_first() {
+    // Finite inputs can still produce a non-finite score (f32 dot overflow to
+    // +inf). That must be treated as the worst rank, not sorted to the top by
+    // `total_cmp` (which orders NaN/inf as the largest value).
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let b = g.add_node(person(), props(&[])).unwrap();
+    g.set_node_embedding(a, Embedding::new(vec![1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
+    g.set_node_embedding(b, Embedding::new(vec![f32::MAX, 0.0, 0.0, 0.0]))
+        .unwrap();
+
+    // dot(query, a) == f32::MAX (finite); dot(query, b) == f32::MAX² -> +inf.
+    let q = SimilarityQuery::new(
+        Embedding::new(vec![f32::MAX, 0.0, 0.0, 0.0]),
+        SimilarityMetric::Dot,
+        10,
+    );
+    let hits = g.similar_nodes(q).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(
+        hits[0].0, a,
+        "finite-scored node must outrank the overflowed one"
+    );
+    assert_eq!(hits[1].0, b);
+}
+
+#[test]
+fn similarity_scan_ceiling_bounds_unfiltered_scan() {
+    // The scan ceiling is the concrete enforcement of "no accidental full vector
+    // sweep" (PRD §13.1): an unfiltered candidate set over the ceiling is
+    // rejected unless the caller opts into a full scan.
+    let mut config = GraphConfig::default();
+    config.scan_ceiling.max_candidates = 2;
+    let mut g = Graph::in_memory(config);
+    g.register_node_type(person(), Some(2)).unwrap();
+    for _ in 0..5 {
+        let n = g.add_node(person(), props(&[])).unwrap();
+        g.set_node_embedding(n, Embedding::new(vec![1.0, 0.0]))
+            .unwrap();
+    }
+    let q = SimilarityQuery::new(Embedding::new(vec![1.0, 0.0]), SimilarityMetric::Cosine, 10);
+    assert!(
+        matches!(g.similar_nodes(q.clone()), Err(Error::UnsupportedQuery(_))),
+        "5 candidates over a ceiling of 2 must be rejected"
+    );
+    let q2 = SimilarityQuery {
+        allow_full_scan: true,
+        ..q
+    };
+    assert_eq!(
+        g.similar_nodes(q2).unwrap().len(),
+        5,
+        "allow_full_scan lifts the bound"
+    );
+}
+
+#[test]
+fn similarity_query_dimension_mismatch_returns_empty() {
+    // A query whose dimension matches no stored embedding returns Ok(empty), not
+    // an error — mixed-dimension graphs are legal, so a dim that misses one type
+    // is not globally invalid (documented contract on `similar_nodes`).
+    let mut g = base_graph(); // embeddings are dim 4
+    let a = g.add_node(person(), props(&[])).unwrap();
+    g.set_node_embedding(a, Embedding::new(vec![1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
+    let q = SimilarityQuery::new(Embedding::new(vec![1.0, 0.0]), SimilarityMetric::Cosine, 10);
+    assert_eq!(g.similar_nodes(q).unwrap(), vec![]);
+}
+
+#[test]
+fn traversal_respects_edge_type_filter_including_unknown_type() {
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let b = g.add_node(person(), props(&[])).unwrap();
+    let c = g.add_node(person(), props(&[])).unwrap();
+    g.add_edge(a, b, EdgeType::new("knows"), 1.0, props(&[]))
+        .unwrap();
+    g.add_edge(a, c, EdgeType::new("likes"), 1.0, props(&[]))
+        .unwrap();
+
+    let knows_only = g
+        .neighbors(
+            a,
+            NeighborOptions {
+                edge_types: vec![EdgeType::new("knows")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(knows_only.len(), 1);
+    assert_eq!(knows_only[0].node, b);
+
+    // An unknown edge type must exclude all edges (empty filter set), not fall
+    // back to matching everything.
+    let unknown = g
+        .neighbors(
+            a,
+            NeighborOptions {
+                edge_types: vec![EdgeType::new("nonexistent")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(unknown.is_empty(), "unknown edge type must match no edges");
+}
+
+#[test]
+fn similarity_node_type_filter_excludes_other_types() {
+    let mut g = Graph::in_memory(GraphConfig::default());
+    g.register_node_type(NodeType::new("person"), Some(2))
+        .unwrap();
+    g.register_node_type(NodeType::new("robot"), Some(2))
+        .unwrap();
+    let p = g.add_node(NodeType::new("person"), props(&[])).unwrap();
+    let r = g.add_node(NodeType::new("robot"), props(&[])).unwrap();
+    g.set_node_embedding(p, Embedding::new(vec![1.0, 0.0]))
+        .unwrap();
+    g.set_node_embedding(r, Embedding::new(vec![1.0, 0.0]))
+        .unwrap();
+
+    let q = SimilarityQuery {
+        node_types: Some(vec![NodeType::new("person")]),
+        ..SimilarityQuery::new(Embedding::new(vec![1.0, 0.0]), SimilarityMetric::Cosine, 10)
+    };
+    let ids: Vec<NodeId> = g
+        .similar_nodes(q)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![p],
+        "robot must be excluded by the node_types filter"
+    );
+}

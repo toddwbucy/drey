@@ -43,19 +43,30 @@ use crate::types::{EdgeId, EdgeType, NodeId, NodeType, Value};
 /// v2: the snapshot gained a trailing CRC over its payload so a bit-flip is
 /// detected on load rather than silently blended in (PRD §10.2.1). Pre-CRC
 /// (v1) snapshots therefore fail cleanly with `VersionMismatch`.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// v3: the WAL header gained a trailing CRC over its magic+version+epoch bytes.
+/// The epoch decides whether the WAL is replayed or discarded as stale, so an
+/// unprotected bit-flip lowering it below the snapshot epoch would silently drop
+/// every acknowledged commit since the snapshot; the CRC turns that into a clean
+/// load-time `Codec` error. v2 WALs (16-byte header, no CRC) fail cleanly with
+/// `VersionMismatch`.
+pub const FORMAT_VERSION: u32 = 3;
 
 const MAGIC: &[u8; 4] = b"DREY";
 const SNAPSHOT_FILE: &str = "snapshot.bin";
 const WAL_FILE: &str = "wal.log";
 const LOCK_FILE: &str = "LOCK";
 
-/// WAL header: `MAGIC(4) + FORMAT_VERSION(u32 LE) + epoch(u64 LE)`. The epoch is
-/// the snapshot generation this WAL belongs to; `open` replays the WAL only when
-/// its epoch is ≥ the snapshot's, so a WAL left un-truncated by a crash mid-
-/// snapshot (its epoch is older) is recognized as stale and skipped rather than
-/// re-applied on top of the snapshot that already contains it.
-const WAL_HEADER_LEN: usize = 16;
+/// WAL header: `MAGIC(4) + FORMAT_VERSION(u32 LE) + epoch(u64 LE) + crc32(u32 LE)`.
+/// The epoch is the snapshot generation this WAL belongs to; `open` replays the
+/// WAL only when its epoch is ≥ the snapshot's, so a WAL left un-truncated by a
+/// crash mid-snapshot (its epoch is older) is recognized as stale and skipped
+/// rather than re-applied on top of the snapshot that already contains it. The
+/// trailing CRC (v3) covers the preceding 16 bytes so a bit-flip in the epoch —
+/// the field that decides replay-vs-discard — is caught at load, not trusted.
+const WAL_HEADER_LEN: usize = 20;
+/// Bytes of the WAL header the trailing CRC covers (magic+version+epoch).
+const WAL_HEADER_CRC_COVERAGE: usize = 16;
 
 /// WAL frame tags.
 const TAG_MUTATION: u8 = 1;
@@ -188,12 +199,12 @@ impl Persistence for WalPersistence {
         // the bytes are durable.
         let mut frame_buf = Vec::new();
         for payload in &self.pending {
-            write_frame(&mut frame_buf, payload);
+            write_frame(&mut frame_buf, payload)?;
         }
         // Commit marker terminates the batch.
         let mut marker = Writer::default();
         marker.u8(TAG_COMMIT);
-        write_frame(&mut frame_buf, &marker.buf);
+        write_frame(&mut frame_buf, &marker.buf)?;
 
         let durable = (|| -> std::io::Result<()> {
             // The injected write failure is TORN: part of the frame reaches the
@@ -294,6 +305,8 @@ fn wal_header(epoch: u64) -> [u8; WAL_HEADER_LEN] {
     h[0..4].copy_from_slice(MAGIC);
     h[4..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     h[8..16].copy_from_slice(&epoch.to_le_bytes());
+    let crc = crc32(&h[0..WAL_HEADER_CRC_COVERAGE]);
+    h[16..20].copy_from_slice(&crc.to_le_bytes());
     h
 }
 
@@ -304,11 +317,21 @@ fn fsync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write a length+crc framed record into `out`.
-fn write_frame(out: &mut Vec<u8>, payload: &[u8]) {
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+/// Write a length+crc framed record into `out`. The frame length is a `u32`, so
+/// a payload of 4 GiB or more cannot be encoded without truncating the prefix
+/// (which would misalign every following frame and strand acknowledged data on
+/// reopen). Reject it loudly at write time instead of casting silently.
+fn write_frame(out: &mut Vec<u8>, payload: &[u8]) -> Result<()> {
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        Error::Codec(format!(
+            "WAL frame payload of {} bytes exceeds the u32 length-prefix limit",
+            payload.len()
+        ))
+    })?;
+    out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(&crc32(payload).to_le_bytes());
     out.extend_from_slice(payload);
+    Ok(())
 }
 
 impl Graph {
@@ -562,8 +585,14 @@ struct WalReplay {
 /// into the snapshot) and nothing is replayed. Returns where the committed prefix
 /// ends so the caller can repair the file.
 fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalReplay> {
-    // A WAL shorter than its header carries no valid content.
-    if bytes.len() < WAL_HEADER_LEN {
+    // Guard order matters for legacy files: magic + version live in the first
+    // 8 bytes, so they are checked before the full-header length guard. A
+    // 16-byte v2 WAL (header-only, zero commits) is shorter than the 20-byte v3
+    // header; length-first would classify it as a torn stale header and silently
+    // rewrite it, instead of the VersionMismatch the format contract promises.
+    // Anything under 8 bytes can only be a torn header write — a header prefix
+    // torn mid-create, carrying no version to check and no committed content.
+    if bytes.len() < 8 {
         return Ok(WalReplay {
             epoch: snap_epoch,
             valid_len: WAL_HEADER_LEN,
@@ -579,6 +608,25 @@ fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalRep
             found: version,
             supported: FORMAT_VERSION,
         });
+    }
+    // Right magic and version but shorter than the full header: a v3 header
+    // write torn mid-create. No epoch/CRC to trust, no committed content.
+    if bytes.len() < WAL_HEADER_LEN {
+        return Ok(WalReplay {
+            epoch: snap_epoch,
+            valid_len: WAL_HEADER_LEN,
+            stale: true,
+        });
+    }
+    // Verify the header CRC before trusting the epoch (v3). The epoch is the sole
+    // discriminator between "replay this WAL" and "discard it as stale", so a
+    // silent bit-flip there would drop acknowledged commits; a mismatch is a
+    // corrupt header, surfaced as a typed error rather than a silent stale-skip.
+    let stored_crc = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    if crc32(&bytes[0..WAL_HEADER_CRC_COVERAGE]) != stored_crc {
+        return Err(Error::Codec(
+            "WAL header CRC mismatch (corrupt header)".into(),
+        ));
     }
     let wal_epoch = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
     if wal_epoch < snap_epoch {

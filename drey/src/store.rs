@@ -138,6 +138,11 @@ impl Store {
     }
 
     pub(crate) fn set_node_embedding(&mut self, node: NodeId, embedding: Vec<f32>) -> Result<()> {
+        // Resolve the node first: a call against a missing id must report
+        // NodeNotFound, not a finiteness/dimension error attributed to a node
+        // that does not exist.
+        let rec = self.nodes.get(&node.0).ok_or(Error::NodeNotFound(node))?;
+        let declared = self.embedding_dim.get(&rec.node_type).copied().flatten();
         // Non-finite components (NaN/±inf) poison similarity scoring — a NaN score
         // sorts to the top of a cosine/dot top-k — so reject them at the boundary.
         if let Some(bad) = embedding.iter().position(|x| !x.is_finite()) {
@@ -146,8 +151,6 @@ impl Store {
                 embedding[bad]
             )));
         }
-        let rec = self.nodes.get(&node.0).ok_or(Error::NodeNotFound(node))?;
-        let declared = self.embedding_dim.get(&rec.node_type).copied().flatten();
         match declared {
             None => Err(Error::InvalidNodeType(
                 "node type was not registered with an embedding dimension".into(),
@@ -176,6 +179,17 @@ impl Store {
         }
         if !self.nodes.contains_key(&to.0) {
             return Err(Error::NodeNotFound(to));
+        }
+        // Enforce the value ceiling on edge properties too. `add_node` and both
+        // property-update paths validate; edge creation must not be the one hole
+        // through which an oversized String/Bytes/List (whose length the codec
+        // prefixes with a u32) reaches the WAL/snapshot and corrupts it.
+        for (k, v) in &properties {
+            if !v.is_valid() {
+                return Err(Error::InvalidPropertyValue(format!(
+                    "property {k:?} is not a valid v0.1 value"
+                )));
+            }
         }
         let type_id = self.edge_types.intern(edge_type.as_str());
         let id = self.next_edge_id;

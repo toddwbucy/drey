@@ -134,7 +134,8 @@ impl Graph {
         // O(degree): look up the node's own adjacency, then only the requested
         // edge types — never a scan of the whole index.
         let mut push_from = |adj: &HashMap<u64, std::collections::BTreeMap<u32, Vec<u64>>>,
-                             take_to: bool| {
+                             take_to: bool,
+                             skip_self_loops: bool| {
             let Some(by_type) = adj.get(&node) else {
                 return;
             };
@@ -146,6 +147,12 @@ impl Graph {
                 }
                 for e in edges {
                     let rec = &self.store.edges[e];
+                    // A self-loop (from == to) sits in both out_adj and in_adj of
+                    // its node, so under `Both` it would otherwise be emitted
+                    // twice. The outbound pass emits it; the inbound pass skips it.
+                    if skip_self_loops && rec.from == rec.to {
+                        continue;
+                    }
                     if let Some(min) = min_weight {
                         if rec.weight < min {
                             continue;
@@ -157,11 +164,11 @@ impl Graph {
             }
         };
         match direction {
-            Direction::Outbound => push_from(&self.store.out_adj, true),
-            Direction::Inbound => push_from(&self.store.in_adj, false),
+            Direction::Outbound => push_from(&self.store.out_adj, true, false),
+            Direction::Inbound => push_from(&self.store.in_adj, false, false),
             Direction::Both => {
-                push_from(&self.store.out_adj, true);
-                push_from(&self.store.in_adj, false);
+                push_from(&self.store.out_adj, true, false);
+                push_from(&self.store.in_adj, false, true);
             }
         }
         // Already deterministic without a sort: the adjacency yields

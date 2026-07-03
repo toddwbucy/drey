@@ -11,13 +11,15 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
 /// A bidirectional string↔`u32` interner.
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+///
+/// Not `serde`-serialized: the interner is persisted by its `labels()` vector
+/// through the hand-rolled binary codec (`persist`), and reconstructed with
+/// [`Interner::from_labels`]. It carries no `Serialize`/`Deserialize` derive so
+/// no dead codec machinery is generated for it (SQLite-class weight).
+#[derive(Default, Clone, Debug)]
 pub struct Interner {
     labels: Vec<String>,
-    #[serde(skip)]
     index: HashMap<String, u32>,
 }
 
@@ -90,7 +92,7 @@ mod tests {
         let mut it = Interner::default();
         it.intern("x");
         it.intern("y");
-        it.index.clear(); // simulate a fresh deserialize (index is #[serde(skip)])
+        it.index.clear(); // simulate a load that restored only `labels`
         it.rebuild_index();
         assert_eq!(it.get("y"), Some(1));
     }
