@@ -175,6 +175,33 @@ fn recovery_corrupt_tail_loads_valid_prefix() {
 }
 
 #[test]
+fn missing_snapshot_with_newer_wal_fails_not_silent_partial_load() {
+    // A lost snapshot beside a post-snapshot (newer-epoch) WAL must fail open,
+    // not silently replay onto an empty store (edges → missing nodes).
+    let dir = tmp("missing_snapshot");
+    let a;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g.add_node(person(), props(&[])).unwrap();
+        let b = g.add_node(person(), props(&[])).unwrap();
+        g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap(); // epoch 1
+        let c = g.add_node(person(), props(&[])).unwrap();
+        g.add_edge(a, c, knows(), 1.0, props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    // Snapshot lost (backup missed it / filesystem damage); WAL is epoch 1.
+    fs::remove_file(dir.join("snapshot.bin")).unwrap();
+    match Graph::open(&dir, config()) {
+        Err(Error::Storage(m)) => assert!(m.contains("snapshot"), "unexpected: {m}"),
+        Err(other) => panic!("expected a storage error about the missing snapshot, got {other}"),
+        Ok(_) => panic!("open silently loaded a partial graph instead of failing"),
+    }
+}
+
+#[test]
 fn recovery_version_mismatch_fails_explicitly() {
     let dir = tmp("version_mismatch");
     {

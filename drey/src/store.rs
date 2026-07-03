@@ -138,6 +138,14 @@ impl Store {
     }
 
     pub(crate) fn set_node_embedding(&mut self, node: NodeId, embedding: Vec<f32>) -> Result<()> {
+        // Non-finite components (NaN/±inf) poison similarity scoring — a NaN score
+        // sorts to the top of a cosine/dot top-k — so reject them at the boundary.
+        if let Some(bad) = embedding.iter().position(|x| !x.is_finite()) {
+            return Err(Error::InvalidPropertyValue(format!(
+                "embedding component {bad} is not finite ({})",
+                embedding[bad]
+            )));
+        }
         let rec = self.nodes.get(&node.0).ok_or(Error::NodeNotFound(node))?;
         let declared = self.embedding_dim.get(&rec.node_type).copied().flatten();
         match declared {
@@ -287,8 +295,21 @@ impl Store {
             }
             if let Some(scalar) = value.as_scalar() {
                 if let Some(tree) = self.prop_index.get_mut(&(type_id, key.clone())) {
-                    if let Some(bucket) = tree.get_mut(&ScalarKey(scalar)) {
-                        bucket.retain(|n| *n != node);
+                    let key_now_empty =
+                        if let Some(bucket) = tree.get_mut(&ScalarKey(scalar.clone())) {
+                            bucket.retain(|n| *n != node);
+                            bucket.is_empty()
+                        } else {
+                            false
+                        };
+                    // Prune emptied containers so the index does not accumulate
+                    // tombstones keyed by dead values (unbounded growth + range
+                    // scans over dead keys), matching remove_from_vec / adj_remove.
+                    if key_now_empty {
+                        tree.remove(&ScalarKey(scalar));
+                    }
+                    if tree.is_empty() {
+                        self.prop_index.remove(&(type_id, key.clone()));
                     }
                 }
             }

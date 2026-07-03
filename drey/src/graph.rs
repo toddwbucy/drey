@@ -54,6 +54,16 @@ impl Graph {
         embedding_dim: Option<usize>,
     ) -> Result<()> {
         self.ensure_writable()?;
+        // The codec prefixes the embedding vector with a u32 count, so a declared
+        // dimension beyond u32::MAX would be truncated on persist. Reject it
+        // unconditionally (independent of the optional config max).
+        if let Some(dim) = embedding_dim {
+            if dim > u32::MAX as usize {
+                return Err(Error::InvalidNodeType(format!(
+                    "embedding dim {dim} exceeds the u32 codec limit"
+                )));
+            }
+        }
         if let (Some(max), Some(dim)) = (self.config.max_embedding_dim, embedding_dim) {
             if dim > max {
                 return Err(Error::InvalidNodeType(format!(
@@ -144,6 +154,11 @@ impl Graph {
 
     pub fn update_edge_weight(&mut self, edge: EdgeId, update: WeightUpdate) -> Result<f32> {
         self.ensure_writable()?;
+        if !update.bounds_valid() {
+            return Err(Error::InvalidPropertyValue(
+                "weight-update bounds must satisfy min <= max and be non-NaN".into(),
+            ));
+        }
         let current = self
             .store
             .edges

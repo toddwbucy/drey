@@ -82,7 +82,9 @@ pub enum CostMode {
 /// Options for bounded traversal (PRD §9.3).
 #[derive(Clone, Debug)]
 pub struct TraversalOptions {
-    pub max_hops: usize,
+    /// Maximum hops. `None` uses the graph's configured `default_max_hops`
+    /// (PRD §9.1). Any value is still clamped to [`MAX_TRAVERSAL_HOPS`].
+    pub max_hops: Option<usize>,
     pub direction: DirectionOpt,
     pub edge_types: Vec<EdgeType>,
     pub min_weight: Option<f32>,
@@ -93,7 +95,7 @@ pub struct TraversalOptions {
 impl Default for TraversalOptions {
     fn default() -> Self {
         TraversalOptions {
-            max_hops: 2,
+            max_hops: None,
             direction: DirectionOpt::Outbound,
             edge_types: Vec::new(),
             min_weight: None,
@@ -226,10 +228,15 @@ impl Graph {
         if !self.store.nodes.contains_key(&from.0) {
             return Err(Error::NodeNotFound(from));
         }
-        // Hard cap on recursion depth: the DFS recurses one frame per hop, so an
-        // unbounded caller value could blow the stack. A graph deeper than this
-        // is out of scope for bounded traversal.
-        opts.max_hops = opts.max_hops.min(MAX_TRAVERSAL_HOPS);
+        // Resolve the effective hop budget: the caller's value, or the graph's
+        // configured `default_max_hops` when unset (PRD §9.1). Then hard-cap it —
+        // the DFS recurses one frame per hop, so an unbounded value could blow the
+        // stack; a graph deeper than this is out of scope for bounded traversal.
+        opts.max_hops = Some(
+            opts.max_hops
+                .unwrap_or(self.config.default_max_hops)
+                .min(MAX_TRAVERSAL_HOPS),
+        );
         let type_ids = self.resolve_type_ids(&opts.edge_types);
         let mut paths: Vec<Path> = Vec::new();
         let mut nodes_stack = vec![from.0];
@@ -270,7 +277,8 @@ impl Graph {
                 return;
             }
         }
-        if edges_stack.len() >= opts.max_hops {
+        // `traverse` resolves max_hops to `Some(effective)` before invoking dfs.
+        if edges_stack.len() >= opts.max_hops.unwrap_or(0) {
             return;
         }
         let current = *nodes_stack.last().unwrap();

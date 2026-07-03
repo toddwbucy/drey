@@ -200,7 +200,7 @@ impl GraphDriver for DreyDriver {
                     .traverse(
                         NodeId(*start),
                         TraversalOptions {
-                            max_hops: *max_hops,
+                            max_hops: Some(*max_hops),
                             max_paths: 1000,
                             ..Default::default()
                         },

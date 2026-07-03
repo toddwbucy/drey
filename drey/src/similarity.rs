@@ -100,6 +100,14 @@ impl Graph {
     /// property filtering (PRD §9.4). Returns `(node, score)` best-first; the
     /// crate never ranks beyond the raw metric score.
     pub fn similar_nodes(&self, query: SimilarityQuery) -> Result<Vec<(NodeId, f32)>> {
+        // A non-finite query vector degenerates every score to NaN and returns a
+        // meaningless ranking; reject it (stored embeddings are already finite,
+        // enforced at set_node_embedding).
+        if let Some(bad) = query.vector.as_slice().iter().position(|x| !x.is_finite()) {
+            return Err(Error::InvalidPropertyValue(format!(
+                "query vector component {bad} is not finite"
+            )));
+        }
         // 1. Structural + property filters first (PRD §13.1 evaluation order).
         let mut candidates = self.candidate_set(&query)?;
 

@@ -62,12 +62,30 @@ pub(crate) struct Persister {
     /// Encoded mutation records not yet committed (fsync'd).
     pending: Vec<Vec<u8>>,
     locked: bool,
+    /// Set when a durable operation failed after it may have left the WAL or
+    /// epoch state inconsistent (a torn `commit` write, or a `snapshot` failure
+    /// after the snapshot was already cut over). A poisoned persister refuses
+    /// all further durable operations — the in-memory graph may hold mutations
+    /// that are not on disk, so the consumer must reopen to recover rather than
+    /// keep writing behind torn or stale bytes.
+    poisoned: bool,
 }
 
 impl Persister {
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Storage(
+                "persister poisoned by a prior failed durable operation; reopen the graph to recover"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Append a mutation to the pending buffer. It becomes durable only at the
     /// next [`Persister::commit`].
     pub(crate) fn append(&mut self, mutation: &Mutation) -> Result<()> {
+        self.ensure_healthy()?;
         let mut w = Writer::default();
         w.u8(TAG_MUTATION);
         write_mutation(&mut w, mutation);
@@ -76,24 +94,41 @@ impl Persister {
     }
 
     /// Flush pending records plus a commit marker to the WAL and fsync.
+    ///
+    /// The pending buffer is only cleared **after** the write and fsync both
+    /// succeed, so a failed commit retains the mutations and returns an error
+    /// (never a false `Ok`). If the write or fsync fails — possibly leaving torn
+    /// bytes at the WAL tail — the persister is poisoned: later commits would
+    /// otherwise append behind the torn region and be stranded on the next open.
     pub(crate) fn commit(&mut self) -> Result<()> {
+        self.ensure_healthy()?;
         // A commit with no accumulated mutations is a no-op: writing an empty
         // commit marker and fsync'ing would only grow the WAL and pay a pointless
         // fsync (this also keeps the snapshot path from emitting empty commits).
         if self.pending.is_empty() {
             return Ok(());
         }
+        // Encode the batch WITHOUT draining `pending` — nothing is removed until
+        // the bytes are durable.
         let mut frame_buf = Vec::new();
-        for payload in self.pending.drain(..) {
-            write_frame(&mut frame_buf, &payload);
+        for payload in &self.pending {
+            write_frame(&mut frame_buf, payload);
         }
         // Commit marker terminates the batch.
         let mut marker = Writer::default();
         marker.u8(TAG_COMMIT);
         write_frame(&mut frame_buf, &marker.buf);
 
-        self.wal.write_all(&frame_buf)?;
-        self.wal.sync_all()?; // fsync — the durability guarantee
+        if let Err(e) = self
+            .wal
+            .write_all(&frame_buf)
+            .and_then(|()| self.wal.sync_all())
+        {
+            self.poisoned = true;
+            return Err(e.into());
+        }
+        // Durable now — safe to forget the batch.
+        self.pending.clear();
         Ok(())
     }
 }
@@ -142,6 +177,13 @@ impl Graph {
             )));
         }
         fs::create_dir_all(&dir)?;
+        // fsync the parent so the newly created directory entry itself is durable
+        // — on POSIX, mkdir is a metadata change to the parent, and without this a
+        // power failure can lose the whole graph directory despite commit()'s
+        // fsync of files inside it.
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fsync_dir(parent)?;
+        }
         let mut graph = Graph::in_memory(config.clone());
         let locked = acquire_lock(&dir, &config)?;
         // A fresh graph starts at epoch 0; write the WAL header up front so the
@@ -159,6 +201,7 @@ impl Graph {
             epoch: 0,
             pending: Vec::new(),
             locked,
+            poisoned: false,
         });
         Ok(graph)
     }
@@ -176,8 +219,9 @@ impl Graph {
         let mut graph = Graph::in_memory(config.clone());
 
         // 1. Replay snapshot if present; its epoch bounds which WAL is current.
+        let snapshot_present = dir.join(SNAPSHOT_FILE).exists();
         let mut snap_epoch = 0u64;
-        if dir.join(SNAPSHOT_FILE).exists() {
+        if snapshot_present {
             let bytes = fs::read(dir.join(SNAPSHOT_FILE))?;
             snap_epoch = load_snapshot(&mut graph.store, &bytes)?;
         }
@@ -192,6 +236,20 @@ impl Graph {
         if dir.join(WAL_FILE).exists() {
             let bytes = fs::read(dir.join(WAL_FILE))?;
             replay = replay_wal(&mut graph, &bytes, snap_epoch)?;
+        }
+
+        // A WAL that belongs to snapshot generation ≥ 1 with no snapshot on disk
+        // proves the snapshot was lost. Replaying its post-snapshot mutations onto
+        // an empty store would be a silent partial load — edges pointing at nodes
+        // that only existed in the missing snapshot. Fail explicitly (PRD §10.2.1:
+        // "never a silent partial load").
+        if !snapshot_present && replay.epoch >= 1 {
+            return Err(Error::Storage(format!(
+                "WAL at {} belongs to snapshot epoch {} but snapshot.bin is missing; \
+                 refusing a partial load",
+                dir.display(),
+                replay.epoch
+            )));
         }
 
         graph.store.sort_indexes();
@@ -230,6 +288,7 @@ impl Graph {
                 epoch,
                 pending: Vec::new(),
                 locked,
+                poisoned: false,
             });
         }
         Ok(graph)
@@ -260,22 +319,38 @@ impl Graph {
         fs::rename(&tmp, dir.join(SNAPSHOT_FILE))?; // atomic replace
         fsync_dir(&dir)?; // make the rename durable — the cutover point
 
-        // Reset the WAL to just the new-epoch header (its old frames are now
-        // folded into the snapshot).
-        {
-            let mut wal = OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(dir.join(WAL_FILE))?;
-            wal.write_all(&wal_header(new_epoch))?;
-            wal.sync_all()?;
-        }
-        fsync_dir(&dir)?;
-        if let Some(p) = self.persist.as_mut() {
-            p.wal = OpenOptions::new().append(true).open(dir.join(WAL_FILE))?;
-            p.epoch = new_epoch;
-            p.pending.clear();
+        // Past the cutover: the snapshot on disk is now the new epoch. If any of
+        // the WAL reset, its fsyncs, the handle swap, or the epoch bump fails, the
+        // on-disk WAL and the in-memory epoch/handle can disagree with the new
+        // snapshot — a later commit would then append to a stale-epoch or
+        // headerless WAL and be silently discarded/stranded on the next open. So
+        // any post-cutover failure poisons the persister: the graph must be
+        // reopened (which loads cleanly from the new snapshot) rather than
+        // continue writing.
+        let reset = (|| -> Result<()> {
+            {
+                let mut wal = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .create(true)
+                    .open(dir.join(WAL_FILE))?;
+                wal.write_all(&wal_header(new_epoch))?;
+                wal.sync_all()?;
+            }
+            fsync_dir(&dir)?;
+            let new_wal = OpenOptions::new().append(true).open(dir.join(WAL_FILE))?;
+            if let Some(p) = self.persist.as_mut() {
+                p.wal = new_wal;
+                p.epoch = new_epoch;
+                p.pending.clear();
+            }
+            Ok(())
+        })();
+        if let Err(e) = reset {
+            if let Some(p) = self.persist.as_mut() {
+                p.poisoned = true;
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -302,19 +377,80 @@ impl Graph {
     }
 }
 
+/// The current boot's id (Linux), used to detect a lock left by a *previous*
+/// boot. Empty when unavailable, in which case boot-based staleness is skipped.
+fn boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Whether a process is alive. Linux: `/proc/<pid>` exists iff it is. Elsewhere,
+/// conservatively assume alive (never reclaim on the liveness signal).
+fn pid_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        Path::new("/proc").join(pid.to_string()).exists()
+    } else {
+        true
+    }
+}
+
+/// Create the lock file exclusively and stamp it with `pid boot_id`.
+fn create_lock(lock: &Path) -> std::io::Result<bool> {
+    match OpenOptions::new().write(true).create_new(true).open(lock) {
+        Ok(mut f) => {
+            // A half-stamped lock reads as malformed and would be reclaimed as
+            // stale by another opener while we believe we hold it — two writers.
+            // Propagate the error and remove the partial file instead.
+            if let Err(e) =
+                write!(f, "{} {}", std::process::id(), boot_id()).and_then(|()| f.sync_all())
+            {
+                let _ = fs::remove_file(lock);
+                return Err(e);
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether an existing lock is stale — its holder rebooted or died. A hard crash
+/// (SIGKILL/OOM/power loss) never runs `Persister::drop`, so without this a stale
+/// LOCK would wedge the graph permanently (recovery-matrix row 1).
+fn lock_is_stale(lock: &Path) -> bool {
+    let content = fs::read_to_string(lock).unwrap_or_default();
+    let mut parts = content.split_whitespace();
+    let holder_pid: Option<u32> = parts.next().and_then(|s| s.parse().ok());
+    let holder_boot = parts.next().unwrap_or("");
+    let cur_boot = boot_id();
+    match holder_pid {
+        None => true, // malformed / legacy lock — treat as stale
+        Some(pid) => (!cur_boot.is_empty() && holder_boot != cur_boot) || !pid_alive(pid),
+    }
+}
+
 fn acquire_lock(dir: &Path, config: &GraphConfig) -> Result<bool> {
     if !config.file_lock {
         return Ok(false);
     }
     let lock = dir.join(LOCK_FILE);
-    // Atomic exclusive create: no TOCTOU window between checking and creating.
-    match OpenOptions::new().write(true).create_new(true).open(&lock) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::LockConflict(
-            format!("another writer holds {}", lock.display()),
-        )),
-        Err(e) => Err(e.into()),
+    // Atomic exclusive create; on conflict, reclaim only if the holder is
+    // provably gone (different boot, or dead pid), then retry once.
+    if create_lock(&lock)? {
+        return Ok(true);
     }
+    if lock_is_stale(&lock) {
+        let _ = fs::remove_file(&lock);
+        if create_lock(&lock)? {
+            return Ok(true);
+        }
+        // Someone else reclaimed it first — it is now live.
+    }
+    Err(Error::LockConflict(format!(
+        "another live writer holds {}",
+        lock.display()
+    )))
 }
 
 // ---- WAL replay ----
@@ -842,10 +978,23 @@ fn load_snapshot(store: &mut Store, bytes: &[u8]) -> Result<u64> {
         store.indexed.insert((t, k));
     }
 
+    // Interned type ids are validated against the loaded label tables before
+    // insertion: an out-of-range id (corruption — there is no snapshot checksum)
+    // must be a typed Codec error, not a deferred `label(..).unwrap()` panic in
+    // insert_*_raw / materialize_* on the read path (PRD §18/§19).
+    let node_type_count = store.node_types.labels().len() as u32;
+    let edge_type_count = store.edge_types.labels().len() as u32;
+
     let n = r.u64()?;
     for _ in 0..n {
         let id = r.u64()?;
         let rec = codec::read_node_record(&mut r)?;
+        if rec.node_type >= node_type_count {
+            return Err(Error::Codec(format!(
+                "node {id} has node_type id {} but only {node_type_count} types are interned",
+                rec.node_type
+            )));
+        }
         store.insert_node_raw(id, rec);
     }
 
@@ -853,6 +1002,12 @@ fn load_snapshot(store: &mut Store, bytes: &[u8]) -> Result<u64> {
     for _ in 0..n {
         let id = r.u64()?;
         let rec = codec::read_edge_record(&mut r)?;
+        if rec.edge_type >= edge_type_count {
+            return Err(Error::Codec(format!(
+                "edge {id} has edge_type id {} but only {edge_type_count} types are interned",
+                rec.edge_type
+            )));
+        }
         store.insert_edge_raw(id, rec);
     }
 
