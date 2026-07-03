@@ -7,7 +7,7 @@ use drey::query::{PropertyQuery, ScalarPredicate};
 use drey::similarity::{SimilarityMetric, SimilarityQuery};
 use drey::traverse::{CostMode, NeighborOptions, ShortestPathOptions, TraversalOptions};
 use drey::types::{Embedding, NodeType, Scalar, Value};
-use drey::{EdgeType, Graph, NodeId};
+use drey::{Direction, EdgeType, Error, Graph, NodeId};
 use std::collections::BTreeMap;
 
 fn person() -> NodeType {
@@ -583,4 +583,77 @@ fn shortest_path_max_steps_zero_reaches_no_neighbor() {
         ..Default::default()
     };
     assert!(g.shortest_path(a, b, opts).unwrap().is_none());
+}
+
+#[test]
+fn signed_zero_f64_matches_ieee_equal_index_and_scan() {
+    // -0.0 and +0.0 are IEEE-equal, so an Eq(F64(0.0)) query must match a stored
+    // F64(-0.0) — on both the indexed path (ScalarKey Ord) and the scan path
+    // (ScalarPredicate::matches), which share Scalar::total_order.
+    let mut g = Graph::in_memory(GraphConfig::default().with_indexed_property(person(), "score"));
+    g.register_node_type(person(), None).unwrap();
+    let n = g
+        .add_node(
+            person(),
+            props(&[
+                ("score", Value::F64(-0.0)), // indexed
+                ("raw", Value::F64(-0.0)),   // unindexed -> scan path
+            ]),
+        )
+        .unwrap();
+    let eq0 = |key: &str| PropertyQuery {
+        node_type: person(),
+        key: key.into(),
+        predicate: ScalarPredicate::Eq(Scalar::F64(0.0)),
+    };
+    assert_eq!(g.nodes_by_property(eq0("score")).unwrap(), vec![n], "index");
+    assert_eq!(g.nodes_by_property(eq0("raw")).unwrap(), vec![n], "scan");
+}
+
+#[test]
+fn similar_nodes_missing_reachability_anchor_errors() {
+    use drey::similarity::{ReachabilityFilter, SimilarityMetric, SimilarityQuery};
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    g.set_node_embedding(a, Embedding::new(vec![1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
+    // A within-anchor that does not exist must error like every other traversal
+    // anchor (neighbors/traverse/shortest_path), not silently return Ok(empty).
+    let q = SimilarityQuery {
+        within: Some(ReachabilityFilter {
+            from: NodeId(9999),
+            max_hops: 3,
+            edge_types: vec![],
+            min_weight: None,
+            direction: Direction::Outbound,
+        }),
+        ..SimilarityQuery::new(
+            Embedding::new(vec![1.0, 0.0, 0.0, 0.0]),
+            SimilarityMetric::Cosine,
+            5,
+        )
+    };
+    match g.similar_nodes(q) {
+        Err(Error::NodeNotFound(_)) => {}
+        other => panic!("expected NodeNotFound for a missing anchor, got {other:?}"),
+    }
+}
+
+#[test]
+fn direction_enum_is_usable_in_public_options() {
+    // Regression for the DirectionOpt/Direction split: the PRD-sanctioned
+    // Direction enum (§9.1/§9.4) constructs the public options structs directly,
+    // with no separate type to convert through. Compile-level guarantee.
+    let _n = NeighborOptions {
+        direction: Direction::Both,
+        ..Default::default()
+    };
+    let _t = TraversalOptions {
+        direction: Direction::Inbound,
+        ..Default::default()
+    };
+    let _s = ShortestPathOptions {
+        direction: Direction::Outbound,
+        ..Default::default()
+    };
 }

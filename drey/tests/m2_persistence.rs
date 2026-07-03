@@ -585,38 +585,33 @@ fn id_allocator_resumes_after_reopen_without_collision() {
 }
 
 #[test]
-fn nan_and_denormal_edge_weights_round_trip_byte_exact() {
-    // The codec's byte-exact f32 contract (PRD §10.2) must hold for hostile
-    // weights too. (Whether NaN weights *should* be accepted is a separate
-    // validation question; here we only lock the round-trip of whatever is
-    // stored.)
-    // A negative NaN with a non-canonical payload: asserting exact bits proves
-    // sign + mantissa survive, not merely that "some NaN" came back (canonical
-    // f32::NAN would pass is_nan() even if the payload were laundered).
-    const HOSTILE_NAN: u32 = 0xFFC0_1234;
+fn non_finite_edge_weights_rejected_finite_denormal_round_trips() {
+    // Non-finite weights are malformed input and are rejected at the boundary
+    // (they would become zero-cost edges in weighted shortest_path). A finite
+    // denormal is legal and must round-trip byte-exact (the codec f32 contract,
+    // PRD §10.2).
     let dir = tmp("nan_weight");
-    let e_nan;
     let e_den;
     {
         let mut g = Graph::create(&dir, config()).unwrap();
         g.register_node_type(person(), None).unwrap();
         let a = g.add_node(person(), props(&[])).unwrap();
         let b = g.add_node(person(), props(&[])).unwrap();
-        e_nan = g
-            .add_edge(a, b, knows(), f32::from_bits(HOSTILE_NAN), props(&[]))
-            .unwrap();
+        assert!(
+            g.add_edge(a, b, knows(), f32::NAN, props(&[])).is_err(),
+            "NaN weight must be rejected"
+        );
+        assert!(
+            g.add_edge(a, b, knows(), f32::INFINITY, props(&[]))
+                .is_err(),
+            "infinite weight must be rejected"
+        );
+        // Smallest positive denormal — finite, so accepted and byte-exact.
         e_den = g
             .add_edge(a, b, knows(), f32::from_bits(1), props(&[]))
             .unwrap();
         g.commit().unwrap();
     }
     let g = Graph::open(&dir, config()).unwrap();
-    let w = g.edge(e_nan).unwrap().unwrap().weight;
-    assert!(w.is_nan());
-    assert_eq!(
-        w.to_bits(),
-        HOSTILE_NAN,
-        "NaN sign/payload bits not preserved byte-exact"
-    );
     assert_eq!(g.edge(e_den).unwrap().unwrap().weight.to_bits(), 1);
 }

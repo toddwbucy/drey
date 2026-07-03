@@ -40,24 +40,12 @@ pub struct NeighborOptions {
     pub min_weight: Option<f32>,
 }
 
-/// Direction wrapper with a sensible default (`Outbound`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum DirectionOpt {
-    #[default]
-    Outbound,
-    Inbound,
-    Both,
-}
-
-impl From<DirectionOpt> for Direction {
-    fn from(d: DirectionOpt) -> Self {
-        match d {
-            DirectionOpt::Outbound => Direction::Outbound,
-            DirectionOpt::Inbound => Direction::Inbound,
-            DirectionOpt::Both => Direction::Both,
-        }
-    }
-}
+/// Deprecated alias for [`Direction`]. The options structs used to carry a
+/// separate `DirectionOpt` enum, which made the PRD-sanctioned [`Direction`]
+/// (§9.1, §9.4) unusable in a public call. They are now the same type; the alias
+/// is retained so existing `DirectionOpt::Outbound`-style references keep
+/// compiling. Prefer [`Direction`].
+pub type DirectionOpt = Direction;
 
 /// What happens when traversal revisits a node (PRD §9.3 `cycle_policy`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -201,7 +189,7 @@ impl Graph {
             return Err(Error::NodeNotFound(node));
         }
         let type_ids = self.resolve_type_ids(&opts.edge_types);
-        let steps = self.steps(node.0, opts.direction.into(), &type_ids, opts.min_weight);
+        let steps = self.steps(node.0, opts.direction, &type_ids, opts.min_weight);
         Ok(steps
             .into_iter()
             .map(|(e, other)| {
@@ -223,7 +211,10 @@ impl Graph {
     }
 
     /// Bounded n-hop traversal returning paths (PRD §9.3). Depth-first with
-    /// `(edge_type, edge_id)`-ordered expansion; stops at `max_hops` and at `max_paths`.
+    /// `(edge_type, edge_id)`-ordered expansion; stops at `max_hops` and at
+    /// `max_paths`. A `max_hops` above an internal cap of 64 is silently clamped
+    /// to it for stack safety, so a graph deeper than 64 hops is out of scope for
+    /// bounded traversal.
     pub fn traverse(&self, from: NodeId, mut opts: TraversalOptions) -> Result<Vec<Path>> {
         if !self.store.nodes.contains_key(&from.0) {
             return Err(Error::NodeNotFound(from));
@@ -282,7 +273,7 @@ impl Graph {
             return;
         }
         let current = *nodes_stack.last().unwrap();
-        for (edge, other) in self.steps(current, opts.direction.into(), type_ids, opts.min_weight) {
+        for (edge, other) in self.steps(current, opts.direction, type_ids, opts.min_weight) {
             if opts.cycle_policy == CyclePolicy::NoRevisit && on_path.contains(&other) {
                 continue;
             }
@@ -342,7 +333,7 @@ impl Graph {
             if opts.max_steps.is_some_and(|max| steps > max) {
                 return None; // exploration budget exhausted (M3 F1)
             }
-            for (edge, other) in self.steps(cur, opts.direction.into(), type_ids, opts.min_weight) {
+            for (edge, other) in self.steps(cur, opts.direction, type_ids, opts.min_weight) {
                 if seen.insert(other) {
                     prev.insert(other, (cur, edge));
                     q.push_back(other);
@@ -377,8 +368,7 @@ impl Graph {
             if opts.max_steps.is_some_and(|max| steps > max) {
                 return None; // exploration budget exhausted (M3 F1)
             }
-            for (edge, other) in self.steps(node, opts.direction.into(), type_ids, opts.min_weight)
-            {
+            for (edge, other) in self.steps(node, opts.direction, type_ids, opts.min_weight) {
                 let w = self.store.edges[&edge].weight.max(0.0);
                 let next = cost + w;
                 if next < *dist.get(&other).unwrap_or(&f32::INFINITY) {
