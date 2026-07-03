@@ -90,7 +90,10 @@ pub(crate) struct WalPersistence {
     epoch: u64,
     /// Encoded mutation records not yet committed (fsync'd).
     pending: Vec<Vec<u8>>,
-    locked: bool,
+    /// The held single-writer advisory lock (see [`acquire_lock`]). Never read —
+    /// its job is to exist: the kernel releases the lock when this handle drops,
+    /// on clean close and hard crash alike.
+    _lock: Option<File>,
     /// Set when a durable operation failed after it may have left the WAL or
     /// epoch state inconsistent (a torn `commit` write, or a `snapshot` failure
     /// after the snapshot was already cut over). A poisoned persister refuses
@@ -223,13 +226,8 @@ impl Persistence for WalPersistence {
     }
 }
 
-impl Drop for WalPersistence {
-    fn drop(&mut self) {
-        if self.locked {
-            let _ = fs::remove_file(self.dir.join(LOCK_FILE));
-        }
-    }
-}
+// No Drop impl: the advisory lock releases when `_lock` drops (kernel-managed),
+// and the LOCK file itself is deliberately left in place — see `acquire_lock`.
 
 /// The 16-byte WAL header for a given epoch.
 fn wal_header(epoch: u64) -> [u8; WAL_HEADER_LEN] {
@@ -290,7 +288,7 @@ impl Graph {
             wal,
             epoch: 0,
             pending: Vec::new(),
-            locked,
+            _lock: locked,
             poisoned: false,
         }));
         Ok(graph)
@@ -377,7 +375,7 @@ impl Graph {
                 wal,
                 epoch,
                 pending: Vec::new(),
-                locked,
+                _lock: locked,
                 poisoned: false,
             }));
         }
@@ -450,80 +448,40 @@ impl Graph {
     }
 }
 
-/// The current boot's id (Linux), used to detect a lock left by a *previous*
-/// boot. Empty when unavailable, in which case boot-based staleness is skipped.
-fn boot_id() -> String {
-    fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// Whether a process is alive. Linux: `/proc/<pid>` exists iff it is. Elsewhere,
-/// conservatively assume alive (never reclaim on the liveness signal).
-fn pid_alive(pid: u32) -> bool {
-    if cfg!(target_os = "linux") {
-        Path::new("/proc").join(pid.to_string()).exists()
-    } else {
-        true
-    }
-}
-
-/// Create the lock file exclusively and stamp it with `pid boot_id`.
-fn create_lock(lock: &Path) -> std::io::Result<bool> {
-    match OpenOptions::new().write(true).create_new(true).open(lock) {
-        Ok(mut f) => {
-            // A half-stamped lock reads as malformed and would be reclaimed as
-            // stale by another opener while we believe we hold it — two writers.
-            // Propagate the error and remove the partial file instead.
-            if let Err(e) =
-                write!(f, "{} {}", std::process::id(), boot_id()).and_then(|()| f.sync_all())
-            {
-                let _ = fs::remove_file(lock);
-                return Err(e);
-            }
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// Whether an existing lock is stale — its holder rebooted or died. A hard crash
-/// (SIGKILL/OOM/power loss) never runs `Persister::drop`, so without this a stale
-/// LOCK would wedge the graph permanently (recovery-matrix row 1).
-fn lock_is_stale(lock: &Path) -> bool {
-    let content = fs::read_to_string(lock).unwrap_or_default();
-    let mut parts = content.split_whitespace();
-    let holder_pid: Option<u32> = parts.next().and_then(|s| s.parse().ok());
-    let holder_boot = parts.next().unwrap_or("");
-    let cur_boot = boot_id();
-    match holder_pid {
-        None => true, // malformed / legacy lock — treat as stale
-        Some(pid) => (!cur_boot.is_empty() && holder_boot != cur_boot) || !pid_alive(pid),
-    }
-}
-
-fn acquire_lock(dir: &Path, config: &GraphConfig) -> Result<bool> {
+/// Take the single-writer lock via OS advisory locking (`flock(2)` on Unix,
+/// `LockFileEx` on Windows, through [`File::try_lock`]).
+///
+/// The kernel releases an advisory lock when the holding file handle closes —
+/// including SIGKILL, OOM-kill, panic-abort, and power loss — so the lock is
+/// crash-safe by construction. This replaces the previous PID+boot-id staleness
+/// scheme (audit #5 / issue #8), eliminating with it the wedge-after-hard-crash,
+/// the reclaim TOCTOU (two openers both judging a lock stale and one deleting
+/// the other's live lock), and the leak-on-error-path: the returned handle
+/// simply drops on any early return and the kernel releases.
+///
+/// The `LOCK` file itself is a permanent anchor — created if absent, never
+/// deleted (unlinking a lock file reintroduces the race where one process holds
+/// the lock on an unlinked inode while another locks a fresh file at the same
+/// path). An unheld leftover file is harmless: locking it just succeeds.
+fn acquire_lock(dir: &Path, config: &GraphConfig) -> Result<Option<File>> {
     if !config.file_lock {
-        return Ok(false);
+        return Ok(None);
     }
     let lock = dir.join(LOCK_FILE);
-    // Atomic exclusive create; on conflict, reclaim only if the holder is
-    // provably gone (different boot, or dead pid), then retry once.
-    if create_lock(&lock)? {
-        return Ok(true);
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock)?;
+    match f.try_lock() {
+        Ok(()) => Ok(Some(f)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::LockConflict(format!(
+            "another live writer holds {}",
+            lock.display()
+        ))),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
-    if lock_is_stale(&lock) {
-        let _ = fs::remove_file(&lock);
-        if create_lock(&lock)? {
-            return Ok(true);
-        }
-        // Someone else reclaimed it first — it is now live.
-    }
-    Err(Error::LockConflict(format!(
-        "another live writer holds {}",
-        lock.display()
-    )))
 }
 
 // ---- WAL replay ----
