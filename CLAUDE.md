@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**v0.1 implemented.** `drey-PRD-v0_8.md` is the authoritative spec; `specs/` holds the
+**v0.1 implemented.** `docs/drey-PRD-v0_8.md` is the authoritative spec; `docs/specs/` holds the
 implementation specs beneath it. The crate is named `drey` (renamed 2026-07-02 from the
 working name `weaver-graph`). Read the PRD before structural work — it records not just
 decisions but their rationale and the rejected alternatives.
@@ -13,12 +13,12 @@ The milestones M1–M5 are built and tested; M0/M3 apparatus runs. The 2026-07-0
 whole-codebase audit (issue #5, closed) was remediated in PRs #6–#15; the two remaining
 budget-gate overruns at representative scale (`decay_edges batch=1000`,
 `similar_nodes cand=10000`) are documented with their revision options in
-`specs/m3-findings.md` (the PRD §16.3 "written reason to revise" exit). The M5
-query-layer decision is in `specs/m5-query-seam-decision.md` (defer Cypher; ship the
+`docs/specs/m3-findings.md` (the PRD §16.3 "written reason to revise" exit). The M5
+query-layer decision is in `docs/specs/m5-query-seam-decision.md` (defer Cypher; ship the
 seam), and the persistence/similarity seams (design commitment 6) are ratified in
-`specs/persistence-seam-decision.md`. The M2 durability contract, on-disk format
-history, and failure semantics are recorded in `specs/m2-durability.md`; every PRD §24
-open question is dispositioned in `specs/open-questions-ledger.md`.
+`docs/specs/persistence-seam-decision.md`. The M2 durability contract, on-disk format
+history, and failure semantics are recorded in `docs/specs/m2-durability.md`; every PRD §24
+open question is dispositioned in `docs/specs/open-questions-ledger.md`.
 
 ### Workspace layout
 - `drey/` — the publishable crate. Single crate, `serde` its only dependency.
@@ -42,7 +42,7 @@ Git: personal project, pushes via the `github-toddwbucy:` SSH host alias (worksp
 convention in `/home/todd/git/CLAUDE.md`). Work merges to `main` via PRs; CI enforces
 build/fmt/test/clippy on stable.
 
-Before implementing more M0 apparatus, read `specs/m0-implementation-checklist.md`
+Before implementing more M0 apparatus, read `docs/specs/m0-implementation-checklist.md`
 alongside the spec — it enumerates the defaults a session is likely to reach for that
 would silently violate the contract.
 

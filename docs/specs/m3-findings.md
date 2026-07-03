@@ -54,7 +54,7 @@ explicit rather than implied.
 
 **Status: implemented (v0.2).** `ShortestPathOptions` now carries an optional
 `max_steps` node-expansion budget, enforced in both BFS and Dijkstra, returning
-`None` when exhausted. See `specs/shortest-path-bound.md`. (`max_cost` was
+`None` when exhausted. See `docs/specs/shortest-path-bound.md`. (`max_cost` was
 deemed a semantic, not latency, concern and left for later.)
 
 ### F2. Hub `neighbors` / `traverse` are O(degree) and the budget is
@@ -120,7 +120,7 @@ is linear in candidates, and ~10k × 1024 f32 costs what it costs.
 scan cost (consistent with "budgets, not comparisons" — the budget was
 synthetic); (b) treat this as the PRD §13.2 ANN-seam trigger and evaluate an
 ANN integration behind the now-extant `SimilarityEvaluator` seam
-(`specs/persistence-seam-decision.md`); or (c) constrain consumers to ≤~5k
+(`docs/specs/persistence-seam-decision.md`); or (c) constrain consumers to ≤~5k
 candidates via filters, per the §13.1 filters-first posture. A real captured
 workload (spec §6) should decide which; do not integrate ANN on synthetic
 evidence alone.

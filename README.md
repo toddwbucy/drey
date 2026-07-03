@@ -10,7 +10,7 @@ The embedding is part of the node record, not a companion system. Each node type
 
 That co-location is a latency and correctness position, not a storage detail:
 
-- **Recall is a function call.** No network hop, no serialization, no separate vector service. Structural filters are hash and index lookups; scoring is a linear pass over `f32` slices already in RAM. Measured end-to-end: sub-millisecond at 100 candidates, ~4 ms at 1,000 (dim 1024, representative fixture — see [`specs/m3-findings.md`](specs/m3-findings.md)).
+- **Recall is a function call.** No network hop, no serialization, no separate vector service. Structural filters are hash and index lookups; scoring is a linear pass over `f32` slices already in RAM. Measured end-to-end: sub-millisecond at 100 candidates, ~4 ms at 1,000 (dim 1024, representative fixture — see [`docs/specs/m3-findings.md`](docs/specs/m3-findings.md)).
 - **Filters run first, and the result is exact.** A similarity query composes node-type, property, and reachability filters *before* scoring, so it returns the true top-k of the filtered set — not an over-fetched approximation from a vector store, intersected with the graph after the fact.
 - **One commit domain.** The embedding and the structure it belongs to go through the same write-ahead log and the same `commit`. There is no vector-store/graph-store drift to reconcile, because there is only one store.
 
@@ -22,4 +22,4 @@ Similarity is a bounded exhaustive scan by design: exact, deterministic, no inde
 
 ## Status
 
-v0.2. The whole workspace has been through two end-to-end adversarial reviews ([issue #5](https://github.com/toddwbucy/drey/issues/5), [PR #17](https://github.com/toddwbucy/drey/pull/17)) plus per-PR review; the two open performance-budget questions are recorded with their revision options in [`specs/m3-findings.md`](specs/m3-findings.md). `drey-PRD-v0_8.md` is the authoritative spec.
+v0.2. The whole workspace has been through two end-to-end adversarial reviews ([issue #5](https://github.com/toddwbucy/drey/issues/5), [PR #17](https://github.com/toddwbucy/drey/pull/17)) plus per-PR review; the two open performance-budget questions are recorded with their revision options in [`docs/specs/m3-findings.md`](docs/specs/m3-findings.md). `docs/drey-PRD-v0_8.md` is the authoritative spec.

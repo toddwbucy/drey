@@ -73,7 +73,7 @@ the structure:
   allocators past the maximum seen (PRD §7.4 / design commitment 5).
 
 Encoding is little-endian, schema-bound, hand-rolled (see the codec decision
-in `specs/open-questions-ledger.md` Q8). `f32` and `Bytes` round-trip
+in `docs/specs/open-questions-ledger.md` Q8). `f32` and `Bytes` round-trip
 byte-exactly, including NaN payloads and denormals (known-answer tests pin
 CRC32 and the float round-trip).
 

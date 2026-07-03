@@ -44,7 +44,7 @@ Steps 4–5 are the exhaustive scan the seam is meant to abstract.
 
 ### 3.1 Scope recommendation — ship the seams, defer the alternatives
 
-Mirror the **M5 query-seam decision** (`specs/m5-query-seam-decision.md`: ship
+Mirror the **M5 query-seam decision** (`docs/specs/m5-query-seam-decision.md`: ship
 the `PropertyGraphRead` seam, defer Cypher). Concretely:
 
 1. **Introduce both trait seams now**, with the current implementations moved
@@ -53,7 +53,7 @@ the `PropertyGraphRead` seam, defer Cypher). Concretely:
 2. **Do not build a second implementation** (embedded-KV persistence, ANN
    similarity) in this change. The PRD gates the ANN swap on *"only if the M3
    budget gate fails,"* and after the PR #7 Zipf-truncation fix the representative
-   gate **passes** (`specs/m3-findings.md`). No measurement is asking for an ANN,
+   gate **passes** (`docs/specs/m3-findings.md`). No measurement is asking for an ANN,
    so building one now would violate "budgets, not comparisons" and add weight
    for no evidenced need. Same logic for an alternative persistence backend:
    WAL+snapshot meets M2, so a KV backend is unmotivated.
