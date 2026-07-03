@@ -16,7 +16,9 @@ budget-gate overruns at representative scale (`decay_edges batch=1000`,
 `specs/m3-findings.md` (the PRD §16.3 "written reason to revise" exit). The M5
 query-layer decision is in `specs/m5-query-seam-decision.md` (defer Cypher; ship the
 seam), and the persistence/similarity seams (design commitment 6) are ratified in
-`specs/persistence-seam-decision.md`.
+`specs/persistence-seam-decision.md`. The M2 durability contract, on-disk format
+history, and failure semantics are recorded in `specs/m2-durability.md`; every PRD §24
+open question is dispositioned in `specs/open-questions-ledger.md`.
 
 ### Workspace layout
 - `drey/` — the publishable crate. Single crate, `serde` its only dependency.
