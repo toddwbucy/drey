@@ -9,10 +9,14 @@ implementation specs beneath it. The crate is named `drey` (renamed 2026-07-02 f
 working name `weaver-graph`). Read the PRD before structural work — it records not just
 decisions but their rationale and the rejected alternatives.
 
-The milestones M1–M5 are built and tested; M0/M3 apparatus runs. Remaining budget-gate
-overruns at representative scale are documented in `specs/m3-findings.md` (the PRD §16.3
-"written reason to revise" exit), and the M5 query-layer decision is in
-`specs/m5-query-seam-decision.md` (defer Cypher; ship the seam).
+The milestones M1–M5 are built and tested; M0/M3 apparatus runs. The 2026-07-03
+whole-codebase audit (issue #5, closed) was remediated in PRs #6–#15; the two remaining
+budget-gate overruns at representative scale (`decay_edges batch=1000`,
+`similar_nodes cand=10000`) are documented with their revision options in
+`specs/m3-findings.md` (the PRD §16.3 "written reason to revise" exit). The M5
+query-layer decision is in `specs/m5-query-seam-decision.md` (defer Cypher; ship the
+seam), and the persistence/similarity seams (design commitment 6) are ratified in
+`specs/persistence-seam-decision.md`.
 
 ### Workspace layout
 - `drey/` — the publishable crate. Single crate, `serde` its only dependency.
@@ -29,11 +33,12 @@ overruns at representative scale are documented in `specs/m3-findings.md` (the P
 
 ### Commands
 - Build / test everything: `cargo build`, `cargo test`. One test: `cargo test <name>`.
-- Generate a fixture: `cargo run --release -p harness --bin generate -- <small|representative|stress> <low|medium|high> <seed> <out_dir>`.
-- Run the budget gate: `cargo run --release -p harness --bin bench -- <fixture_dir> <drey|naive> [per_bucket]` — emits one run-JSON document; exits non-zero if a real-driver bucket fails its budget. **Measure in `--release`**; debug tails are meaningless.
+- Generate a fixture: `cargo run --release -p harness --bin generate -- <small|representative|stress> <low|medium|high> <seed> <out_dir>` — also materializes the workload plans (`workload.measurement.jsonl` + the four §4.2 mixes) next to the fixture.
+- Run the budget gate: `cargo run --release -p harness --bin bench -- <fixture_dir> <drey|naive> [workload_name]` — `workload_name` defaults to `measurement` (the budget-gate plan; the four mix names also work); emits one run-JSON document; exits non-zero if a real-driver bucket fails its budget. **Measure in `--release`**; debug tails are meaningless.
 
 Git: personal project, pushes via the `github-toddwbucy:` SSH host alias (workspace
-convention in `/home/todd/git/CLAUDE.md`). Work for v0.1 lives on `feat/drey-v0.1`.
+convention in `/home/todd/git/CLAUDE.md`). Work merges to `main` via PRs; CI enforces
+build/fmt/test/clippy on stable.
 
 Before implementing more M0 apparatus, read `specs/m0-implementation-checklist.md`
 alongside the spec — it enumerates the defaults a session is likely to reach for that
