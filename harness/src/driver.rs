@@ -20,7 +20,7 @@ use drey::types::{Embedding, NodeType, Scalar, Value};
 use drey::{EdgeId, EdgeType, Graph, NodeId};
 
 use crate::generator::Fixture;
-use crate::workload::{Dir, WorkloadOp};
+use crate::workload::{Dir, PropVal, WeightOp, WorkloadOp};
 
 /// Load-time facts a driver reports back.
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +85,15 @@ fn to_value(j: &Json) -> Value {
     }
 }
 
+/// A workload predicate value → a drey `Scalar`.
+fn scalar(v: &PropVal) -> Scalar {
+    match v {
+        PropVal::I64(i) => Scalar::I64(*i),
+        PropVal::F64(f) => Scalar::F64(*f),
+        PropVal::Str(s) => Scalar::String(s.clone()),
+    }
+}
+
 fn dir(d: Dir) -> DirectionOpt {
     match d {
         Dir::Outbound => DirectionOpt::Outbound,
@@ -95,22 +104,45 @@ fn dir(d: Dir) -> DirectionOpt {
 
 // ---- DreyDriver ----
 
-/// Wraps a real in-memory `drey::Graph`. Fixture ids map 1:1 onto drey ids
-/// because nodes and edges are added in ascending id order with no removals, so
-/// drey's monotonic allocator assigns the same ids.
+/// Wraps a real in-memory `drey::Graph`.
+///
+/// Fixture ids are **not** assumed to equal drey ids: `load_fixture` records the
+/// `NodeId`/`EdgeId` that `add_node`/`add_edge` actually return and every op
+/// target is translated through those maps (checklist trap 6 — never infer
+/// identity from insertion position). Today the fixture is dense-from-zero so
+/// the maps are identity, but a captured fixture with id gaps would otherwise
+/// silently attach edges to the wrong nodes.
 pub struct DreyDriver {
     graph: Option<Graph>,
+    node_map: HashMap<u64, NodeId>,
+    edge_map: HashMap<u64, EdgeId>,
 }
 
 impl DreyDriver {
     pub fn new() -> Self {
-        DreyDriver { graph: None }
+        DreyDriver {
+            graph: None,
+            node_map: HashMap::new(),
+            edge_map: HashMap::new(),
+        }
     }
     fn g(&self) -> &Graph {
         self.graph.as_ref().expect("fixture not loaded")
     }
     fn g_mut(&mut self) -> &mut Graph {
         self.graph.as_mut().expect("fixture not loaded")
+    }
+    fn node(&self, fixture_id: u64) -> Result<NodeId, String> {
+        self.node_map
+            .get(&fixture_id)
+            .copied()
+            .ok_or_else(|| format!("unknown fixture node id {fixture_id}"))
+    }
+    fn edge(&self, fixture_id: u64) -> Result<EdgeId, String> {
+        self.edge_map
+            .get(&fixture_id)
+            .copied()
+            .ok_or_else(|| format!("unknown fixture edge id {fixture_id}"))
     }
 }
 
@@ -126,10 +158,14 @@ impl GraphDriver for DreyDriver {
     }
 
     fn load_fixture(&mut self, fx: &Fixture) -> Result<LoadStats, String> {
-        // Index p_seq (I64) on every node type so property_eq/range hit the index.
+        // Index p_seq (I64 ranges) and p_cat (String equality) on every node type
+        // so property_range/property_eq hit the index rather than scanning.
         let mut config = GraphConfig::default();
         for t in 0..fx.params.node_types {
-            config = config.with_indexed_property(NodeType::new(format!("nt_{t:02}")), "p_seq");
+            let nt = NodeType::new(format!("nt_{t:02}"));
+            config = config
+                .with_indexed_property(nt.clone(), "p_seq")
+                .with_indexed_property(nt, "p_cat");
         }
         let mut g = Graph::in_memory(config);
         for t in 0..fx.params.node_types {
@@ -139,39 +175,58 @@ impl GraphDriver for DreyDriver {
             )
             .map_err(|e| e.to_string())?;
         }
+
+        // Record the id drey actually assigns — do not assume it equals n.id.
+        let mut node_map = HashMap::with_capacity(fx.nodes.len());
         for n in &fx.nodes {
             let props: BTreeMap<String, Value> = n
                 .props
                 .iter()
                 .map(|(k, v)| (k.clone(), to_value(v)))
                 .collect();
-            g.add_node(NodeType::new(n.node_type.clone()), props)
+            let id = g
+                .add_node(NodeType::new(n.node_type.clone()), props)
                 .map_err(|e| e.to_string())?;
+            node_map.insert(n.id, id);
         }
         for (id, v) in &fx.embeddings {
-            g.set_node_embedding(NodeId(*id), Embedding::new(v.clone()))
+            let nid = *node_map
+                .get(id)
+                .ok_or_else(|| format!("embedding for unknown fixture node {id}"))?;
+            g.set_node_embedding(nid, Embedding::new(v.clone()))
                 .map_err(|e| e.to_string())?;
         }
+        let mut edge_map = HashMap::with_capacity(fx.edges.len());
         for e in &fx.edges {
             let props: BTreeMap<String, Value> = e
                 .props
                 .iter()
                 .map(|(k, v)| (k.clone(), to_value(v)))
                 .collect();
-            g.add_edge(
-                NodeId(e.from),
-                NodeId(e.to),
-                EdgeType::new(e.edge_type.clone()),
-                e.weight,
-                props,
-            )
-            .map_err(|e| e.to_string())?;
+            let from = *node_map
+                .get(&e.from)
+                .ok_or_else(|| format!("edge {} from unknown node {}", e.id, e.from))?;
+            let to = *node_map
+                .get(&e.to)
+                .ok_or_else(|| format!("edge {} to unknown node {}", e.id, e.to))?;
+            let eid = g
+                .add_edge(
+                    from,
+                    to,
+                    EdgeType::new(e.edge_type.clone()),
+                    e.weight,
+                    props,
+                )
+                .map_err(|e| e.to_string())?;
+            edge_map.insert(e.id, eid);
         }
         let stats = LoadStats {
             nodes: fx.nodes.len(),
             edges: fx.edges.len(),
         };
         self.graph = Some(g);
+        self.node_map = node_map;
+        self.edge_map = edge_map;
         Ok(stats)
     }
 
@@ -180,25 +235,27 @@ impl GraphDriver for DreyDriver {
             WorkloadOp::Neighbors {
                 start,
                 dir: d,
-                edge_type,
+                edge_types,
                 min_weight,
             } => {
+                let start = self.node(*start)?;
                 let opts = NeighborOptions {
                     direction: dir(*d),
-                    edge_types: edge_type.iter().map(|t| EdgeType::new(t.clone())).collect(),
+                    edge_types: edge_types
+                        .iter()
+                        .map(|t| EdgeType::new(t.clone()))
+                        .collect(),
                     min_weight: *min_weight,
                 };
-                let ns = self
-                    .g()
-                    .neighbors(NodeId(*start), opts)
-                    .map_err(|e| e.to_string())?;
+                let ns = self.g().neighbors(start, opts).map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("neighbors", ns.len() as u64)])))
             }
             WorkloadOp::Traverse { start, max_hops } => {
+                let start = self.node(*start)?;
                 let paths = self
                     .g()
                     .traverse(
-                        NodeId(*start),
+                        start,
                         TraversalOptions {
                             max_hops: Some(*max_hops),
                             max_paths: 1000,
@@ -214,6 +271,8 @@ impl GraphDriver for DreyDriver {
                 weighted,
                 max_steps,
             } => {
+                let from = self.node(*from)?;
+                let to = self.node(*to)?;
                 let opts = ShortestPathOptions {
                     cost_mode: if *weighted {
                         CostMode::WeightedCost
@@ -225,21 +284,22 @@ impl GraphDriver for DreyDriver {
                 };
                 let path = self
                     .g()
-                    .shortest_path(NodeId(*from), NodeId(*to), opts)
+                    .shortest_path(from, to, opts)
                     .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("found", path.is_some() as u64)])))
             }
             WorkloadOp::PropertyEq {
                 node_type,
                 key,
-                ivalue,
+                value,
+                ..
             } => {
                 let hits = self
                     .g()
                     .nodes_by_property(PropertyQuery {
                         node_type: NodeType::new(node_type.clone()),
                         key: key.clone(),
-                        predicate: ScalarPredicate::Eq(Scalar::I64(*ivalue)),
+                        predicate: ScalarPredicate::Eq(scalar(value)),
                     })
                     .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("hits", hits.len() as u64)])))
@@ -249,6 +309,7 @@ impl GraphDriver for DreyDriver {
                 key,
                 min,
                 max,
+                ..
             } => {
                 let hits = self
                     .g()
@@ -256,8 +317,8 @@ impl GraphDriver for DreyDriver {
                         node_type: NodeType::new(node_type.clone()),
                         key: key.clone(),
                         predicate: ScalarPredicate::Range {
-                            min: Some(Scalar::I64(*min)),
-                            max: Some(Scalar::I64(*max)),
+                            min: Some(scalar(min)),
+                            max: Some(scalar(max)),
                         },
                     })
                     .map_err(|e| e.to_string())?;
@@ -266,35 +327,62 @@ impl GraphDriver for DreyDriver {
             WorkloadOp::Similar {
                 seed_node,
                 k,
-                node_type,
+                node_types,
+                prop_filter,
+                candidates,
+                ..
             } => {
+                let seed = self.node(*seed_node)?;
                 let emb = self
                     .g()
-                    .node(NodeId(*seed_node))
+                    .node(seed)
                     .map_err(|e| e.to_string())?
                     .and_then(|n| n.embedding)
                     .ok_or("seed node has no embedding")?;
-                // Compose a node-type filter so the scan is bounded to the
-                // budget's ≤10k-candidate shape (spec §4.4).
+                // Compose the type filter (one or more types) and an optional
+                // property filter so the scan is bounded to the sweep target
+                // (spec §4.1). The realized candidate count is carried in the op
+                // and reported here without re-scanning inside the timed region.
+                let property_filter = prop_filter.as_ref().map(|(pk, pv)| PropertyQuery {
+                    node_type: NodeType::new(node_types.first().cloned().unwrap_or_default()),
+                    key: pk.clone(),
+                    predicate: ScalarPredicate::Eq(scalar(pv)),
+                });
                 let query = SimilarityQuery {
-                    node_types: Some(vec![NodeType::new(node_type.clone())]),
+                    node_types: Some(
+                        node_types
+                            .iter()
+                            .map(|t| NodeType::new(t.clone()))
+                            .collect(),
+                    ),
+                    property_filter,
                     ..SimilarityQuery::new(emb, SimilarityMetric::Cosine, *k)
                 };
                 let hits = self.g().similar_nodes(query).map_err(|e| e.to_string())?;
-                Ok(OpOutcome::ok(c(&[("results", hits.len() as u64)])))
+                Ok(OpOutcome::ok(c(&[
+                    ("results", hits.len() as u64),
+                    ("candidates", *candidates),
+                ])))
             }
             WorkloadOp::UpdateEdgeWeight {
                 edge,
-                factor,
+                weight_op,
+                operand,
                 bounded,
             } => {
+                let eid = self.edge(*edge)?;
+                let update = match weight_op {
+                    WeightOp::Set => WeightUpdate::set(*operand),
+                    WeightOp::Add => WeightUpdate::add(*operand),
+                    WeightOp::Multiply => WeightUpdate::multiply(*operand),
+                };
                 let update = if *bounded {
-                    WeightUpdate::multiply(*factor).with_bounds(0.0, 1.0)
+                    update.with_bounds(0.0, 1.0)
                 } else {
-                    WeightUpdate::multiply(*factor)
+                    update
                 };
                 self.g_mut()
-                    .update_edge_weight(EdgeId(*edge), update)
+                    .update_edge_weight(eid, update)
                     .map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[("updated", 1)])))
             }
@@ -333,21 +421,22 @@ struct NaiveNode {
     embedding: Option<Vec<f32>>,
 }
 
-#[allow(dead_code)]
 struct NaiveEdge {
-    from: u64,
     to: u64,
     edge_type: String,
     weight: f32,
 }
 
 /// Throwaway mechanics validation only (spec §5.1). Linear scans everywhere; its
-/// timings are never a baseline.
+/// timings are never a baseline. For the op classes it *does* implement it must
+/// stay semantically equivalent to `DreyDriver` (same node-type filtering, same
+/// bounded-weight semantics), so counter cross-checks are meaningful.
 #[derive(Default)]
 pub struct NaiveDriver {
     nodes: HashMap<u64, NaiveNode>,
     edges: HashMap<u64, NaiveEdge>,
-    adjacency: HashMap<u64, Vec<u64>>, // from -> edge ids
+    out_adj: HashMap<u64, Vec<u64>>, // from -> edge ids
+    in_adj: HashMap<u64, Vec<u64>>,  // to -> edge ids
 }
 
 impl NaiveDriver {
@@ -381,13 +470,13 @@ impl GraphDriver for NaiveDriver {
             self.edges.insert(
                 e.id,
                 NaiveEdge {
-                    from: e.from,
                     to: e.to,
                     edge_type: e.edge_type.clone(),
                     weight: e.weight,
                 },
             );
-            self.adjacency.entry(e.from).or_default().push(e.id);
+            self.out_adj.entry(e.from).or_default().push(e.id);
+            self.in_adj.entry(e.to).or_default().push(e.id);
         }
         Ok(LoadStats {
             nodes: self.nodes.len(),
@@ -397,9 +486,41 @@ impl GraphDriver for NaiveDriver {
 
     fn run_op(&mut self, op: &WorkloadOp) -> Result<OpOutcome, String> {
         match op {
-            WorkloadOp::Neighbors { start, .. } => {
-                let n = self.adjacency.get(start).map(|v| v.len()).unwrap_or(0);
-                Ok(OpOutcome::ok(c(&[("neighbors", n as u64)])))
+            WorkloadOp::Neighbors {
+                start,
+                dir: d,
+                edge_types,
+                min_weight,
+            } => {
+                // drey returns one Neighbor per matching edge (direction +
+                // edge-type + min_weight filtered), so count matching edges the
+                // same way — otherwise the cross-driver counter check diverges
+                // now that the plan varies these parameters (audit #5).
+                let mut candidates: Vec<u64> = Vec::new();
+                if matches!(d, Dir::Outbound | Dir::Both) {
+                    if let Some(es) = self.out_adj.get(start) {
+                        candidates.extend(es);
+                    }
+                }
+                if matches!(d, Dir::Inbound | Dir::Both) {
+                    if let Some(es) = self.in_adj.get(start) {
+                        candidates.extend(es);
+                    }
+                }
+                let mut n = 0u64;
+                for eid in candidates {
+                    let e = &self.edges[&eid];
+                    if !edge_types.is_empty() && !edge_types.contains(&e.edge_type) {
+                        continue;
+                    }
+                    if let Some(w) = min_weight {
+                        if e.weight < *w {
+                            continue;
+                        }
+                    }
+                    n += 1;
+                }
+                Ok(OpOutcome::ok(c(&[("neighbors", n)])))
             }
             WorkloadOp::Traverse { start, max_hops } => {
                 // BFS with a visited set and a path cap, matching DreyDriver's
@@ -413,7 +534,7 @@ impl GraphDriver for NaiveDriver {
                 'outer: for _ in 0..*max_hops {
                     let mut next = Vec::new();
                     for node in frontier.drain(..) {
-                        if let Some(edges) = self.adjacency.get(&node) {
+                        if let Some(edges) = self.out_adj.get(&node) {
                             for e in edges {
                                 let to = self.edges[e].to;
                                 paths += 1;
@@ -430,20 +551,54 @@ impl GraphDriver for NaiveDriver {
                 }
                 Ok(OpOutcome::ok(c(&[("paths_returned", paths)])))
             }
-            WorkloadOp::PropertyEq { key, ivalue, .. } => {
+            WorkloadOp::PropertyEq {
+                node_type,
+                key,
+                value,
+                ..
+            } => {
+                // Filter by node_type (as DreyDriver does) and match the typed
+                // value; otherwise the hit counter would disagree with drey and
+                // the cross-driver counter check would be meaningless (audit #5).
                 let mut hits = 0u64;
                 for n in self.nodes.values() {
-                    if n.props.get(key).and_then(|v| v.as_i64()) == Some(*ivalue) {
+                    if &n.node_type != node_type {
+                        continue;
+                    }
+                    let m = match value {
+                        PropVal::I64(i) => n.props.get(key).and_then(|v| v.as_i64()) == Some(*i),
+                        PropVal::F64(f) => n.props.get(key).and_then(|v| v.as_f64()) == Some(*f),
+                        PropVal::Str(s) => {
+                            n.props.get(key).and_then(|v| v.as_str()) == Some(s.as_str())
+                        }
+                    };
+                    if m {
                         hits += 1;
                     }
                 }
                 Ok(OpOutcome::ok(c(&[("hits", hits)])))
             }
-            WorkloadOp::UpdateEdgeWeight { edge, factor, .. } => {
-                if let Some(e) = self.edges.get_mut(edge) {
-                    e.weight *= *factor;
-                }
-                Ok(OpOutcome::ok(c(&[("updated", 1)])))
+            WorkloadOp::UpdateEdgeWeight {
+                edge,
+                weight_op,
+                operand,
+                bounded,
+            } => {
+                // Apply the op then clamp when bounded (the §4.1 stopgap
+                // semantics DreyDriver uses), and report updated=0 for a missing
+                // edge rather than a false 1 (audit #5).
+                let updated = if let Some(e) = self.edges.get_mut(edge) {
+                    let w = match weight_op {
+                        WeightOp::Set => *operand,
+                        WeightOp::Add => e.weight + *operand,
+                        WeightOp::Multiply => e.weight * *operand,
+                    };
+                    e.weight = if *bounded { w.clamp(0.0, 1.0) } else { w };
+                    1
+                } else {
+                    0
+                };
+                Ok(OpOutcome::ok(c(&[("updated", updated)])))
             }
             // NaiveDriver only implements enough op classes to prove mechanics;
             // the rest report n/a rather than fabricate a measurement.
