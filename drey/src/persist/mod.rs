@@ -61,8 +61,29 @@ const WAL_HEADER_LEN: usize = 16;
 const TAG_MUTATION: u8 = 1;
 const TAG_COMMIT: u8 = 2;
 
-/// The persistence handle for a file-backed graph.
-pub(crate) struct Persister {
+/// The internal persistence seam (design commitment 6): the public API sits
+/// above this trait, so the durability backend is swappable without an API
+/// change. [`WalPersistence`] is the only implementation today (WAL + snapshot);
+/// recovery/construction is a per-backend factory (`Graph::open`/`create`), not
+/// a trait method, since recovery *builds* the graph rather than acting on an
+/// existing backend.
+/// `Send + Sync` so a boxed `dyn Persistence` keeps `Graph` `Send + Sync` (a
+/// consumer may move a graph between threads or share `&Graph` for concurrent
+/// reads / `export`). A concrete backend held directly would be auto-`Send +
+/// Sync`; a trait object is not unless the trait says so.
+pub(crate) trait Persistence: Send + Sync {
+    /// Buffer one mutation; durable only at the next [`Persistence::commit`].
+    fn append(&mut self, mutation: &Mutation) -> Result<()>;
+    /// Flush buffered mutations to durable storage (fsync-backed).
+    fn commit(&mut self) -> Result<()>;
+    /// Compact `store` into a fresh full-image checkpoint and reset the log.
+    fn snapshot(&mut self, store: &Store) -> Result<()>;
+    /// The current durability generation, embedded in exported images.
+    fn epoch(&self) -> u64;
+}
+
+/// The WAL + snapshot persistence backend for a file-backed graph.
+pub(crate) struct WalPersistence {
     dir: PathBuf,
     wal: File,
     /// Snapshot generation this WAL belongs to (see [`WAL_HEADER_LEN`]).
@@ -79,7 +100,7 @@ pub(crate) struct Persister {
     poisoned: bool,
 }
 
-impl Persister {
+impl WalPersistence {
     fn ensure_healthy(&self) -> Result<()> {
         if self.poisoned {
             return Err(Error::Storage(
@@ -89,10 +110,10 @@ impl Persister {
         }
         Ok(())
     }
+}
 
-    /// Append a mutation to the pending buffer. It becomes durable only at the
-    /// next [`Persister::commit`].
-    pub(crate) fn append(&mut self, mutation: &Mutation) -> Result<()> {
+impl Persistence for WalPersistence {
+    fn append(&mut self, mutation: &Mutation) -> Result<()> {
         self.ensure_healthy()?;
         let mut w = Writer::default();
         w.u8(TAG_MUTATION);
@@ -108,7 +129,7 @@ impl Persister {
     /// (never a false `Ok`). If the write or fsync fails — possibly leaving torn
     /// bytes at the WAL tail — the persister is poisoned: later commits would
     /// otherwise append behind the torn region and be stranded on the next open.
-    pub(crate) fn commit(&mut self) -> Result<()> {
+    fn commit(&mut self) -> Result<()> {
         self.ensure_healthy()?;
         // A commit with no accumulated mutations is a no-op: writing an empty
         // commit marker and fsync'ing would only grow the WAL and pay a pointless
@@ -139,9 +160,70 @@ impl Persister {
         self.pending.clear();
         Ok(())
     }
+
+    /// Compact: write a full-graph snapshot and reset the WAL. The snapshot is
+    /// written to a temp file, fsync'd, atomically renamed, and the parent
+    /// directory fsync'd — so a crash leaves either the old or new snapshot,
+    /// never a partial one. The new snapshot carries a bumped epoch, and the WAL
+    /// is re-headered with that epoch. If a crash lands between the rename and
+    /// the WAL reset, the leftover WAL has the *old* epoch, so `open` sees it as
+    /// stale and skips it instead of double-applying (PRD §10.2.1).
+    fn snapshot(&mut self, store: &Store) -> Result<()> {
+        // Flush anything pending first so the snapshot reflects all commits.
+        self.commit()?;
+        let new_epoch = self.epoch + 1;
+        let dir = self.dir.clone();
+
+        let bytes = save_snapshot(store, new_epoch);
+        let tmp = dir.join("snapshot.bin.tmp");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, dir.join(SNAPSHOT_FILE))?; // atomic replace — the cutover point
+
+        // Past the cutover the new snapshot is visible, so the in-memory
+        // epoch/WAL must be advanced to match. ANY failure from here — the
+        // directory fsync that makes the rename durable, the WAL reset, its
+        // fsyncs, the handle swap, or the epoch bump — leaves on-disk and
+        // in-memory disagreeing; a later commit would then append to a
+        // stale-epoch or headerless WAL and be silently discarded/stranded on the
+        // next open. So every post-cutover step (including that first fsync_dir)
+        // is inside the poison-guarded block: on failure the graph must be
+        // reopened (it loads cleanly from the new snapshot) rather than keep
+        // writing.
+        let cutover = (|| -> Result<()> {
+            fsync_dir(&dir)?; // make the rename durable
+            {
+                let mut wal = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .create(true)
+                    .open(dir.join(WAL_FILE))?;
+                wal.write_all(&wal_header(new_epoch))?;
+                wal.sync_all()?;
+            }
+            fsync_dir(&dir)?;
+            let new_wal = OpenOptions::new().append(true).open(dir.join(WAL_FILE))?;
+            self.wal = new_wal;
+            self.epoch = new_epoch;
+            self.pending.clear();
+            Ok(())
+        })();
+        if let Err(e) = cutover {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
-impl Drop for Persister {
+impl Drop for WalPersistence {
     fn drop(&mut self) {
         if self.locked {
             let _ = fs::remove_file(self.dir.join(LOCK_FILE));
@@ -203,14 +285,14 @@ impl Graph {
         wal.write_all(&wal_header(0))?;
         wal.sync_all()?;
         fsync_dir(&dir)?;
-        graph.persist = Some(Persister {
+        graph.persist = Some(Box::new(WalPersistence {
             dir,
             wal,
             epoch: 0,
             pending: Vec::new(),
             locked,
             poisoned: false,
-        });
+        }));
         Ok(graph)
     }
 
@@ -290,14 +372,14 @@ impl Graph {
                 replay.epoch
             };
             let wal = OpenOptions::new().append(true).open(&wal_path)?;
-            graph.persist = Some(Persister {
+            graph.persist = Some(Box::new(WalPersistence {
                 dir,
                 wal,
                 epoch,
                 pending: Vec::new(),
                 locked,
                 poisoned: false,
-            });
+            }));
         }
         Ok(graph)
     }
@@ -310,57 +392,13 @@ impl Graph {
     /// the WAL reset, the leftover WAL has the *old* epoch, so `open` sees it as
     /// stale and skips it instead of double-applying (PRD §10.2.1).
     pub fn snapshot(&mut self) -> Result<()> {
-        let (dir, new_epoch) = match &self.persist {
-            Some(p) => (p.dir.clone(), p.epoch + 1),
-            None => return Err(Error::Storage("cannot snapshot an in-memory graph".into())),
-        };
-        // Flush anything pending first so the snapshot reflects all commits.
-        self.commit()?;
-
-        let bytes = save_snapshot(&self.store, new_epoch);
-        let tmp = dir.join("snapshot.bin.tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
+        // The compaction lives behind the persistence seam; a file-backed graph
+        // delegates to its backend, an in-memory graph has nothing to compact.
+        // `persist` and `store` are disjoint fields, so the split borrow is fine.
+        match self.persist.as_mut() {
+            Some(p) => p.snapshot(&self.store),
+            None => Err(Error::Storage("cannot snapshot an in-memory graph".into())),
         }
-        fs::rename(&tmp, dir.join(SNAPSHOT_FILE))?; // atomic replace
-        fsync_dir(&dir)?; // make the rename durable — the cutover point
-
-        // Past the cutover: the snapshot on disk is now the new epoch. If any of
-        // the WAL reset, its fsyncs, the handle swap, or the epoch bump fails, the
-        // on-disk WAL and the in-memory epoch/handle can disagree with the new
-        // snapshot — a later commit would then append to a stale-epoch or
-        // headerless WAL and be silently discarded/stranded on the next open. So
-        // any post-cutover failure poisons the persister: the graph must be
-        // reopened (which loads cleanly from the new snapshot) rather than
-        // continue writing.
-        let reset = (|| -> Result<()> {
-            {
-                let mut wal = OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .create(true)
-                    .open(dir.join(WAL_FILE))?;
-                wal.write_all(&wal_header(new_epoch))?;
-                wal.sync_all()?;
-            }
-            fsync_dir(&dir)?;
-            let new_wal = OpenOptions::new().append(true).open(dir.join(WAL_FILE))?;
-            if let Some(p) = self.persist.as_mut() {
-                p.wal = new_wal;
-                p.epoch = new_epoch;
-                p.pending.clear();
-            }
-            Ok(())
-        })();
-        if let Err(e) = reset {
-            if let Some(p) = self.persist.as_mut() {
-                p.poisoned = true;
-            }
-            return Err(e);
-        }
-        Ok(())
     }
 
     /// Export a portable full-graph image to a single file (PRD §9.2, §22).
@@ -369,7 +407,7 @@ impl Graph {
         // A portable image is not tied to a WAL; carry the current epoch so a
         // re-import into a file-backed graph starts consistently.
         let path = path.as_ref();
-        let epoch = self.persist.as_ref().map_or(0, |p| p.epoch);
+        let epoch = self.persist.as_ref().map_or(0, |p| p.epoch());
         let bytes = save_snapshot(&self.store, epoch);
         // Write to a sibling temp file, fsync, then atomically rename over the
         // destination and fsync the parent. `export` is the §22 backup verb, so a

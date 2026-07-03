@@ -20,7 +20,17 @@ pub struct Graph {
     pub(crate) store: Store,
     pub(crate) config: GraphConfig,
     /// The persistence backend, present when the graph is file-backed (M2).
-    pub(crate) persist: Option<crate::persist::Persister>,
+    pub(crate) persist: Option<Box<dyn crate::persist::Persistence>>,
+}
+
+// `Graph` must stay `Send + Sync` — a consumer may move it between threads or
+// share `&Graph` for concurrent reads / `export`. Boxing the persistence backend
+// behind a trait object would silently drop both unless the trait is `Send +
+// Sync`; this never-called fn fails to compile if that regresses.
+#[allow(dead_code)]
+fn _assert_graph_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<Graph>();
 }
 
 impl Graph {
