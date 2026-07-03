@@ -1,35 +1,34 @@
-//! `bench` — run a measurement plan against a fixture and emit run JSON (M0/M3).
+//! `bench` — replay a materialized workload against a fixture and emit run JSON
+//! (M0/M3).
 //!
-//! Usage: `bench <fixture_dir> <drey|naive> [per_bucket]`
+//! Usage: `bench <fixture_dir> <drey|naive> [workload_name]`
+//!
+//! `workload_name` selects which `workload.<name>.jsonl` to replay (default
+//! `measurement`, the budget-gate plan; the four mix names are also available).
+//! The plan is read from disk, never synthesized in process — a run is
+//! reproducible from the fixture artifacts alone (spec §3.6).
 
 use std::process::exit;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness::driver::{DreyDriver, GraphDriver, NaiveDriver};
-use harness::fixture::read_fixture;
-use harness::output::{host_fingerprint, Resources, RunMeta, RunOutput};
+use harness::fixture::{read_fixture, read_workload};
+use harness::output::{host_fingerprint, FixtureInfo, Resources, RunMeta, RunOutput};
 use harness::runner;
-use harness::workload::measurement_plan;
+use harness::workload::WARMUP;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: {} <fixture_dir> <drey|naive> [per_bucket]", args[0]);
+        eprintln!(
+            "usage: {} <fixture_dir> <drey|naive> [workload_name]",
+            args[0]
+        );
         exit(2);
     }
     let dir = std::path::PathBuf::from(&args[1]);
     let driver_kind = args[2].as_str();
-    // Default 1000, but a present-yet-unparseable value is a user error, not a
-    // silent fallback.
-    let per_bucket: usize = match args.get(3) {
-        None => 1000,
-        Some(s) => match s.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                eprintln!("per_bucket must be a non-negative integer, got {s:?}");
-                exit(2);
-            }
-        },
-    };
+    let workload_name = args.get(3).map(|s| s.as_str()).unwrap_or("measurement");
 
     let (fixture, manifest, checksum_ok) = match read_fixture(&dir) {
         Ok(v) => v,
@@ -42,6 +41,16 @@ fn main() {
         eprintln!("warning: fixture checksums did not verify");
     }
 
+    // Replay the materialized plan; do not synthesize one (spec §3.6).
+    let plan = match read_workload(&dir, workload_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("failed to read workload {workload_name:?}: {e}");
+            eprintln!("(run `generate` to materialize workload.*.jsonl next to the fixture)");
+            exit(1);
+        }
+    };
+
     let mut driver: Box<dyn GraphDriver> = match driver_kind {
         "drey" => Box::new(DreyDriver::new()),
         "naive" => Box::new(NaiveDriver::new()),
@@ -51,6 +60,13 @@ fn main() {
         }
     };
     let is_real = driver_kind == "drey";
+
+    // Capture the run start before any load/measurement work, so `started_at`
+    // reflects the start rather than completion time.
+    let started_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     eprintln!("loading fixture into {} driver…", driver.name());
     let load = match driver.load_fixture(&fixture) {
@@ -65,11 +81,9 @@ fn main() {
         load.nodes, load.edges
     );
 
-    let plan = measurement_plan(&fixture, per_bucket);
-    // Warmup: discard up to 100 per bucket (spec §5.2), but never more than
-    // half a small plan so short runs still retain samples.
-    let warmup = 100.min(per_bucket / 2);
-    let results = match runner::run(driver.as_mut(), &plan, warmup, is_real) {
+    // Warmup: discard the spec §5.2 prefix per bucket. The materialized plan is
+    // sized (by `generate`) so each budgeted bucket still retains its floor.
+    let results = match runner::run(driver.as_mut(), &plan, WARMUP, is_real) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("run failed: {e}");
@@ -91,10 +105,13 @@ fn main() {
         harness_version: env!("CARGO_PKG_VERSION").into(),
         run: RunMeta {
             driver: driver.name(),
-            fixture_size: format!("{:?}", manifest.parameters.size_class).to_lowercase(),
-            fixture_source: format!("{:?}", manifest.source).to_lowercase(),
-            checksum_verified: checksum_ok,
+            mix: workload_name.to_string(),
             ops_total: plan.len() as u64,
+            started_at,
+        },
+        fixture: FixtureInfo {
+            manifest,
+            checksum_verified: checksum_ok,
         },
         host: host_fingerprint(),
         results,

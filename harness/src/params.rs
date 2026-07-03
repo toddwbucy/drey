@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 
 /// The generator version. Bump whenever output for the same `(seed, params)`
 /// would change (spec §3.4).
-pub const GENERATOR_VERSION: u32 = 1;
+///
+/// v2: the edge self-loop fallback became degree-aware (was `(from+1) % n`),
+/// which can change output for seeds where that fallback fired.
+pub const GENERATOR_VERSION: u32 = 2;
 
 /// Default truncated-Zipf exponent for out-degree (spec §3.2 `[spec decision]`).
 pub const DEFAULT_DEGREE_S: f64 = 1.2;

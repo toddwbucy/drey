@@ -160,19 +160,45 @@ fn generate_edges(params: &Parameters) -> Vec<FixtureEdge> {
     // Edge-type skew: a Zipf over edge types so type-filter selectivity varies.
     let et_zipf = ZipfTable::new(params.edge_types as usize, params.degree_s);
 
+    // Truncated Zipf (spec §3.2): cap each node's total (in+out) degree at
+    // max_degree. Without this the top node reaches ~50x the declared cap and the
+    // manifest asserts a bound the data violates. A drawn endpoint already at the
+    // cap is resampled; the spilled mass flattens onto lower ranks.
+    let max_degree = params.max_degree;
+    let mut degree = vec![0u32; n];
+    let draw = |rng: &mut DetRng, degree: &[u32]| -> usize {
+        for _ in 0..16 {
+            let node = node_zipf.sample(rng);
+            if degree[node] < max_degree {
+                return node;
+            }
+        }
+        degree.iter().position(|&d| d < max_degree).unwrap_or(0)
+    };
+
     let mut edges = Vec::with_capacity(params.edges as usize);
     for id in 0..params.edges {
-        // Draw endpoints hub-heavy; avoid self-loops by resampling the target.
-        let from = node_zipf.sample(&mut rng);
-        let mut to = node_zipf.sample(&mut rng);
+        // Draw endpoints hub-heavy but degree-capped; avoid self-loops.
+        let from = draw(&mut rng, &degree);
+        let mut to = draw(&mut rng, &degree);
         let mut guard = 0;
         while to == from && guard < 8 {
-            to = node_zipf.sample(&mut rng);
+            to = draw(&mut rng, &degree);
             guard += 1;
         }
         if to == from {
-            to = (from + 1) % n; // deterministic fallback
+            // Degree-aware deterministic fallback: the nearest node that is not
+            // `from` and is still under the cap. A plain `(from + 1) % n` could
+            // land on a node already at max_degree and push it over, failing the
+            // self-check. Falls back to `from` only if the graph is fully
+            // saturated (unreachable for valid params, where edges ≪ n·cap).
+            to = (1..n)
+                .map(|off| (from + off) % n)
+                .find(|&cand| degree[cand] < max_degree)
+                .unwrap_or(from);
         }
+        degree[from] += 1;
+        degree[to] += 1;
         let et = et_zipf.sample(&mut rng);
         edges.push(FixtureEdge {
             id,

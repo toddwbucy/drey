@@ -19,6 +19,8 @@ struct Bucket {
     times_us: Vec<f64>,
     status: Option<OpStatus>,
     last_counters: BTreeMap<String, u64>,
+    /// Bucket-defining parameters (constant within a bucket), for the row.
+    params: BTreeMap<String, String>,
 }
 
 /// Run a plan against a driver, returning one [`ResultRow`] per bucket. `warmup`
@@ -40,6 +42,9 @@ pub fn run(
 
         let b = buckets.entry(key).or_default();
         b.status = Some(outcome.status);
+        if b.params.is_empty() {
+            b.params = op.params();
+        }
         if outcome.status == OpStatus::Ok {
             b.times_us.push(elapsed_us);
             b.last_counters = outcome.counters;
@@ -55,9 +60,11 @@ pub fn run(
             None => "n/a",
         };
 
-        // Discard a warmup prefix, but never more than a fifth of a bucket, so
-        // small (heavyweight) buckets like batch decay still retain samples.
-        let effective_warmup = warmup.min(b.times_us.len() / 5);
+        // Discard the warmup prefix (spec §5.2 wants exactly 100 for a real
+        // plan). Clamp to half a bucket only as a floor for tiny test plans;
+        // real plans are sized by `measurement_samples` and guarded by
+        // `plan_self_check`, so the clamp never bites them.
+        let effective_warmup = warmup.min(b.times_us.len() / 2);
         let retained: Vec<f64> = b.times_us.split_off(effective_warmup);
 
         let budget = budget_for(&bucket);
@@ -101,6 +108,7 @@ pub fn run(
         rows.push(ResultRow {
             op: bucket,
             status: status_str.into(),
+            params: std::mem::take(&mut b.params),
             samples: retained.len() as u64,
             p50_us: p50,
             p95_us: p95,
@@ -110,6 +118,7 @@ pub fn run(
             budget_throughput_per_s: budget.throughput_per_s,
             budget_source: "synthetic".into(),
             pass,
+            counters: std::mem::take(&mut b.last_counters),
         });
     }
     Ok(rows)

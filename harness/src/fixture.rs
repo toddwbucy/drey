@@ -172,6 +172,31 @@ pub fn read_fixture(dir: &Path) -> Result<(Fixture, Manifest, bool), String> {
     Ok((fixture, manifest, checksum_ok))
 }
 
+/// The on-disk name for a materialized workload plan (spec §3.6): the mix name
+/// (`mixed`, …) or `measurement` for the budget-gate plan.
+pub fn workload_filename(name: &str) -> String {
+    format!("workload.{name}.jsonl")
+}
+
+/// Materialize a workload plan next to the fixture as `workload.<name>.jsonl`,
+/// one op per line in execution order (spec §3.6 — the workload is data, not
+/// code, so a run is reproducible from artifacts alone).
+pub fn write_workload(
+    dir: &Path,
+    name: &str,
+    plan: &[crate::workload::WorkloadOp],
+) -> Result<(), String> {
+    let bytes = canonical::jsonl(plan.iter()).into_bytes();
+    write_all(dir.join(workload_filename(name)), &bytes)
+}
+
+/// Read a materialized workload plan back (spec §3.6). `bench` runs exactly this
+/// sequence rather than synthesizing a plan in process.
+pub fn read_workload(dir: &Path, name: &str) -> Result<Vec<crate::workload::WorkloadOp>, String> {
+    let file = workload_filename(name);
+    parse_jsonl(&dir.join(&file)).map_err(|e| format!("{file}: {e}"))
+}
+
 fn parse_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
     let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -210,6 +235,26 @@ pub fn self_check(fixture: &Fixture) -> Result<(), String> {
     let expected_mean = p.fanout.mean() as f64;
     if (mean - expected_mean).abs() > 1e-9 {
         return Err(format!("mean out-degree {mean} != {expected_mean}"));
+    }
+
+    // No node exceeds the declared max_degree — the manifest must not assert a
+    // truncation bound the data violates (spec §3.2).
+    let mut degree = vec![0u32; fixture.nodes.len()];
+    for e in &fixture.edges {
+        if let Some(d) = degree.get_mut(e.from as usize) {
+            *d += 1;
+        }
+        if let Some(d) = degree.get_mut(e.to as usize) {
+            *d += 1;
+        }
+    }
+    if let Some(&max) = degree.iter().max() {
+        if max as u64 > p.max_degree as u64 {
+            return Err(format!(
+                "max node degree {max} exceeds declared max_degree {}",
+                p.max_degree
+            ));
+        }
     }
 
     // Embedding coverage within tolerance of the parameter.
