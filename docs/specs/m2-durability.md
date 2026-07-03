@@ -1,4 +1,4 @@
-# M2 Durability & Persistence — Decision Record
+# M2 Durability & Persistence - Decision Record
 
 Status: retroactive record, 2026-07-03. The M2 implementation (WAL + snapshots,
 hand-rolled binary codec) shipped with its design stated only in
@@ -6,7 +6,7 @@ hand-rolled binary codec) shipped with its design stated only in
 documentation layer the PRD (§21 M2 exit criteria) expects. It reflects the
 code as of `FORMAT_VERSION 3` (post issue #5 remediation and PR #17). Where
 this document and the code disagree, the code plus its tests are normative and
-this document has rotted — fix it.
+this document has rotted - fix it.
 
 ## Durability level (PRD §21 M2 exit criterion)
 
@@ -22,7 +22,7 @@ Supporting guarantees, all load-bearing for the level above:
 - `create` fsyncs the graph directory's **parent**, so a newly created graph
   survives power loss (a POSIX `mkdir` is a metadata change to the parent).
 - `snapshot` writes to a temp file, fsyncs it, atomically renames, and fsyncs
-  the directory — a crash leaves the old or new snapshot, never a partial one.
+  the directory - a crash leaves the old or new snapshot, never a partial one.
 - `export` uses the same temp+fsync+rename discipline, so a failed export
   cannot destroy the previous export at the destination path.
 
@@ -45,7 +45,7 @@ bytes (issue #5, critical finding). Recovery is reopen: `open` repairs the
 WAL to its last committed frame.
 
 The poison paths are exercised by `cfg(test)` fail-points (torn WAL write,
-WAL fsync, post-cutover dir fsync) — compiled out of release builds, no
+WAL fsync, post-cutover dir fsync) - compiled out of release builds, no
 public surface (issue #10 / PR #15).
 
 ## On-disk format
@@ -57,7 +57,7 @@ the structure:
 - **WAL header (v3, 20 bytes):** magic `DREY` + format version (u32 LE) +
   epoch (u64 LE) + CRC32 over the preceding 16 bytes. The epoch is the
   snapshot generation the WAL belongs to and is the sole discriminator
-  between replay and discard-as-stale — which is why it is CRC-protected.
+  between replay and discard-as-stale - which is why it is CRC-protected.
 - **WAL frames:** length (u32 LE) + CRC32(payload) + payload. Mutation frames
   carry one encoded `Mutation` each; a batch is terminated by a commit-marker
   frame. On replay, only fully committed batches apply; a torn or CRC-bad
@@ -66,7 +66,7 @@ the structure:
 - **Snapshot:** magic + version + epoch, interner label tables, per-type
   embedding dims, index registrations, then all node and edge records with
   **explicit IDs**, and a trailing CRC32 over the payload (v2+). Type ids in
-  records are validated against the label tables at load — corruption is a
+  records are validated against the label tables at load - corruption is a
   typed `Codec` error at `open`, never a deferred panic.
 - **IDs:** records store `NodeId`/`EdgeId` explicitly, never by array
   position; replay applies mutations with their recorded ids and restores the
@@ -90,15 +90,15 @@ CRC32 and the float round-trip).
 **There is no in-place migration.** `open` on an older-version graph fails
 explicitly with `VersionMismatch`; the upgrade path is export from a build
 that reads the old format, import into the new. This is a deliberate v0.x
-posture — migration machinery is weight (design commitment 4) that
+posture - migration machinery is weight (design commitment 4) that
 pre-release format churn does not justify. Revisit before the first release
 that promises format stability.
 
 ## Locking
 
 Single-writer enforcement (`GraphConfig.file_lock`, default off) uses OS
-advisory locking — `flock(2)` on Unix, `LockFileEx` on Windows, via
-`File::try_lock` — on a permanent `LOCK` anchor file that is never deleted.
+advisory locking - `flock(2)` on Unix, `LockFileEx` on Windows, via
+`File::try_lock` - on a permanent `LOCK` anchor file that is never deleted.
 The kernel releases the lock on fd close, including SIGKILL/OOM-kill/power
 loss, so a hard crash cannot wedge the graph (issue #8 / PR #14 replaced the
 original PID-file scheme, which could).
@@ -109,10 +109,10 @@ There is no rollback verb and no `Drop` flush. Dropping the `Graph` (or
 crashing) with accumulated uncommitted mutations **silently discards them**:
 the next `open` loads the last committed state. `commit` is the only publish
 point. Consumers that need turn-boundary durability call `commit` at the turn
-boundary — this is the contract the durability level above is written
+boundary - this is the contract the durability level above is written
 against.
 
-## Recovery matrix (PRD §10.2.1) — test anchors
+## Recovery matrix (PRD §10.2.1) - test anchors
 
 All rows are asserted in `drey/tests/m2_persistence.rs`: crash-before-commit,
 torn tail, corrupt frame (CRC byte-flip), corrupt snapshot (truncation and
