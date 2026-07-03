@@ -23,8 +23,12 @@ mod codec;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use codec::{crc32, Reader, Writer};
+
+/// Per-call counter for unique `export` temp-file names (see `Graph::export`).
+static EXPORT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::config::GraphConfig;
 use crate::error::{Error, Result};
@@ -364,9 +368,36 @@ impl Graph {
     pub fn export(&self, path: impl AsRef<Path>) -> Result<()> {
         // A portable image is not tied to a WAL; carry the current epoch so a
         // re-import into a file-backed graph starts consistently.
+        let path = path.as_ref();
         let epoch = self.persist.as_ref().map_or(0, |p| p.epoch);
         let bytes = save_snapshot(&self.store, epoch);
-        fs::write(path, bytes)?;
+        // Write to a sibling temp file, fsync, then atomically rename over the
+        // destination and fsync the parent. `export` is the §22 backup verb, so a
+        // torn/failed write must never destroy the previous image at `path` — the
+        // hazard of a bare `fs::write` (create+truncate in place). Mirrors
+        // `snapshot`'s cutover.
+        //
+        // Unlike `snapshot` (`&mut self`, serialized by the single-writer model),
+        // `export` takes `&self`, so two threads can export the same destination
+        // at once. A fixed `.tmp` name would let them clobber each other's temp;
+        // a per-call unique suffix (pid + counter) keeps each write private, and
+        // the atomic renames just resolve to whichever finishes last — always a
+        // complete image, never a torn one.
+        let tmp = {
+            let seq = EXPORT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let mut s = path.as_os_str().to_os_string();
+            s.push(format!(".{}.{}.tmp", std::process::id(), seq));
+            PathBuf::from(s)
+        };
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fsync_dir(parent)?;
+        }
         Ok(())
     }
 
