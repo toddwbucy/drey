@@ -106,6 +106,12 @@ pub(crate) mod fail {
 /// reads / `export`). A concrete backend held directly would be auto-`Send +
 /// Sync`; a trait object is not unless the trait says so.
 pub(crate) trait Persistence: Send + Sync {
+    /// Whether the backend can accept new work: `Err` once a prior durable
+    /// failure has poisoned it. `Graph` checks this **before** applying any
+    /// mutation to the in-memory store — the store mutates before the log
+    /// append, so refusing only at `append` would leave a phantom in-memory
+    /// change that was never logged (Err returned, store diverged anyway).
+    fn preflight(&self) -> Result<()>;
     /// Buffer one mutation; durable only at the next [`Persistence::commit`].
     fn append(&mut self, mutation: &Mutation) -> Result<()>;
     /// Flush buffered mutations to durable storage (fsync-backed).
@@ -150,6 +156,10 @@ impl WalPersistence {
 }
 
 impl Persistence for WalPersistence {
+    fn preflight(&self) -> Result<()> {
+        self.ensure_healthy()
+    }
+
     fn append(&mut self, mutation: &Mutation) -> Result<()> {
         self.ensure_healthy()?;
         let mut w = Writer::default();
@@ -186,8 +196,17 @@ impl Persistence for WalPersistence {
         write_frame(&mut frame_buf, &marker.buf);
 
         let durable = (|| -> std::io::Result<()> {
+            // The injected write failure is TORN: part of the frame reaches the
+            // file before the "device" errors, so the fault test's reopen also
+            // exercises truncation-to-last-good-prefix through a realistic tail.
+            // (The m2 torn-tail recovery tests — crash_during_commit,
+            // corrupt_tail, crc_byteflip, frames_without_commit_marker — cover
+            // the manufactured on-disk variants directly.)
             #[cfg(test)]
-            fail::hit(&fail::WAL_WRITE)?;
+            if fail::hit(&fail::WAL_WRITE).is_err() {
+                let _ = self.wal.write_all(&frame_buf[..frame_buf.len() / 2]);
+                return Err(std::io::Error::other("injected fault: torn WAL write"));
+            }
             self.wal.write_all(&frame_buf)?;
             #[cfg(test)]
             fail::hit(&fail::WAL_SYNC)?;
@@ -1145,8 +1164,16 @@ mod tests {
                 Err(Error::Storage(m)) => assert!(m.contains("poisoned"), "{m}"),
                 other => panic!("expected poisoned-storage error, got {other:?}"),
             }
-            // New mutations refuse too: nothing more can silently diverge.
+            // New mutations refuse BEFORE touching the store (the preflight
+            // path): an is_err() alone could hide a phantom in-memory node that
+            // was never logged, so assert the state is untouched too.
+            let before = g.counts();
             assert!(g.add_node(person(), no_props()).is_err());
+            assert_eq!(
+                g.counts(),
+                before,
+                "poisoned mutation must not mutate in-memory state"
+            );
         }
         // Reopen recovers cleanly to the acknowledged state: only `a` was ever
         // confirmed durable.
@@ -1203,8 +1230,15 @@ mod tests {
             );
             // Poisoned: further durable work refuses — a commit here would
             // append to a stale-epoch WAL and be silently discarded on the
-            // next open (the audit's fsync'd-but-lost scenario).
+            // next open (the audit's fsync'd-but-lost scenario). The refusal
+            // happens before the store mutates (preflight), so counts hold.
+            let before = g.counts();
             assert!(g.add_node(person(), no_props()).is_err());
+            assert_eq!(
+                g.counts(),
+                before,
+                "poisoned mutation must not mutate in-memory state"
+            );
             match g.commit() {
                 Err(Error::Storage(m)) => assert!(m.contains("poisoned"), "{m}"),
                 other => panic!("expected poisoned-storage error, got {other:?}"),
