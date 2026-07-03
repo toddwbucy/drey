@@ -23,6 +23,16 @@ pub struct Graph {
     pub(crate) persist: Option<Box<dyn crate::persist::Persistence>>,
 }
 
+// `Graph` must stay `Send + Sync` — a consumer may move it between threads or
+// share `&Graph` for concurrent reads / `export`. Boxing the persistence backend
+// behind a trait object would silently drop both unless the trait is `Send +
+// Sync`; this never-called fn fails to compile if that regresses.
+#[allow(dead_code)]
+fn _assert_graph_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<Graph>();
+}
+
 impl Graph {
     /// Create an in-memory graph with no persistence. Useful for tests and for
     /// consumers that want an ephemeral graph. File-backed graphs come from

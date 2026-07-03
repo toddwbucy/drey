@@ -67,7 +67,11 @@ const TAG_COMMIT: u8 = 2;
 /// recovery/construction is a per-backend factory (`Graph::open`/`create`), not
 /// a trait method, since recovery *builds* the graph rather than acting on an
 /// existing backend.
-pub(crate) trait Persistence {
+/// `Send + Sync` so a boxed `dyn Persistence` keeps `Graph` `Send + Sync` (a
+/// consumer may move a graph between threads or share `&Graph` for concurrent
+/// reads / `export`). A concrete backend held directly would be auto-`Send +
+/// Sync`; a trait object is not unless the trait says so.
+pub(crate) trait Persistence: Send + Sync {
     /// Buffer one mutation; durable only at the next [`Persistence::commit`].
     fn append(&mut self, mutation: &Mutation) -> Result<()>;
     /// Flush buffered mutations to durable storage (fsync-backed).
@@ -177,18 +181,20 @@ impl Persistence for WalPersistence {
             f.write_all(&bytes)?;
             f.sync_all()?;
         }
-        fs::rename(&tmp, dir.join(SNAPSHOT_FILE))?; // atomic replace
-        fsync_dir(&dir)?; // make the rename durable — the cutover point
+        fs::rename(&tmp, dir.join(SNAPSHOT_FILE))?; // atomic replace — the cutover point
 
-        // Past the cutover: the snapshot on disk is now the new epoch. If any of
-        // the WAL reset, its fsyncs, the handle swap, or the epoch bump fails, the
-        // on-disk WAL and the in-memory epoch/handle can disagree with the new
-        // snapshot — a later commit would then append to a stale-epoch or
-        // headerless WAL and be silently discarded/stranded on the next open. So
-        // any post-cutover failure poisons the persister: the graph must be
-        // reopened (which loads cleanly from the new snapshot) rather than
-        // continue writing.
-        let reset = (|| -> Result<()> {
+        // Past the cutover the new snapshot is visible, so the in-memory
+        // epoch/WAL must be advanced to match. ANY failure from here — the
+        // directory fsync that makes the rename durable, the WAL reset, its
+        // fsyncs, the handle swap, or the epoch bump — leaves on-disk and
+        // in-memory disagreeing; a later commit would then append to a
+        // stale-epoch or headerless WAL and be silently discarded/stranded on the
+        // next open. So every post-cutover step (including that first fsync_dir)
+        // is inside the poison-guarded block: on failure the graph must be
+        // reopened (it loads cleanly from the new snapshot) rather than keep
+        // writing.
+        let cutover = (|| -> Result<()> {
+            fsync_dir(&dir)?; // make the rename durable
             {
                 let mut wal = OpenOptions::new()
                     .write(true)
@@ -205,7 +211,7 @@ impl Persistence for WalPersistence {
             self.pending.clear();
             Ok(())
         })();
-        if let Err(e) = reset {
+        if let Err(e) = cutover {
             self.poisoned = true;
             return Err(e);
         }

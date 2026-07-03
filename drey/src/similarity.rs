@@ -294,4 +294,23 @@ mod tests {
         assert_eq!(top[0].0, NodeId(1)); // exact match ranks first
         assert_eq!(top[1].0, NodeId(2)); // near match second
     }
+
+    #[test]
+    fn exhaustive_scan_lower_is_better_euclidean_with_tie_break() {
+        // Euclidean is lower-is-better: the scan must sort ascending (nearest
+        // first), and equal distances tie-break by ascending node id.
+        let near = [0.1f32, 0.0]; // distance 0.1 from the origin query
+        let tie = [0.1f32, 0.0]; // same distance -> id tie-break
+        let far = [5.0f32, 0.0]; // distance 5.0
+        let cand = [
+            (NodeId(2), &tie[..]),
+            (NodeId(3), &far[..]),
+            (NodeId(1), &near[..]),
+        ];
+        let eval: &dyn SimilarityEvaluator = &ExhaustiveScan;
+        let top = eval.top_k(&[0.0, 0.0], SimilarityMetric::Euclidean, &cand, 3);
+        assert_eq!(top[0].0, NodeId(1)); // nearest, lower id wins the tie
+        assert_eq!(top[1].0, NodeId(2)); // equally near, higher id
+        assert_eq!(top[2].0, NodeId(3)); // farthest ranks last
+    }
 }
