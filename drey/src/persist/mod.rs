@@ -61,6 +61,40 @@ const WAL_HEADER_LEN: usize = 16;
 const TAG_MUTATION: u8 = 1;
 const TAG_COMMIT: u8 = 2;
 
+/// Test-only fault injection (issue #10): lets unit tests force the I/O
+/// failures (ENOSPC/EIO-shaped) that the commit/snapshot **poison paths** guard
+/// against, which no real filesystem produces deterministically. Compiled out
+/// of release builds entirely — no public surface, no feature flag, no runtime
+/// cost (SQLite-class weight). Failpoints are thread-local, so each test arms
+/// only its own thread and parallel tests cannot consume each other's faults.
+#[cfg(test)]
+pub(crate) mod fail {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        /// Fail the next WAL frame write in `commit`.
+        pub static WAL_WRITE: Cell<bool> = const { Cell::new(false) };
+        /// Fail the next WAL fsync in `commit`.
+        pub static WAL_SYNC: Cell<bool> = const { Cell::new(false) };
+        /// Fail the post-cutover directory fsync in `snapshot`.
+        pub static CUTOVER_DIR_FSYNC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm a failpoint: the next [`hit`] on this thread errors once.
+    pub fn arm(fp: &'static LocalKey<Cell<bool>>) {
+        fp.with(|c| c.set(true));
+    }
+
+    /// Consume the failpoint: error once if armed, then disarm.
+    pub fn hit(fp: &'static LocalKey<Cell<bool>>) -> std::io::Result<()> {
+        if fp.with(|c| c.replace(false)) {
+            return Err(std::io::Error::other("injected fault"));
+        }
+        Ok(())
+    }
+}
+
 /// The internal persistence seam (design commitment 6): the public API sits
 /// above this trait, so the durability backend is swappable without an API
 /// change. [`WalPersistence`] is the only implementation today (WAL + snapshot);
@@ -72,6 +106,12 @@ const TAG_COMMIT: u8 = 2;
 /// reads / `export`). A concrete backend held directly would be auto-`Send +
 /// Sync`; a trait object is not unless the trait says so.
 pub(crate) trait Persistence: Send + Sync {
+    /// Whether the backend can accept new work: `Err` once a prior durable
+    /// failure has poisoned it. `Graph` checks this **before** applying any
+    /// mutation to the in-memory store — the store mutates before the log
+    /// append, so refusing only at `append` would leave a phantom in-memory
+    /// change that was never logged (Err returned, store diverged anyway).
+    fn preflight(&self) -> Result<()>;
     /// Buffer one mutation; durable only at the next [`Persistence::commit`].
     fn append(&mut self, mutation: &Mutation) -> Result<()>;
     /// Flush buffered mutations to durable storage (fsync-backed).
@@ -116,6 +156,10 @@ impl WalPersistence {
 }
 
 impl Persistence for WalPersistence {
+    fn preflight(&self) -> Result<()> {
+        self.ensure_healthy()
+    }
+
     fn append(&mut self, mutation: &Mutation) -> Result<()> {
         self.ensure_healthy()?;
         let mut w = Writer::default();
@@ -151,11 +195,24 @@ impl Persistence for WalPersistence {
         marker.u8(TAG_COMMIT);
         write_frame(&mut frame_buf, &marker.buf);
 
-        if let Err(e) = self
-            .wal
-            .write_all(&frame_buf)
-            .and_then(|()| self.wal.sync_all())
-        {
+        let durable = (|| -> std::io::Result<()> {
+            // The injected write failure is TORN: part of the frame reaches the
+            // file before the "device" errors, so the fault test's reopen also
+            // exercises truncation-to-last-good-prefix through a realistic tail.
+            // (The m2 torn-tail recovery tests — crash_during_commit,
+            // corrupt_tail, crc_byteflip, frames_without_commit_marker — cover
+            // the manufactured on-disk variants directly.)
+            #[cfg(test)]
+            if fail::hit(&fail::WAL_WRITE).is_err() {
+                let _ = self.wal.write_all(&frame_buf[..frame_buf.len() / 2]);
+                return Err(std::io::Error::other("injected fault: torn WAL write"));
+            }
+            self.wal.write_all(&frame_buf)?;
+            #[cfg(test)]
+            fail::hit(&fail::WAL_SYNC)?;
+            self.wal.sync_all()
+        })();
+        if let Err(e) = durable {
             self.poisoned = true;
             return Err(e.into());
         }
@@ -197,6 +254,8 @@ impl Persistence for WalPersistence {
         // reopened (it loads cleanly from the new snapshot) rather than keep
         // writing.
         let cutover = (|| -> Result<()> {
+            #[cfg(test)]
+            fail::hit(&fail::CUTOVER_DIR_FSYNC)?;
             fsync_dir(&dir)?; // make the rename durable
             {
                 let mut wal = OpenOptions::new()
@@ -1062,4 +1121,133 @@ fn load_snapshot(store: &mut Store, bytes: &[u8]) -> Result<u64> {
     }
 
     Ok(epoch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("drey_fault_{}_{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn person() -> NodeType {
+        NodeType::new("person")
+    }
+
+    fn no_props() -> BTreeMap<String, Value> {
+        BTreeMap::new()
+    }
+
+    /// The critical audit finding's exact scenario, now exercised: a failed
+    /// commit write must surface an error, poison the persister (a retry
+    /// errors — never a false `Ok`), and leave the on-disk graph at the last
+    /// acknowledged state.
+    #[test]
+    fn injected_commit_write_failure_poisons_and_never_false_oks() {
+        let dir = tmp("commit_write");
+        let a;
+        {
+            let mut g = Graph::create(&dir, GraphConfig::default()).unwrap();
+            g.register_node_type(person(), None).unwrap();
+            a = g.add_node(person(), no_props()).unwrap();
+            g.commit().unwrap();
+            let _b = g.add_node(person(), no_props()).unwrap();
+            fail::arm(&fail::WAL_WRITE);
+            assert!(g.commit().is_err(), "injected write failure must surface");
+            // Poisoned: the retry must error, not report Ok with data lost —
+            // the exact false-Ok the audit's critical finding described.
+            match g.commit() {
+                Err(Error::Storage(m)) => assert!(m.contains("poisoned"), "{m}"),
+                other => panic!("expected poisoned-storage error, got {other:?}"),
+            }
+            // New mutations refuse BEFORE touching the store (the preflight
+            // path): an is_err() alone could hide a phantom in-memory node that
+            // was never logged, so assert the state is untouched too.
+            let before = g.counts();
+            assert!(g.add_node(person(), no_props()).is_err());
+            assert_eq!(
+                g.counts(),
+                before,
+                "poisoned mutation must not mutate in-memory state"
+            );
+        }
+        // Reopen recovers cleanly to the acknowledged state: only `a` was ever
+        // confirmed durable.
+        let g = Graph::open(&dir, GraphConfig::default()).unwrap();
+        assert_eq!(g.counts().0, 1);
+        assert!(g.node(a).unwrap().is_some());
+    }
+
+    /// Same contract when the write lands but the fsync fails. The batch may or
+    /// may not have reached disk (an unacknowledged commit is allowed to appear
+    /// after recovery — what is forbidden is a false `Ok`); the persister must
+    /// poison either way.
+    #[test]
+    fn injected_commit_fsync_failure_poisons_and_never_false_oks() {
+        let dir = tmp("commit_fsync");
+        let a;
+        {
+            let mut g = Graph::create(&dir, GraphConfig::default()).unwrap();
+            g.register_node_type(person(), None).unwrap();
+            a = g.add_node(person(), no_props()).unwrap();
+            g.commit().unwrap();
+            let _b = g.add_node(person(), no_props()).unwrap();
+            fail::arm(&fail::WAL_SYNC);
+            assert!(g.commit().is_err(), "injected fsync failure must surface");
+            match g.commit() {
+                Err(Error::Storage(m)) => assert!(m.contains("poisoned"), "{m}"),
+                other => panic!("expected poisoned-storage error, got {other:?}"),
+            }
+        }
+        let g = Graph::open(&dir, GraphConfig::default()).unwrap();
+        // `b`'s bytes were written before the failed fsync, so recovery may
+        // legitimately load 1 or 2 nodes; `a` (acknowledged) must be present.
+        let n = g.counts().0;
+        assert!(n == 1 || n == 2, "unexpected node count {n}");
+        assert!(g.node(a).unwrap().is_some());
+    }
+
+    /// A post-cutover snapshot failure (the new snapshot is already visible)
+    /// must poison rather than leave the persister writing behind a stale
+    /// epoch, and a reopen must load cleanly from the new snapshot.
+    #[test]
+    fn injected_post_cutover_failure_poisons_and_reopen_loads_snapshot() {
+        let dir = tmp("cutover_fsync");
+        let a;
+        {
+            let mut g = Graph::create(&dir, GraphConfig::default()).unwrap();
+            g.register_node_type(person(), None).unwrap();
+            a = g.add_node(person(), no_props()).unwrap();
+            g.commit().unwrap();
+            fail::arm(&fail::CUTOVER_DIR_FSYNC);
+            assert!(
+                g.snapshot().is_err(),
+                "injected post-cutover failure must surface"
+            );
+            // Poisoned: further durable work refuses — a commit here would
+            // append to a stale-epoch WAL and be silently discarded on the
+            // next open (the audit's fsync'd-but-lost scenario). The refusal
+            // happens before the store mutates (preflight), so counts hold.
+            let before = g.counts();
+            assert!(g.add_node(person(), no_props()).is_err());
+            assert_eq!(
+                g.counts(),
+                before,
+                "poisoned mutation must not mutate in-memory state"
+            );
+            match g.commit() {
+                Err(Error::Storage(m)) => assert!(m.contains("poisoned"), "{m}"),
+                other => panic!("expected poisoned-storage error, got {other:?}"),
+            }
+        }
+        // The rename already happened: reopen loads the new-epoch snapshot and
+        // skips the old-epoch WAL as stale. No acknowledged data is lost.
+        let g = Graph::open(&dir, GraphConfig::default()).unwrap();
+        assert_eq!(g.counts().0, 1);
+        assert!(g.node(a).unwrap().is_some());
+    }
 }

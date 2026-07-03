@@ -54,6 +54,14 @@ impl Graph {
         if self.config.read_only {
             return Err(Error::Storage("graph is opened read-only".into()));
         }
+        // Refuse before mutating: every mutation method changes the in-memory
+        // store *before* logging, so a backend that would reject the append
+        // (poisoned by a prior durable failure) must be surfaced here — after
+        // the store mutation, an append refusal would leave a phantom
+        // in-memory change that was never logged.
+        if let Some(p) = &self.persist {
+            p.preflight()?;
+        }
         Ok(())
     }
 
