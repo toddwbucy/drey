@@ -295,12 +295,13 @@ impl Store {
             }
             if let Some(scalar) = value.as_scalar() {
                 if let Some(tree) = self.prop_index.get_mut(&(type_id, key.clone())) {
-                    let key_now_empty = if let Some(bucket) = tree.get_mut(&ScalarKey(scalar.clone())) {
-                        bucket.retain(|n| *n != node);
-                        bucket.is_empty()
-                    } else {
-                        false
-                    };
+                    let key_now_empty =
+                        if let Some(bucket) = tree.get_mut(&ScalarKey(scalar.clone())) {
+                            bucket.retain(|n| *n != node);
+                            bucket.is_empty()
+                        } else {
+                            false
+                        };
                     // Prune emptied containers so the index does not accumulate
                     // tombstones keyed by dead values (unbounded growth + range
                     // scans over dead keys), matching remove_from_vec / adj_remove.

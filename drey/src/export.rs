@@ -91,7 +91,14 @@ impl GraphFeatureExport for Graph {
             map.to_node
                 .iter()
                 .filter_map(|n| self.store.nodes.get(&n.0))
-                .map(|rec| self.store.embedding_dim.get(&rec.node_type).copied().flatten().unwrap_or(0))
+                .map(|rec| {
+                    self.store
+                        .embedding_dim
+                        .get(&rec.node_type)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(0)
+                })
                 .max()
                 .unwrap_or(0)
         } else {

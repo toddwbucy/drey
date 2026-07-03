@@ -443,10 +443,18 @@ fn weight_update_rejects_malformed_bounds_instead_of_panicking() {
     let b = g.add_node(person(), props(&[])).unwrap();
     let e = g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
     // NaN bound and inverted bound both return an error, not a clamp panic.
-    assert!(g.update_edge_weight(e, WeightUpdate::set(0.5).with_bounds(f32::NAN, 1.0)).is_err());
-    assert!(g.update_edge_weight(e, WeightUpdate::add(0.1).with_bounds(2.0, 1.0)).is_err());
+    assert!(g
+        .update_edge_weight(e, WeightUpdate::set(0.5).with_bounds(f32::NAN, 1.0))
+        .is_err());
+    assert!(g
+        .update_edge_weight(e, WeightUpdate::add(0.1).with_bounds(2.0, 1.0))
+        .is_err());
     // A well-formed bound still works.
-    assert_eq!(g.update_edge_weight(e, WeightUpdate::set(5.0).with_bounds(0.0, 2.0)).unwrap(), 2.0);
+    assert_eq!(
+        g.update_edge_weight(e, WeightUpdate::set(5.0).with_bounds(0.0, 2.0))
+            .unwrap(),
+        2.0
+    );
 }
 
 #[test]
@@ -455,10 +463,17 @@ fn similarity_rejects_non_finite_embeddings_and_query() {
     let mut g = base_graph();
     let x = g.add_node(person(), props(&[])).unwrap();
     // A NaN embedding component is rejected at write time.
-    assert!(g.set_node_embedding(x, Embedding::new(vec![f32::NAN, 0.0, 0.0, 0.0])).is_err());
-    g.set_node_embedding(x, Embedding::new(vec![1.0, 0.0, 0.0, 0.0])).unwrap();
+    assert!(g
+        .set_node_embedding(x, Embedding::new(vec![f32::NAN, 0.0, 0.0, 0.0]))
+        .is_err());
+    g.set_node_embedding(x, Embedding::new(vec![1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
     // A non-finite query vector is rejected.
-    let q = SimilarityQuery::new(Embedding::new(vec![f32::INFINITY, 0.0, 0.0, 0.0]), SimilarityMetric::Cosine, 5);
+    let q = SimilarityQuery::new(
+        Embedding::new(vec![f32::INFINITY, 0.0, 0.0, 0.0]),
+        SimilarityMetric::Cosine,
+        5,
+    );
     assert!(g.similar_nodes(q).is_err());
 }
 
@@ -469,16 +484,26 @@ fn export_node_type_ids_align_and_features_are_rectangular() {
     let mut g = base_graph();
     g.register_node_type(t2.clone(), None).unwrap(); // no embedding
     let a = g.add_node(person(), props(&[])).unwrap();
-    g.set_node_embedding(a, Embedding::new(vec![1.0, 2.0, 3.0, 4.0])).unwrap();
+    g.set_node_embedding(a, Embedding::new(vec![1.0, 2.0, 3.0, 4.0]))
+        .unwrap();
     let b = g.add_node(t2.clone(), props(&[])).unwrap(); // no embedding
     let map = g.node_index_map();
     // node_type_ids aligned to the map, distinct per type.
     let tids = g.node_type_ids(&map).unwrap();
     assert_eq!(tids.len(), 2);
-    assert_ne!(tids[map.index_of(a).unwrap()], tids[map.index_of(b).unwrap()]);
+    assert_ne!(
+        tids[map.index_of(a).unwrap()],
+        tids[map.index_of(b).unwrap()]
+    );
     // Feature rows are rectangular even though b has no embedding (zero-padded).
     let feats = g
-        .node_features(&map, &FeatureSpec { include_embedding: true, numeric_properties: vec![] })
+        .node_features(
+            &map,
+            &FeatureSpec {
+                include_embedding: true,
+                numeric_properties: vec![],
+            },
+        )
         .unwrap();
     assert_eq!(feats[0].len(), feats[1].len());
     assert_eq!(feats[map.index_of(b).unwrap()], vec![0.0, 0.0, 0.0, 0.0]);

@@ -119,7 +119,11 @@ impl Persister {
         marker.u8(TAG_COMMIT);
         write_frame(&mut frame_buf, &marker.buf);
 
-        if let Err(e) = self.wal.write_all(&frame_buf).and_then(|()| self.wal.sync_all()) {
+        if let Err(e) = self
+            .wal
+            .write_all(&frame_buf)
+            .and_then(|()| self.wal.sync_all())
+        {
             self.poisoned = true;
             return Err(e.into());
         }
