@@ -615,3 +615,45 @@ fn non_finite_edge_weights_rejected_finite_denormal_round_trips() {
     let g = Graph::open(&dir, config()).unwrap();
     assert_eq!(g.edge(e_den).unwrap().unwrap().weight.to_bits(), 1);
 }
+
+#[test]
+fn recovery_mutation_frames_without_commit_marker_are_discarded() {
+    // The staged-discard path: a commit torn AFTER its mutation frame but BEFORE
+    // the commit marker. The frame is intact (CRC-valid) but unmarked, so its
+    // staged mutations must be discarded, not applied — distinct from the
+    // torn-frame and CRC-mismatch paths.
+    let dir = tmp("staged_discard");
+    let a;
+    let size_after_first;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        size_after_first = fs::metadata(dir.join("wal.log")).unwrap().len();
+        let _b = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    // Drop batch 2's trailing commit-marker frame: len(4) + crc(4) + a 1-byte
+    // TAG_COMMIT payload = 9 bytes. That leaves batch 2's AddNode frame intact
+    // but with no marker after it.
+    let size_after_second = fs::metadata(dir.join("wal.log")).unwrap().len();
+    assert!(
+        size_after_second > size_after_first + 9,
+        "batch 2 should be a mutation frame plus the 9-byte marker"
+    );
+    OpenOptions::new()
+        .write(true)
+        .open(dir.join("wal.log"))
+        .unwrap()
+        .set_len(size_after_second - 9)
+        .unwrap();
+
+    let g = Graph::open(&dir, config()).unwrap();
+    assert_eq!(
+        g.counts().0,
+        1,
+        "an unmarked (uncommitted) staged mutation must be discarded"
+    );
+    assert!(g.node(a).unwrap().is_some());
+}

@@ -80,15 +80,23 @@ impl<'a> Reader<'a> {
         Ok(n)
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.buf.len() {
-            return Err(Error::Codec(format!(
-                "unexpected end of buffer: wanted {n} bytes at offset {}, {} remain",
-                self.pos,
-                self.remaining()
-            )));
-        }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
+        // `checked_add`, not `self.pos + n`: a corrupt length prefix can drive `n`
+        // up to usize::MAX, and on a 32-bit target `pos + n` would wrap to a small
+        // value, pass the bound check, and panic on the slice. Overflow is just
+        // another out-of-bounds read → a typed Codec error (PRD §10.2.1).
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.buf.len())
+            .ok_or_else(|| {
+                Error::Codec(format!(
+                    "unexpected end of buffer: wanted {n} bytes at offset {}, {} remain",
+                    self.pos,
+                    self.remaining()
+                ))
+            })?;
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
         Ok(s)
     }
     pub fn u8(&mut self) -> Result<u8> {
@@ -324,6 +332,17 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn take_overflow_is_codec_error_not_panic() {
+        // A corrupt length prefix can request up to usize::MAX bytes. `pos + n`
+        // would wrap on a 32-bit target and pass the bound check; `checked_add`
+        // turns the overflow into a Codec error. Advancing `pos` to 1 makes
+        // `pos + usize::MAX` overflow even on 64-bit, exercising that branch.
+        let mut r = Reader::new(&[0u8; 4]);
+        r.u8().unwrap();
+        assert!(matches!(r.take(usize::MAX), Err(Error::Codec(_))));
+    }
 
     #[test]
     fn crc32_matches_ieee_known_answer() {

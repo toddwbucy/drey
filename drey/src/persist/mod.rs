@@ -364,9 +364,28 @@ impl Graph {
     pub fn export(&self, path: impl AsRef<Path>) -> Result<()> {
         // A portable image is not tied to a WAL; carry the current epoch so a
         // re-import into a file-backed graph starts consistently.
+        let path = path.as_ref();
         let epoch = self.persist.as_ref().map_or(0, |p| p.epoch);
         let bytes = save_snapshot(&self.store, epoch);
-        fs::write(path, bytes)?;
+        // Write to a sibling temp file, fsync, then atomically rename over the
+        // destination and fsync the parent. `export` is the §22 backup verb, so a
+        // torn/failed write must never destroy the previous image at `path` — the
+        // hazard of a bare `fs::write` (create+truncate in place). Mirrors
+        // `snapshot`'s cutover.
+        let tmp = {
+            let mut s = path.as_os_str().to_os_string();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fsync_dir(parent)?;
+        }
         Ok(())
     }
 

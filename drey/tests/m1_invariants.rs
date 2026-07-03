@@ -673,3 +673,23 @@ fn decay_rejecting_non_finite_result_leaves_batch_unapplied() {
     // Weight is untouched: the batch aborted before applying anything.
     assert_eq!(g.edge(e).unwrap().unwrap().weight, f32::MAX);
 }
+
+#[test]
+fn traverse_max_hops_zero_returns_no_paths() {
+    // A path needs at least one edge, so a 0-hop traversal returns nothing —
+    // not a spurious length-0 path to the start node.
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let b = g.add_node(person(), props(&[])).unwrap();
+    g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
+    let paths = g
+        .traverse(
+            a,
+            TraversalOptions {
+                max_hops: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(paths.is_empty());
+}
