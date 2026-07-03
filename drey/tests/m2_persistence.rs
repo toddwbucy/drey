@@ -616,6 +616,67 @@ fn non_finite_edge_weights_rejected_finite_denormal_round_trips() {
     assert_eq!(g.edge(e_den).unwrap().unwrap().weight.to_bits(), 1);
 }
 
+fn locking_config() -> GraphConfig {
+    GraphConfig {
+        file_lock: true,
+        ..config()
+    }
+}
+
+#[test]
+fn second_writer_conflicts_while_lock_held_and_succeeds_after_drop() {
+    // Single-writer enforcement via OS advisory locking: a second writable open
+    // fails LockConflict while the first holds the graph, and succeeds once the
+    // first handle drops (kernel releases the lock with the handle).
+    let dir = tmp("flock_conflict");
+    let g1 = Graph::create(&dir, locking_config()).unwrap();
+    match Graph::open(&dir, locking_config()) {
+        Err(Error::LockConflict(_)) => {}
+        Err(other) => panic!("expected LockConflict, got {other}"),
+        Ok(_) => panic!("second writer acquired the lock while the first was live"),
+    }
+    drop(g1);
+    assert!(Graph::open(&dir, locking_config()).is_ok());
+}
+
+#[test]
+fn leftover_lock_file_after_hard_crash_does_not_wedge() {
+    // A hard crash (SIGKILL/OOM/power loss) never runs Drop, so a LOCK file
+    // survives on disk — but the kernel released the advisory lock with the
+    // dead process's fd, so locking the leftover file just succeeds. This is
+    // the recovery-matrix row-1 guarantee the old PID-file scheme violated
+    // (audit #5 / issue #8: a stale LOCK wedged the graph until manual repair).
+    let dir = tmp("flock_stale");
+    {
+        let mut g = Graph::create(&dir, locking_config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    // Simulate the crash leftover: the LOCK file exists (with whatever stale
+    // content — the old scheme stamped "pid boot_id") but no process holds it.
+    fs::write(dir.join("LOCK"), b"999999 dead-boot-id").unwrap();
+    let g = Graph::open(&dir, locking_config()).unwrap();
+    assert_eq!(
+        g.counts().0,
+        1,
+        "graph must open normally past a stale LOCK"
+    );
+}
+
+#[test]
+fn read_only_open_ignores_the_writer_lock() {
+    // Read-only opens attach no writer and take no lock (PRD §9.1), so they
+    // must succeed even while a writer holds the graph.
+    let dir = tmp("flock_read_only");
+    let mut g1 = Graph::create(&dir, locking_config()).unwrap();
+    g1.register_node_type(person(), None).unwrap();
+    g1.add_node(person(), props(&[])).unwrap();
+    g1.commit().unwrap();
+    let ro = Graph::open(&dir, locking_config().read_only()).unwrap();
+    assert_eq!(ro.counts().0, 1);
+}
+
 #[test]
 fn recovery_mutation_frames_without_commit_marker_are_discarded() {
     // The staged-discard path: a commit torn AFTER its mutation frame but BEFORE
