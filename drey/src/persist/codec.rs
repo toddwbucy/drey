@@ -305,6 +305,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn crc32_matches_ieee_known_answer() {
+        // Pin the polynomial/reflection to the standard IEEE CRC-32. The suite is
+        // otherwise self-consistent under any CRC (write and read share the fn),
+        // so without this a reimplementation could change the value and silently
+        // invalidate every WAL frame written by an older build.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
     fn f32_round_trips_hostile_bit_patterns() {
         // Denormal, negative zero, and a long-decimal value must survive exact.
         let cases = [f32::from_bits(1), -0.0_f32, 0.1_f32, f32::MIN_POSITIVE];

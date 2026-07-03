@@ -35,7 +35,11 @@ use crate::types::{EdgeId, EdgeType, NodeId, NodeType, Value};
 /// On-disk format version, written into the snapshot header and the WAL header.
 /// Bumped on any incompatible format change; open fails with `VersionMismatch`
 /// on a mismatch of either file, before any frame is decoded (PRD §10.2.1, §20).
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// v2: the snapshot gained a trailing CRC over its payload so a bit-flip is
+/// detected on load rather than silently blended in (PRD §10.2.1). Pre-CRC
+/// (v1) snapshots therefore fail cleanly with `VersionMismatch`.
+pub const FORMAT_VERSION: u32 = 2;
 
 const MAGIC: &[u8; 4] = b"DREY";
 const SNAPSHOT_FILE: &str = "snapshot.bin";
@@ -923,6 +927,13 @@ fn save_snapshot(store: &Store, epoch: u64) -> Vec<u8> {
         codec::write_edge_record(&mut w, &store.edges[id]);
     }
 
+    // Trailing integrity checksum over everything after magic+version. Unlike the
+    // WAL (framed per-record), the snapshot is one blob; without this a bit-flip
+    // in a weight/property loads silently altered — the exact silent partial
+    // blend PRD §10.2.1 forbids. Excluding magic+version keeps a version bump
+    // surfacing as VersionMismatch rather than a checksum error.
+    let crc = crc32(&w.buf[8..]);
+    w.u32(crc);
     w.buf
 }
 
@@ -939,6 +950,18 @@ fn load_snapshot(store: &mut Store, bytes: &[u8]) -> Result<u64> {
             found: version,
             supported: FORMAT_VERSION,
         });
+    }
+    // Verify the trailing payload checksum before decoding the body, so a
+    // corrupt or truncated snapshot fails explicitly instead of loading altered
+    // data (PRD §10.2.1). The CRC covers bytes[8..len-4]; magic+version are
+    // excluded (handled above) and the trailing 4 bytes are the checksum itself.
+    if bytes.len() < 12 {
+        return Err(Error::Codec("snapshot too short for checksum".into()));
+    }
+    let split = bytes.len() - 4;
+    let stored = u32::from_le_bytes(bytes[split..].try_into().unwrap());
+    if crc32(&bytes[8..split]) != stored {
+        return Err(Error::Codec("snapshot checksum mismatch".into()));
     }
     let epoch = r.u64()?;
     store.next_node_id = r.u64()?;
