@@ -77,7 +77,11 @@ impl PropertyGraphRead for Graph {
         &'a self,
         filter: EdgeFilter,
     ) -> Result<Box<dyn Iterator<Item = EdgeId> + 'a>> {
-        let ids: Vec<EdgeId> = self.edges_matching(&filter).into_iter().map(EdgeId).collect();
+        let ids: Vec<EdgeId> = self
+            .edges_matching(&filter)
+            .into_iter()
+            .map(EdgeId)
+            .collect();
         Ok(Box::new(ids.into_iter()))
     }
 

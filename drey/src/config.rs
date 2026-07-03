@@ -20,7 +20,9 @@ impl Default for ScanCeiling {
         // agent-scale filtered candidate sets pass, small enough that an
         // accidental unfiltered scan is capped rather than turning into a full
         // vector-database sweep (PRD §13.1).
-        ScanCeiling { max_candidates: 100_000 }
+        ScanCeiling {
+            max_candidates: 100_000,
+        }
     }
 }
 

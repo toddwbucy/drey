@@ -24,10 +24,13 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
 
       - name: Build (workspace, all targets)
         run: cargo build --workspace --all-targets

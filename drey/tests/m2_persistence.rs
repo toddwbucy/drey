@@ -17,7 +17,10 @@ fn knows() -> EdgeType {
     EdgeType::new("knows")
 }
 fn props(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect()
 }
 
 /// A unique temp directory for one test, cleaned first.
@@ -51,8 +54,18 @@ fn round_trip_preserves_everything_byte_exact() {
     {
         let mut g = Graph::create(&dir, config()).unwrap();
         g.register_node_type(person(), Some(4)).unwrap();
-        a = g.add_node(person(), props(&[("age", Value::I64(30)), ("tag", Value::Bytes(vec![0, 255, 7]))])).unwrap();
-        b = g.add_node(person(), props(&[("age", Value::I64(40))])).unwrap();
+        a = g
+            .add_node(
+                person(),
+                props(&[
+                    ("age", Value::I64(30)),
+                    ("tag", Value::Bytes(vec![0, 255, 7])),
+                ]),
+            )
+            .unwrap();
+        b = g
+            .add_node(person(), props(&[("age", Value::I64(40))]))
+            .unwrap();
         // Hostile f32 bit patterns: denormal and negative zero.
         let emb = Embedding::new(vec![f32::from_bits(1), -0.0, 0.1, f32::MIN_POSITIVE]);
         g.set_node_embedding(a, emb).unwrap();
@@ -65,7 +78,10 @@ fn round_trip_preserves_everything_byte_exact() {
     // Durable ids (PRD §7.4).
     let na = g.node(a).unwrap().unwrap();
     assert_eq!(na.properties.get("age"), Some(&Value::I64(30)));
-    assert_eq!(na.properties.get("tag"), Some(&Value::Bytes(vec![0, 255, 7])));
+    assert_eq!(
+        na.properties.get("tag"),
+        Some(&Value::Bytes(vec![0, 255, 7]))
+    );
     // Byte-exact embedding.
     let emb = na.embedding.unwrap();
     assert_eq!(emb.0[0].to_bits(), f32::from_bits(1).to_bits());
@@ -117,7 +133,10 @@ fn recovery_crash_during_commit_loads_prior() {
         g.commit().unwrap();
     }
     // Simulate a torn second commit: truncate into the middle of batch 2.
-    let f = OpenOptions::new().write(true).open(dir.join("wal.log")).unwrap();
+    let f = OpenOptions::new()
+        .write(true)
+        .open(dir.join("wal.log"))
+        .unwrap();
     f.set_len(size_after_first + 5).unwrap();
     drop(f);
 
@@ -142,7 +161,10 @@ fn recovery_corrupt_tail_loads_valid_prefix() {
     // Append garbage after the last good commit.
     {
         use std::io::Write;
-        let mut f = OpenOptions::new().append(true).open(dir.join("wal.log")).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(dir.join("wal.log"))
+            .unwrap();
         f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]).unwrap();
     }
     let g = Graph::open(&dir, config()).unwrap();
@@ -189,7 +211,8 @@ fn snapshot_compacts_wal_and_preserves_state() {
         // (no committed frames).
         assert_eq!(fs::metadata(dir.join("wal.log")).unwrap().len(), 16);
         // Further mutation after snapshot still persists.
-        g.remove_node(a, RemoveNodeMode::RejectIfEdgesExist).unwrap();
+        g.remove_node(a, RemoveNodeMode::RejectIfEdgesExist)
+            .unwrap();
         g.commit().unwrap();
     }
     let g = Graph::open(&dir, config()).unwrap();
@@ -238,7 +261,10 @@ fn recovery_snapshot_crash_before_wal_truncation_skips_stale_wal() {
         g.commit().unwrap();
     }
     let g = Graph::open(&dir, config()).unwrap();
-    assert!(g.node(c).unwrap().is_some(), "post-recovery commit was lost");
+    assert!(
+        g.node(c).unwrap().is_some(),
+        "post-recovery commit was lost"
+    );
     assert_eq!(g.edge(e).unwrap().unwrap().weight, 0.5);
 }
 
@@ -254,7 +280,8 @@ fn export_import_restores_exact_id_space() {
         a = g.add_node(person(), props(&[])).unwrap();
         // Force a gap in the id space by removing an intermediate node.
         let gap = g.add_node(person(), props(&[])).unwrap();
-        g.remove_node(gap, RemoveNodeMode::RejectIfEdgesExist).unwrap();
+        g.remove_node(gap, RemoveNodeMode::RejectIfEdgesExist)
+            .unwrap();
         b = g.add_node(person(), props(&[])).unwrap();
         e = g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
         g.commit().unwrap();

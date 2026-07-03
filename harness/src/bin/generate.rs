@@ -11,7 +11,10 @@ use harness::params::{Fanout, Parameters, SizeClass};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 5 {
-        eprintln!("usage: {} <small|representative|stress> <low|medium|high> <seed> <out_dir>", args[0]);
+        eprintln!(
+            "usage: {} <small|representative|stress> <low|medium|high> <seed> <out_dir>",
+            args[0]
+        );
         exit(2);
     }
     let size = match args[1].as_str() {

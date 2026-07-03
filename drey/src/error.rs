@@ -54,7 +54,10 @@ impl fmt::Display for Error {
             Error::InvalidEdgeType(m) => write!(f, "invalid edge type: {m}"),
             Error::InvalidPropertyValue(m) => write!(f, "invalid property value: {m}"),
             Error::DimensionMismatch { expected, actual } => {
-                write!(f, "embedding dimension mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "embedding dimension mismatch: expected {expected}, got {actual}"
+                )
             }
             Error::DanglingEdge(id) => {
                 write!(f, "removing node {id:?} would orphan incident edges")
@@ -62,7 +65,10 @@ impl fmt::Display for Error {
             Error::IndexCorruption(m) => write!(f, "index corruption: {m}"),
             Error::UnsupportedQuery(m) => write!(f, "unsupported query: {m}"),
             Error::VersionMismatch { found, supported } => {
-                write!(f, "format version mismatch: found {found}, this build supports {supported}")
+                write!(
+                    f,
+                    "format version mismatch: found {found}, this build supports {supported}"
+                )
             }
             Error::LockConflict(m) => write!(f, "lock conflict: {m}"),
         }

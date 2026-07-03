@@ -141,29 +141,29 @@ impl Graph {
         let mut out: Vec<(u64, u64)> = Vec::new();
         // O(degree): look up the node's own adjacency, then only the requested
         // edge types — never a scan of the whole index.
-        let mut push_from =
-            |adj: &HashMap<u64, std::collections::BTreeMap<u32, Vec<u64>>>, take_to: bool| {
-                let Some(by_type) = adj.get(&node) else {
-                    return;
-                };
-                for (etype, edges) in by_type {
-                    if let Some(types) = type_ids {
-                        if !types.contains(etype) {
+        let mut push_from = |adj: &HashMap<u64, std::collections::BTreeMap<u32, Vec<u64>>>,
+                             take_to: bool| {
+            let Some(by_type) = adj.get(&node) else {
+                return;
+            };
+            for (etype, edges) in by_type {
+                if let Some(types) = type_ids {
+                    if !types.contains(etype) {
+                        continue;
+                    }
+                }
+                for e in edges {
+                    let rec = &self.store.edges[e];
+                    if let Some(min) = min_weight {
+                        if rec.weight < min {
                             continue;
                         }
                     }
-                    for e in edges {
-                        let rec = &self.store.edges[e];
-                        if let Some(min) = min_weight {
-                            if rec.weight < min {
-                                continue;
-                            }
-                        }
-                        let other = if take_to { rec.to } else { rec.from };
-                        out.push((*e, other));
-                    }
+                    let other = if take_to { rec.to } else { rec.from };
+                    out.push((*e, other));
                 }
-            };
+            }
+        };
         match direction {
             Direction::Outbound => push_from(&self.store.out_adj, true),
             Direction::Inbound => push_from(&self.store.in_adj, false),
@@ -207,7 +207,13 @@ impl Graph {
                 Neighbor {
                     node: NodeId(other),
                     via: EdgeId(e),
-                    edge_type: EdgeType(self.store.edge_types.label(rec.edge_type).unwrap().to_string()),
+                    edge_type: EdgeType(
+                        self.store
+                            .edge_types
+                            .label(rec.edge_type)
+                            .unwrap()
+                            .to_string(),
+                    ),
                     weight: rec.weight,
                 }
             })
@@ -347,8 +353,10 @@ impl Graph {
     ) -> Option<Path> {
         let mut dist: HashMap<u64, f32> = HashMap::from([(from, 0.0)]);
         let mut prev: HashMap<u64, (u64, u64)> = HashMap::new();
-        let mut heap: BinaryHeap<DijkstraState> =
-            BinaryHeap::from([DijkstraState { cost: 0.0, node: from }]);
+        let mut heap: BinaryHeap<DijkstraState> = BinaryHeap::from([DijkstraState {
+            cost: 0.0,
+            node: from,
+        }]);
         let mut steps = 0usize;
         while let Some(DijkstraState { cost, node }) = heap.pop() {
             if node == to {
@@ -361,13 +369,17 @@ impl Graph {
             if opts.max_steps.is_some_and(|max| steps > max) {
                 return None; // exploration budget exhausted (M3 F1)
             }
-            for (edge, other) in self.steps(node, opts.direction.into(), type_ids, opts.min_weight) {
+            for (edge, other) in self.steps(node, opts.direction.into(), type_ids, opts.min_weight)
+            {
                 let w = self.store.edges[&edge].weight.max(0.0);
                 let next = cost + w;
                 if next < *dist.get(&other).unwrap_or(&f32::INFINITY) {
                     dist.insert(other, next);
                     prev.insert(other, (node, edge));
-                    heap.push(DijkstraState { cost: next, node: other });
+                    heap.push(DijkstraState {
+                        cost: next,
+                        node: other,
+                    });
                 }
             }
         }
@@ -394,7 +406,10 @@ impl Graph {
         edges.reverse();
         let cost = match cost_mode {
             CostMode::UnweightedHops => edges.len() as f32,
-            CostMode::WeightedCost => edges.iter().map(|e| self.store.edges[e].weight.max(0.0)).sum(),
+            CostMode::WeightedCost => edges
+                .iter()
+                .map(|e| self.store.edges[e].weight.max(0.0))
+                .sum(),
         };
         Path {
             nodes: nodes.into_iter().map(NodeId).collect(),

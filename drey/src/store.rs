@@ -17,9 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::interner::Interner;
-use crate::types::{
-    Edge, EdgeId, EdgeType, Node, NodeId, NodeType, Properties, ScalarKey, Value,
-};
+use crate::types::{Edge, EdgeId, EdgeType, Node, NodeId, NodeType, Properties, ScalarKey, Value};
 
 /// Internal node record. `node_type` is interned to a `u32`.
 #[derive(Clone, Debug)]
@@ -105,7 +103,9 @@ impl Store {
         self.node_types
             .get(node_type.as_str())
             .filter(|id| self.embedding_dim.contains_key(id))
-            .ok_or_else(|| Error::InvalidNodeType(format!("node type {:?} not registered", node_type.as_str())))
+            .ok_or_else(|| {
+                Error::InvalidNodeType(format!("node type {:?} not registered", node_type.as_str()))
+            })
     }
 
     pub(crate) fn add_node(
@@ -116,7 +116,9 @@ impl Store {
         let type_id = self.require_registered(node_type)?;
         for (k, v) in &properties {
             if !v.is_valid() {
-                return Err(Error::InvalidPropertyValue(format!("property {k:?} is not a valid v0.1 value")));
+                return Err(Error::InvalidPropertyValue(format!(
+                    "property {k:?} is not a valid v0.1 value"
+                )));
             }
         }
         let id = self.next_node_id;
@@ -137,11 +139,7 @@ impl Store {
 
     pub(crate) fn set_node_embedding(&mut self, node: NodeId, embedding: Vec<f32>) -> Result<()> {
         let rec = self.nodes.get(&node.0).ok_or(Error::NodeNotFound(node))?;
-        let declared = self
-            .embedding_dim
-            .get(&rec.node_type)
-            .copied()
-            .flatten();
+        let declared = self.embedding_dim.get(&rec.node_type).copied().flatten();
         match declared {
             None => Err(Error::InvalidNodeType(
                 "node type was not registered with an embedding dimension".into(),
@@ -192,13 +190,19 @@ impl Store {
     }
 
     pub(crate) fn set_edge_weight(&mut self, edge: EdgeId, weight: f32) -> Result<f32> {
-        let rec = self.edges.get_mut(&edge.0).ok_or(Error::EdgeNotFound(edge))?;
+        let rec = self
+            .edges
+            .get_mut(&edge.0)
+            .ok_or(Error::EdgeNotFound(edge))?;
         rec.weight = weight;
         Ok(weight)
     }
 
     pub(crate) fn remove_edge(&mut self, edge: EdgeId) -> Result<()> {
-        let rec = self.edges.remove(&edge.0).ok_or(Error::EdgeNotFound(edge))?;
+        let rec = self
+            .edges
+            .remove(&edge.0)
+            .ok_or(Error::EdgeNotFound(edge))?;
         adj_remove(&mut self.out_adj, rec.from, rec.edge_type, edge.0);
         adj_remove(&mut self.in_adj, rec.to, rec.edge_type, edge.0);
         remove_from_vec(&mut self.edges_by_type, rec.edge_type, edge.0);
@@ -293,12 +297,7 @@ impl Store {
 
     /// Re-index a single node's properties after a property patch: the caller
     /// passes the old and new property maps so the index moves exactly.
-    pub(crate) fn reindex_node(
-        &mut self,
-        node: u64,
-        old: &Properties,
-        new: &Properties,
-    ) {
+    pub(crate) fn reindex_node(&mut self, node: u64, old: &Properties, new: &Properties) {
         let type_id = self.nodes[&node].node_type;
         let node_type = NodeType(self.node_types.label(type_id).unwrap().to_string());
         self.unindex_node_properties(type_id, &node_type, node, old);
@@ -327,7 +326,10 @@ impl Store {
     pub(crate) fn insert_edge_raw(&mut self, id: u64, rec: EdgeRecord) {
         adj_insert(&mut self.out_adj, rec.from, rec.edge_type, id);
         adj_insert(&mut self.in_adj, rec.to, rec.edge_type, id);
-        self.edges_by_type.entry(rec.edge_type).or_default().push(id);
+        self.edges_by_type
+            .entry(rec.edge_type)
+            .or_default()
+            .push(id);
         self.edges.insert(id, rec);
     }
 
@@ -395,7 +397,11 @@ fn remove_from_vec<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Vec<u64>>, key:
 
 /// Insert an edge id into a nested `node -> edge_type -> [edge_id]` adjacency.
 fn adj_insert(adj: &mut HashMap<u64, BTreeMap<u32, Vec<u64>>>, node: u64, etype: u32, edge: u64) {
-    adj.entry(node).or_default().entry(etype).or_default().push(edge);
+    adj.entry(node)
+        .or_default()
+        .entry(etype)
+        .or_default()
+        .push(edge);
 }
 
 /// Remove an edge id from a nested adjacency, pruning empty levels.

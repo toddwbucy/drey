@@ -17,7 +17,10 @@ pub struct Budget {
 /// Provisional budget for a measurement bucket (spec §4.4). Buckets not in the
 /// table have no budget and never pass/fail.
 pub fn budget_for(bucket: &str) -> Budget {
-    let p95 = |v: f64| Budget { p95_us: Some(v), throughput_per_s: None };
+    let p95 = |v: f64| Budget {
+        p95_us: Some(v),
+        throughput_per_s: None,
+    };
     match bucket {
         "neighbors" => p95(100.0),
         "traverse:max_hops=2" => p95(1_000.0),
@@ -26,11 +29,17 @@ pub fn budget_for(bucket: &str) -> Budget {
         "property_eq" | "property_range" => p95(1_000.0),
         "similar_nodes" => p95(10_000.0),
         // Dual budget: ≤10µs p95 AND ≥100k updates/s sustained.
-        "update_edge_weight" => Budget { p95_us: Some(10.0), throughput_per_s: Some(100_000.0) },
+        "update_edge_weight" => Budget {
+            p95_us: Some(10.0),
+            throughput_per_s: Some(100_000.0),
+        },
         "decay_edges:batch=100000" => p95(100_000.0),
         "decay_edges:batch=10000" => p95(10_000.0),
         "decay_edges:batch=1000" => p95(1_000.0),
-        _ => Budget { p95_us: None, throughput_per_s: None },
+        _ => Budget {
+            p95_us: None,
+            throughput_per_s: None,
+        },
     }
 }
 
@@ -88,7 +97,9 @@ pub struct RunOutput {
 /// Best-effort host fingerprint (spec §5.2): results are only comparable within
 /// one fingerprint.
 pub fn host_fingerprint() -> HostFingerprint {
-    let cores = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(0);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(0);
     let cpu = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|s| {
@@ -108,5 +119,10 @@ pub fn host_fingerprint() -> HostFingerprint {
                 .map(|kb| (kb / 1_048_576) as u32)
         })
         .unwrap_or(0);
-    HostFingerprint { cpu, cores, ram_gb, os: std::env::consts::OS.to_string() }
+    HostFingerprint {
+        cpu,
+        cores,
+        ram_gb,
+        os: std::env::consts::OS.to_string(),
+    }
 }

@@ -36,14 +36,48 @@ pub enum Dir {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum WorkloadOp {
-    Neighbors { start: u64, dir: Dir, edge_type: Option<String>, min_weight: Option<f32> },
-    Traverse { start: u64, max_hops: usize },
-    ShortestPath { from: u64, to: u64, weighted: bool, max_steps: Option<usize> },
-    PropertyEq { node_type: String, key: String, ivalue: i64 },
-    PropertyRange { node_type: String, key: String, min: i64, max: i64 },
-    Similar { seed_node: u64, k: usize, node_type: String },
-    UpdateEdgeWeight { edge: u64, factor: f32, bounded: bool },
-    DecayEdges { edge_type: Option<String>, factor: f32, batch: usize },
+    Neighbors {
+        start: u64,
+        dir: Dir,
+        edge_type: Option<String>,
+        min_weight: Option<f32>,
+    },
+    Traverse {
+        start: u64,
+        max_hops: usize,
+    },
+    ShortestPath {
+        from: u64,
+        to: u64,
+        weighted: bool,
+        max_steps: Option<usize>,
+    },
+    PropertyEq {
+        node_type: String,
+        key: String,
+        ivalue: i64,
+    },
+    PropertyRange {
+        node_type: String,
+        key: String,
+        min: i64,
+        max: i64,
+    },
+    Similar {
+        seed_node: u64,
+        k: usize,
+        node_type: String,
+    },
+    UpdateEdgeWeight {
+        edge: u64,
+        factor: f32,
+        bounded: bool,
+    },
+    DecayEdges {
+        edge_type: Option<String>,
+        factor: f32,
+        batch: usize,
+    },
     Commit,
 }
 
@@ -54,7 +88,10 @@ impl WorkloadOp {
             WorkloadOp::Neighbors { .. } => "neighbors".into(),
             WorkloadOp::Traverse { max_hops, .. } => format!("traverse:max_hops={max_hops}"),
             WorkloadOp::ShortestPath { weighted, .. } => {
-                format!("shortest_path:{}", if *weighted { "weighted" } else { "hops" })
+                format!(
+                    "shortest_path:{}",
+                    if *weighted { "weighted" } else { "hops" }
+                )
             }
             WorkloadOp::PropertyEq { .. } => "property_eq".into(),
             WorkloadOp::PropertyRange { .. } => "property_range".into(),
@@ -140,9 +177,9 @@ impl FixtureIndex {
             return 0;
         }
         let idx = match stratum {
-            0 => n / 10,          // low-degree
-            1 => n / 2,           // median
-            _ => n - 1,           // hub
+            0 => n / 10, // low-degree
+            1 => n / 2,  // median
+            _ => n - 1,  // hub
         };
         self.by_out_degree[idx.min(n - 1)]
     }
@@ -173,8 +210,18 @@ pub fn measurement_plan(fx: &Fixture, per_bucket: usize) -> Vec<WorkloadOp> {
         // shortest path, both modes, random pairs
         let from = *idx.node_ids.choose(&mut rng).unwrap();
         let to = *idx.node_ids.choose(&mut rng).unwrap();
-        plan.push(WorkloadOp::ShortestPath { from, to, weighted: false, max_steps: Some(SHORTEST_PATH_MAX_STEPS) });
-        plan.push(WorkloadOp::ShortestPath { from, to, weighted: true, max_steps: Some(SHORTEST_PATH_MAX_STEPS) });
+        plan.push(WorkloadOp::ShortestPath {
+            from,
+            to,
+            weighted: false,
+            max_steps: Some(SHORTEST_PATH_MAX_STEPS),
+        });
+        plan.push(WorkloadOp::ShortestPath {
+            from,
+            to,
+            weighted: true,
+            max_steps: Some(SHORTEST_PATH_MAX_STEPS),
+        });
         // property eq / range across the selectivity bands
         plan.push(WorkloadOp::PropertyEq {
             node_type: "nt_00".into(),
@@ -212,7 +259,11 @@ pub fn measurement_plan(fx: &Fixture, per_bucket: usize) -> Vec<WorkloadOp> {
     for &batch in &[1_000usize, 10_000, 100_000] {
         for _ in 0..per_bucket.min(50) {
             let edge_type = idx.edge_types.choose(&mut rng).cloned();
-            plan.push(WorkloadOp::DecayEdges { edge_type, factor: 0.9, batch });
+            plan.push(WorkloadOp::DecayEdges {
+                edge_type,
+                factor: 0.9,
+                batch,
+            });
         }
     }
 
@@ -262,7 +313,12 @@ fn mix_salt(mix: Mix) -> u64 {
 fn read_op(idx: &FixtureIndex, rng: &mut DetRng, i: usize) -> WorkloadOp {
     let start = idx.stratified_start(i % 3);
     match rng.gen_range(0..4) {
-        0 => WorkloadOp::Neighbors { start, dir: Dir::Outbound, edge_type: None, min_weight: None },
+        0 => WorkloadOp::Neighbors {
+            start,
+            dir: Dir::Outbound,
+            edge_type: None,
+            min_weight: None,
+        },
         1 => WorkloadOp::Traverse { start, max_hops: 2 },
         2 => WorkloadOp::PropertyEq {
             node_type: "nt_00".into(),
@@ -272,20 +328,33 @@ fn read_op(idx: &FixtureIndex, rng: &mut DetRng, i: usize) -> WorkloadOp {
         _ => {
             let from = *idx.node_ids.choose(rng).unwrap();
             let to = *idx.node_ids.choose(rng).unwrap();
-            WorkloadOp::ShortestPath { from, to, weighted: false, max_steps: Some(SHORTEST_PATH_MAX_STEPS) }
+            WorkloadOp::ShortestPath {
+                from,
+                to,
+                weighted: false,
+                max_steps: Some(SHORTEST_PATH_MAX_STEPS),
+            }
         }
     }
 }
 
 fn similarity_op(fx: &Fixture, rng: &mut DetRng) -> WorkloadOp {
     let seed_node = fx.embeddings.choose(rng).map(|(id, _)| *id).unwrap_or(0);
-    WorkloadOp::Similar { seed_node, k: 10, node_type: "nt_00".into() }
+    WorkloadOp::Similar {
+        seed_node,
+        k: 10,
+        node_type: "nt_00".into(),
+    }
 }
 
 fn mutation_op(idx: &FixtureIndex, rng: &mut DetRng) -> WorkloadOp {
     if rng.gen_bool(0.9) {
         let edge = idx.edge_ids.choose(rng).copied().unwrap_or(0);
-        WorkloadOp::UpdateEdgeWeight { edge, factor: 0.99, bounded: rng.gen_bool(0.5) }
+        WorkloadOp::UpdateEdgeWeight {
+            edge,
+            factor: 0.99,
+            bounded: rng.gen_bool(0.5),
+        }
     } else {
         WorkloadOp::DecayEdges {
             edge_type: idx.edge_types.choose(rng).cloned(),
@@ -305,8 +374,7 @@ mod tests {
     fn measurement_plan_covers_every_budget_bucket() {
         let fx = generate(Parameters::new(SizeClass::Small, Fanout::Medium, 1));
         let plan = measurement_plan(&fx, 100);
-        let buckets: std::collections::BTreeSet<String> =
-            plan.iter().map(|o| o.bucket()).collect();
+        let buckets: std::collections::BTreeSet<String> = plan.iter().map(|o| o.bucket()).collect();
         for expected in [
             "neighbors",
             "traverse:max_hops=2",

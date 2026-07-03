@@ -184,7 +184,11 @@ impl Graph {
 
         // 2. Replay the committed WAL prefix, unless the WAL is stale (its epoch
         //    predates the snapshot, i.e. a crash left it un-truncated).
-        let mut replay = WalReplay { epoch: snap_epoch, valid_len: WAL_HEADER_LEN, stale: true };
+        let mut replay = WalReplay {
+            epoch: snap_epoch,
+            valid_len: WAL_HEADER_LEN,
+            stale: true,
+        };
         if dir.join(WAL_FILE).exists() {
             let bytes = fs::read(dir.join(WAL_FILE))?;
             replay = replay_wal(&mut graph, &bytes, snap_epoch)?;
@@ -334,20 +338,31 @@ struct WalReplay {
 fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalReplay> {
     // A WAL shorter than its header carries no valid content.
     if bytes.len() < WAL_HEADER_LEN {
-        return Ok(WalReplay { epoch: snap_epoch, valid_len: WAL_HEADER_LEN, stale: true });
+        return Ok(WalReplay {
+            epoch: snap_epoch,
+            valid_len: WAL_HEADER_LEN,
+            stale: true,
+        });
     }
     if &bytes[0..4] != MAGIC {
         return Err(Error::Codec("bad WAL magic".into()));
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     if version != FORMAT_VERSION {
-        return Err(Error::VersionMismatch { found: version, supported: FORMAT_VERSION });
+        return Err(Error::VersionMismatch {
+            found: version,
+            supported: FORMAT_VERSION,
+        });
     }
     let wal_epoch = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
     if wal_epoch < snap_epoch {
         // Stale WAL left by a crash mid-snapshot: its frames are already in the
         // snapshot. Skip to avoid double-applying (e.g. non-idempotent decay).
-        return Ok(WalReplay { epoch: snap_epoch, valid_len: WAL_HEADER_LEN, stale: true });
+        return Ok(WalReplay {
+            epoch: snap_epoch,
+            valid_len: WAL_HEADER_LEN,
+            stale: true,
+        });
     }
 
     // Decode frames after the header, buffering records between commit markers.
@@ -396,7 +411,11 @@ fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalRep
     }
     graph.store.next_node_id = graph.store.next_node_id.max(max_node);
     graph.store.next_edge_id = graph.store.next_edge_id.max(max_edge);
-    Ok(WalReplay { epoch: wal_epoch, valid_len: last_commit_end, stale: false })
+    Ok(WalReplay {
+        epoch: wal_epoch,
+        valid_len: last_commit_end,
+        stale: false,
+    })
 }
 
 /// Apply a committed mutation during replay, using explicit ids (no allocation)
@@ -409,14 +428,25 @@ fn apply_replay(
 ) -> Result<()> {
     let store = &mut graph.store;
     match m {
-        Mutation::RegisterNodeType { node_type, embedding_dim } => {
+        Mutation::RegisterNodeType {
+            node_type,
+            embedding_dim,
+        } => {
             store.register_node_type(&node_type, embedding_dim)?;
         }
-        Mutation::AddNode { id, node_type, properties } => {
+        Mutation::AddNode {
+            id,
+            node_type,
+            properties,
+        } => {
             let type_id = store.node_types.intern(node_type.as_str());
             store.insert_node_raw(
                 id.0,
-                NodeRecord { node_type: type_id, properties, embedding: None },
+                NodeRecord {
+                    node_type: type_id,
+                    properties,
+                    embedding: None,
+                },
             );
             *max_node = (*max_node).max(id.0 + 1);
         }
@@ -436,11 +466,24 @@ fn apply_replay(
             let remove_incident = mode == crate::mutation::RemoveNodeMode::RemoveIncidentEdges;
             store.remove_node(node, remove_incident)?;
         }
-        Mutation::AddEdge { id, from, to, edge_type, weight, properties } => {
+        Mutation::AddEdge {
+            id,
+            from,
+            to,
+            edge_type,
+            weight,
+            properties,
+        } => {
             let type_id = store.edge_types.intern(edge_type.as_str());
             store.insert_edge_raw(
                 id.0,
-                EdgeRecord { from: from.0, to: to.0, edge_type: type_id, weight, properties },
+                EdgeRecord {
+                    from: from.0,
+                    to: to.0,
+                    edge_type: type_id,
+                    weight,
+                    properties,
+                },
             );
             *max_edge = (*max_edge).max(id.0 + 1);
         }
@@ -499,7 +542,10 @@ fn read_patch(r: &mut Reader) -> Result<std::collections::BTreeMap<String, Optio
 
 fn write_mutation(w: &mut Writer, m: &Mutation) {
     match m {
-        Mutation::RegisterNodeType { node_type, embedding_dim } => {
+        Mutation::RegisterNodeType {
+            node_type,
+            embedding_dim,
+        } => {
             w.u8(0);
             w.str(node_type.as_str());
             match embedding_dim {
@@ -510,7 +556,11 @@ fn write_mutation(w: &mut Writer, m: &Mutation) {
                 }
             }
         }
-        Mutation::AddNode { id, node_type, properties } => {
+        Mutation::AddNode {
+            id,
+            node_type,
+            properties,
+        } => {
             w.u8(1);
             w.u64(id.0);
             w.str(node_type.as_str());
@@ -537,7 +587,14 @@ fn write_mutation(w: &mut Writer, m: &Mutation) {
                 crate::mutation::RemoveNodeMode::RemoveIncidentEdges => 1,
             });
         }
-        Mutation::AddEdge { id, from, to, edge_type, weight, properties } => {
+        Mutation::AddEdge {
+            id,
+            from,
+            to,
+            edge_type,
+            weight,
+            properties,
+        } => {
             w.u8(5);
             w.u64(id.0);
             w.u64(from.0);
@@ -587,7 +644,10 @@ fn read_mutation(r: &mut Reader) -> Result<Mutation> {
                 1 => Some(r.u64()? as usize),
                 t => return Err(Error::Codec(format!("bad dim tag {t}"))),
             };
-            Mutation::RegisterNodeType { node_type, embedding_dim }
+            Mutation::RegisterNodeType {
+                node_type,
+                embedding_dim,
+            }
         }
         1 => Mutation::AddNode {
             id: NodeId(r.u64()?),
@@ -602,7 +662,10 @@ fn read_mutation(r: &mut Reader) -> Result<Mutation> {
             for _ in 0..n {
                 emb.push(r.f32()?);
             }
-            Mutation::SetNodeEmbedding { node, embedding: emb }
+            Mutation::SetNodeEmbedding {
+                node,
+                embedding: emb,
+            }
         }
         3 => Mutation::UpdateNodeProperties {
             node: NodeId(r.u64()?),
@@ -633,7 +696,9 @@ fn read_mutation(r: &mut Reader) -> Result<Mutation> {
             edge: EdgeId(r.u64()?),
             patch: read_patch(r)?,
         },
-        8 => Mutation::RemoveEdge { edge: EdgeId(r.u64()?) },
+        8 => Mutation::RemoveEdge {
+            edge: EdgeId(r.u64()?),
+        },
         9 => {
             let n = r.u32()? as usize;
             let n = r.checked_len(n, 4)?; // each str is ≥ 4 bytes (u32 len prefix)
@@ -648,7 +713,10 @@ fn read_mutation(r: &mut Reader) -> Result<Mutation> {
             };
             let factor = r.f32()?;
             Mutation::DecayEdges {
-                filter: crate::mutation::EdgeFilter { edge_types, min_weight },
+                filter: crate::mutation::EdgeFilter {
+                    edge_types,
+                    min_weight,
+                },
                 factor,
             }
         }
@@ -731,7 +799,10 @@ fn load_snapshot(store: &mut Store, bytes: &[u8]) -> Result<u64> {
     }
     let version = r.u32()?;
     if version != FORMAT_VERSION {
-        return Err(Error::VersionMismatch { found: version, supported: FORMAT_VERSION });
+        return Err(Error::VersionMismatch {
+            found: version,
+            supported: FORMAT_VERSION,
+        });
     }
     let epoch = r.u64()?;
     store.next_node_id = r.u64()?;

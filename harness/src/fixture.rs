@@ -160,7 +160,8 @@ pub fn read_fixture(dir: &Path) -> Result<(Fixture, Manifest, bool), String> {
         parse_jsonl(&dir.join(NODES)).map_err(|e| format!("nodes.jsonl: {e}"))?;
     let edges: Vec<crate::generator::FixtureEdge> =
         parse_jsonl(&dir.join(EDGES)).map_err(|e| format!("edges.jsonl: {e}"))?;
-    let embeddings = decode_embeddings(&fs::read(dir.join(EMBEDDINGS)).map_err(|e| e.to_string())?)?;
+    let embeddings =
+        decode_embeddings(&fs::read(dir.join(EMBEDDINGS)).map_err(|e| e.to_string())?)?;
 
     let fixture = Fixture {
         params: manifest.parameters.clone(),
@@ -305,9 +306,18 @@ mod tests {
     fn generation_is_byte_for_byte_deterministic() {
         let a = generate(Parameters::new(SizeClass::Small, Fanout::Medium, 7));
         let b = generate(Parameters::new(SizeClass::Small, Fanout::Medium, 7));
-        assert_eq!(canonical::jsonl(a.nodes.iter()), canonical::jsonl(b.nodes.iter()));
-        assert_eq!(canonical::jsonl(a.edges.iter()), canonical::jsonl(b.edges.iter()));
-        assert_eq!(encode_embeddings(&a.embeddings), encode_embeddings(&b.embeddings));
+        assert_eq!(
+            canonical::jsonl(a.nodes.iter()),
+            canonical::jsonl(b.nodes.iter())
+        );
+        assert_eq!(
+            canonical::jsonl(a.edges.iter()),
+            canonical::jsonl(b.edges.iter())
+        );
+        assert_eq!(
+            encode_embeddings(&a.embeddings),
+            encode_embeddings(&b.embeddings)
+        );
     }
 
     #[test]

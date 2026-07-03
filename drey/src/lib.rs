@@ -43,6 +43,5 @@ pub use config::GraphConfig;
 pub use error::{Error, Result};
 pub use graph::Graph;
 pub use types::{
-    Direction, Edge, EdgeId, EdgeType, Embedding, Node, NodeId, NodeType, Properties, Scalar,
-    Value,
+    Direction, Edge, EdgeId, EdgeType, Embedding, Node, NodeId, NodeType, Properties, Scalar, Value,
 };

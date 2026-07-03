@@ -77,7 +77,10 @@ impl ZipfTable {
     fn sample(&self, rng: &mut DetRng) -> usize {
         let target = rng.gen::<f64>() * self.total;
         // First index whose cumulative weight ≥ target.
-        match self.cdf.binary_search_by(|x| x.partial_cmp(&target).unwrap()) {
+        match self
+            .cdf
+            .binary_search_by(|x| x.partial_cmp(&target).unwrap())
+        {
             Ok(i) => i,
             Err(i) => i.min(self.cdf.len() - 1),
         }
@@ -210,9 +213,9 @@ fn generate_embeddings(params: &Parameters) -> Vec<(u64, Vec<f32>)> {
         let mut i = 0;
         while i < dim {
             match (i / 100) % 3 {
-                0 => v[i] = f32::from_bits(1),          // smallest denormal
-                1 => v[i] = -0.0,                        // negative zero
-                _ => v[i] = f32::MIN_POSITIVE,           // smallest normal
+                0 => v[i] = f32::from_bits(1), // smallest denormal
+                1 => v[i] = -0.0,              // negative zero
+                _ => v[i] = f32::MIN_POSITIVE, // smallest normal
             }
             i += 100; // every 100th → ~1%
         }
