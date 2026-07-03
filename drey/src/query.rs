@@ -50,8 +50,9 @@ impl ScalarPredicate {
 
 impl Graph {
     /// Resolve a node type to its interned id, or error if it is not registered.
-    /// Shared by the type and property queries so both stay in sync.
-    fn resolve_registered_type(&self, node_type: &NodeType) -> Result<u32> {
+    /// Shared by the type and property queries (and the similarity candidate
+    /// seed) so they stay in sync.
+    pub(crate) fn resolve_registered_type(&self, node_type: &NodeType) -> Result<u32> {
         self.store
             .node_types
             .get(node_type.as_str())

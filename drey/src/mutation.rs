@@ -72,6 +72,15 @@ impl WeightUpdate {
             WeightOp::Add(v) => current + v,
             WeightOp::Multiply(v) => current * v,
         };
+        // A non-finite op result must not be clamped. `f32::max`/`min` drop NaN
+        // (`NaN.max(min).min(max) == min`), which would silently coerce a NaN
+        // update into a finite in-bounds weight and defeat the `is_finite`
+        // rejection in `update_edge_weight` (which runs on this result). Return
+        // `raw` unclamped so a NaN/±inf result reaches — and is rejected by —
+        // that guard, exactly as the unbounded path already does.
+        if !raw.is_finite() {
+            return raw;
+        }
         match self.bounds {
             // `f32::clamp` panics when min > max or either bound is NaN. Use a
             // manual clamp that can't panic; malformed bounds (validated and
