@@ -187,7 +187,15 @@ fn generate_edges(params: &Parameters) -> Vec<FixtureEdge> {
             guard += 1;
         }
         if to == from {
-            to = (from + 1) % n; // deterministic fallback
+            // Degree-aware deterministic fallback: the nearest node that is not
+            // `from` and is still under the cap. A plain `(from + 1) % n` could
+            // land on a node already at max_degree and push it over, failing the
+            // self-check. Falls back to `from` only if the graph is fully
+            // saturated (unreachable for valid params, where edges ≪ n·cap).
+            to = (1..n)
+                .map(|off| (from + off) % n)
+                .find(|&cand| degree[cand] < max_degree)
+                .unwrap_or(from);
         }
         degree[from] += 1;
         degree[to] += 1;

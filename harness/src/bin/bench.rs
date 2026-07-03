@@ -61,6 +61,13 @@ fn main() {
     };
     let is_real = driver_kind == "drey";
 
+    // Capture the run start before any load/measurement work, so `started_at`
+    // reflects the start rather than completion time.
+    let started_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     eprintln!("loading fixture into {} driver…", driver.name());
     let load = match driver.load_fixture(&fixture) {
         Ok(s) => s,
@@ -94,10 +101,6 @@ fn main() {
         }
     }
 
-    let started_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let output = RunOutput {
         harness_version: env!("CARGO_PKG_VERSION").into(),
         run: RunMeta {

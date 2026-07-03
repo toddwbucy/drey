@@ -523,22 +523,25 @@ impl GraphDriver for NaiveDriver {
                 Ok(OpOutcome::ok(c(&[("neighbors", n)])))
             }
             WorkloadOp::Traverse { start, max_hops } => {
-                // BFS with a visited set and a path cap, matching DreyDriver's
-                // bounds. Without them the hub-heavy graph makes the frontier grow
-                // geometrically and the driver OOMs (audit #5).
+                // Bounded BFS with a visited set and an edge-hop cap. This is a
+                // different computation from DreyDriver's DFS path enumeration
+                // (matching that here would reintroduce the geometric frontier
+                // blowup the cap exists to prevent — audit #5), so the counter is
+                // named `edge_hops`, not `paths_returned`: the two traverse
+                // counters measure different things and must not be cross-checked.
                 use std::collections::HashSet;
-                const MAX_PATHS: u64 = 1000;
+                const MAX_EDGE_HOPS: u64 = 1000;
                 let mut frontier = vec![*start];
                 let mut visited_set: HashSet<u64> = HashSet::from([*start]);
-                let mut paths = 0u64;
+                let mut edge_hops = 0u64;
                 'outer: for _ in 0..*max_hops {
                     let mut next = Vec::new();
                     for node in frontier.drain(..) {
                         if let Some(edges) = self.out_adj.get(&node) {
                             for e in edges {
                                 let to = self.edges[e].to;
-                                paths += 1;
-                                if paths >= MAX_PATHS {
+                                edge_hops += 1;
+                                if edge_hops >= MAX_EDGE_HOPS {
                                     break 'outer;
                                 }
                                 if visited_set.insert(to) {
@@ -549,7 +552,7 @@ impl GraphDriver for NaiveDriver {
                     }
                     frontier = next;
                 }
-                Ok(OpOutcome::ok(c(&[("paths_returned", paths)])))
+                Ok(OpOutcome::ok(c(&[("edge_hops", edge_hops)])))
             }
             WorkloadOp::PropertyEq {
                 node_type,
