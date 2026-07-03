@@ -23,8 +23,12 @@ mod codec;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use codec::{crc32, Reader, Writer};
+
+/// Per-call counter for unique `export` temp-file names (see `Graph::export`).
+static EXPORT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::config::GraphConfig;
 use crate::error::{Error, Result};
@@ -372,9 +376,17 @@ impl Graph {
         // torn/failed write must never destroy the previous image at `path` — the
         // hazard of a bare `fs::write` (create+truncate in place). Mirrors
         // `snapshot`'s cutover.
+        //
+        // Unlike `snapshot` (`&mut self`, serialized by the single-writer model),
+        // `export` takes `&self`, so two threads can export the same destination
+        // at once. A fixed `.tmp` name would let them clobber each other's temp;
+        // a per-call unique suffix (pid + counter) keeps each write private, and
+        // the atomic renames just resolve to whichever finishes last — always a
+        // complete image, never a torn one.
         let tmp = {
+            let seq = EXPORT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
             let mut s = path.as_os_str().to_os_string();
-            s.push(".tmp");
+            s.push(format!(".{}.{}.tmp", std::process::id(), seq));
             PathBuf::from(s)
         };
         {
