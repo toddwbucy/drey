@@ -73,8 +73,22 @@ impl WeightUpdate {
             WeightOp::Multiply(v) => current * v,
         };
         match self.bounds {
-            Some((min, max)) => raw.clamp(min, max),
-            None => raw,
+            // `f32::clamp` panics when min > max or either bound is NaN. Use a
+            // manual clamp that can't panic; malformed bounds (validated and
+            // rejected by `update_edge_weight`) degrade to leaving `raw`
+            // unclamped rather than aborting the process (PRD §18 no-panic).
+            Some((min, max)) if min <= max => raw.max(min).min(max),
+            _ => raw,
+        }
+    }
+
+    /// Whether the bounds are well-formed (`min <= max`, neither NaN). Malformed
+    /// bounds are rejected at the API (`update_edge_weight`) so a caller cannot
+    /// reach the no-op-clamp fallback in [`WeightUpdate::apply`] silently.
+    pub fn bounds_valid(&self) -> bool {
+        match self.bounds {
+            Some((min, max)) => min <= max, // false if either is NaN
+            None => true,
         }
     }
 }

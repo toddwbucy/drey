@@ -154,6 +154,11 @@ impl Graph {
 
     pub fn update_edge_weight(&mut self, edge: EdgeId, update: WeightUpdate) -> Result<f32> {
         self.ensure_writable()?;
+        if !update.bounds_valid() {
+            return Err(Error::InvalidPropertyValue(
+                "weight-update bounds must satisfy min <= max and be non-NaN".into(),
+            ));
+        }
         let current = self
             .store
             .edges

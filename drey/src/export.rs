@@ -52,6 +52,11 @@ pub trait GraphFeatureExport {
     /// Node feature matrix, one row per dense index, per the spec.
     fn node_features(&self, map: &NodeIndexMap, spec: &FeatureSpec) -> Result<Vec<Vec<f32>>>;
 
+    /// Interned node-type id per node, aligned to the dense index map — the
+    /// "Node type IDs" required export form of PRD §14 (needed by heterogeneous
+    /// pipelines such as RGCN).
+    fn node_type_ids(&self, map: &NodeIndexMap) -> Result<Vec<u32>>;
+
     /// Edge index as `(src_dense, dst_dense)` pairs, filtered and deterministic.
     fn edge_index(&self, map: &NodeIndexMap, filter: &EdgeFilter) -> Result<Vec<(usize, usize)>>;
 
@@ -78,14 +83,34 @@ impl GraphFeatureExport for Graph {
     }
 
     fn node_features(&self, map: &NodeIndexMap, spec: &FeatureSpec) -> Result<Vec<Vec<f32>>> {
+        // Uniform embedding width so every row has the same shape and the numeric
+        // property columns align: the max declared embedding dim among the mapped
+        // nodes. A node missing its embedding is zero-padded to this width rather
+        // than contributing zero columns (which produced ragged, misaligned rows).
+        let embed_width = if spec.include_embedding {
+            map.to_node
+                .iter()
+                .filter_map(|n| self.store.nodes.get(&n.0))
+                .map(|rec| self.store.embedding_dim.get(&rec.node_type).copied().flatten().unwrap_or(0))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let mut rows = Vec::with_capacity(map.len());
         for node in &map.to_node {
-            let rec = &self.store.nodes[&node.0];
-            let mut row = Vec::new();
+            // A stale map entry is a recoverable error, never a panic — matching
+            // the sibling `edge_index`.
+            let rec = self.store.nodes.get(&node.0).ok_or_else(|| {
+                Error::IndexCorruption(format!("node index map references missing node {}", node.0))
+            })?;
+            let mut row = Vec::with_capacity(embed_width + spec.numeric_properties.len());
             if spec.include_embedding {
                 if let Some(emb) = &rec.embedding {
                     row.extend_from_slice(emb);
                 }
+                row.resize(embed_width, 0.0); // zero-pad (or all-zeros if absent)
             }
             for key in &spec.numeric_properties {
                 let v = rec.properties.get(key).and_then(numeric_of).unwrap_or(0.0);
@@ -94,6 +119,24 @@ impl GraphFeatureExport for Graph {
             rows.push(row);
         }
         Ok(rows)
+    }
+
+    fn node_type_ids(&self, map: &NodeIndexMap) -> Result<Vec<u32>> {
+        map.to_node
+            .iter()
+            .map(|node| {
+                self.store
+                    .nodes
+                    .get(&node.0)
+                    .map(|rec| rec.node_type)
+                    .ok_or_else(|| {
+                        Error::IndexCorruption(format!(
+                            "node index map references missing node {}",
+                            node.0
+                        ))
+                    })
+            })
+            .collect()
     }
 
     fn edge_index(&self, map: &NodeIndexMap, filter: &EdgeFilter) -> Result<Vec<(usize, usize)>> {
