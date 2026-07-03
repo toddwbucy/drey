@@ -138,6 +138,15 @@ impl Graph {
         properties: Properties,
     ) -> Result<EdgeId> {
         self.ensure_writable()?;
+        if !weight.is_finite() {
+            // A NaN/±inf weight is malformed input: it silently becomes a
+            // zero-cost edge in weighted shortest_path (f32::max(NaN, 0.0) == 0.0)
+            // and defeats the min_weight filter. Reject at the boundary, as the
+            // embedding path rejects non-finite components.
+            return Err(Error::InvalidPropertyValue(
+                "edge weight must be finite (not NaN or infinite)".into(),
+            ));
+        }
         let id = self
             .store
             .add_edge(from, to, &edge_type, weight, properties.clone())?;
@@ -166,6 +175,14 @@ impl Graph {
             .ok_or(Error::EdgeNotFound(edge))?
             .weight;
         let new = update.apply(current);
+        if !new.is_finite() {
+            // Even with finite inputs the op can produce a non-finite result
+            // (e.g. a weight driven to +inf then Multiply(0.0) → NaN). Reject the
+            // result so a poisoned weight never reaches the store or the WAL.
+            return Err(Error::InvalidPropertyValue(
+                "edge weight update produced a non-finite result".into(),
+            ));
+        }
         self.store.set_edge_weight(edge, new)?;
         self.log(Mutation::SetEdgeWeight { edge, weight: new })?;
         Ok(new)
@@ -203,14 +220,31 @@ impl Graph {
     /// the crate only applies the batch.
     pub fn decay_edges(&mut self, filter: EdgeFilter, factor: f32) -> Result<DecayReport> {
         self.ensure_writable()?;
+        if !factor.is_finite() {
+            return Err(Error::InvalidPropertyValue(
+                "decay factor must be finite (not NaN or infinite)".into(),
+            ));
+        }
         let ids = self.edges_matching(&filter);
         let update = WeightUpdate::multiply(factor);
+        // Compute and validate every result BEFORE mutating anything: a finite
+        // weight × finite factor can still overflow to ±inf, and applying edges
+        // one-by-one would otherwise leave the batch partially applied on such a
+        // result. Reject the whole batch instead (matches `update_edge_weight`).
+        let mut updates = Vec::with_capacity(ids.len());
         for id in &ids {
-            let current = self.store.edges[id].weight;
-            let new = update.apply(current);
+            let new = update.apply(self.store.edges[id].weight);
+            if !new.is_finite() {
+                return Err(Error::InvalidPropertyValue(
+                    "decay produced a non-finite edge weight".into(),
+                ));
+            }
+            updates.push((*id, new));
+        }
+        for (id, new) in &updates {
             // Route through the same write path as `update_edge_weight` so any
             // validation/bookkeeping in the store applies to both.
-            self.store.set_edge_weight(EdgeId(*id), new)?;
+            self.store.set_edge_weight(EdgeId(*id), *new)?;
         }
         // A single log record captures the batch for replay.
         self.log(Mutation::DecayEdges {

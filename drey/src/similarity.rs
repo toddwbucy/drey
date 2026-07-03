@@ -195,6 +195,13 @@ impl Graph {
     /// which would blow up exponentially on hub-heavy graphs. Work is O(V + E)
     /// within the hop bound.
     fn reachable_set(&self, filter: &ReachabilityFilter) -> Result<HashSet<u64>> {
+        // Validate the anchor like neighbors/traverse/shortest_path do. Without
+        // this a missing `from` yields an empty reachable set (just `{from}`
+        // intersected away), so `similar_nodes` returns Ok(empty) instead of the
+        // NodeNotFound every other traversal anchor reports.
+        if !self.store.nodes.contains_key(&filter.from.0) {
+            return Err(Error::NodeNotFound(filter.from));
+        }
         let type_ids = self.resolve_type_ids(&filter.edge_types);
         let max_hops = filter.max_hops.min(crate::traverse::MAX_TRAVERSAL_HOPS);
 
@@ -205,7 +212,7 @@ impl Graph {
             let mut next = Vec::new();
             for node in frontier.drain(..) {
                 for (_edge, other) in
-                    self.steps(node, filter.direction.into(), &type_ids, filter.min_weight)
+                    self.steps(node, filter.direction, &type_ids, filter.min_weight)
                 {
                     if visited.insert(other) {
                         next.push(other);

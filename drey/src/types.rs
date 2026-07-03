@@ -45,9 +45,11 @@ impl EdgeType {
     }
 }
 
-/// Traversal / adjacency direction (PRD §9.1).
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+/// Traversal / adjacency direction (PRD §9.1). `Outbound` is the default so the
+/// options structs that carry a direction can derive `Default`.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Direction {
+    #[default]
     Outbound,
     Inbound,
     Both,
@@ -175,7 +177,14 @@ impl Scalar {
         match (self, other) {
             (Scalar::Bool(a), Scalar::Bool(b)) => a.cmp(b),
             (Scalar::I64(a), Scalar::I64(b)) => a.cmp(b),
-            (Scalar::F64(a), Scalar::F64(b)) => a.total_cmp(b),
+            (Scalar::F64(a), Scalar::F64(b)) => {
+                // Normalize signed zero so -0.0 and +0.0 are the same index key
+                // and the same scan match: `total_cmp` alone orders -0.0 < +0.0,
+                // which would make an `Eq(F64(0.0))` query miss a stored
+                // `F64(-0.0)` even though they are IEEE-equal.
+                let norm = |x: f64| if x == 0.0 { 0.0 } else { x };
+                norm(*a).total_cmp(&norm(*b))
+            }
             (Scalar::String(a), Scalar::String(b)) => a.cmp(b),
             _ => rank(self).cmp(&rank(other)),
         }
@@ -184,8 +193,12 @@ impl Scalar {
 
 /// A wrapper giving [`Scalar`] a total `Ord` for use as a `BTreeMap` key in the
 /// property index. Keeps the total-order rules in [`Scalar::total_order`].
+///
+/// Internal: this is the index's key encoding, not part of the public API (the
+/// public surface takes/returns [`Scalar`], never `ScalarKey`), so keeping it
+/// `pub(crate)` leaves the index representation free to change.
 #[derive(Clone, Debug)]
-pub struct ScalarKey(pub Scalar);
+pub(crate) struct ScalarKey(pub(crate) Scalar);
 
 impl PartialEq for ScalarKey {
     fn eq(&self, other: &Self) -> bool {
