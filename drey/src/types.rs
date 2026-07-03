@@ -130,11 +130,25 @@ impl Value {
     }
 
     /// Whether a value is well-formed for v0.1. The variants are non-nesting by
-    /// construction (there is no `Map` variant and `List` holds only
-    /// [`Scalar`]), so every constructible `Value` is valid; the check exists
-    /// as an explicit guard point for future variants (PRD §7.3).
+    /// construction (no `Map`, `List` holds only [`Scalar`]). The one real check
+    /// is a length ceiling: the on-disk codec prefixes byte/string/list lengths
+    /// with a `u32`, so a value whose length does not fit in `u32` would be
+    /// silently truncated on write and corrupt the WAL/snapshot. Reject it here,
+    /// at the API boundary, so oversized data never reaches the codec.
     pub fn is_valid(&self) -> bool {
-        true
+        const MAX: usize = u32::MAX as usize;
+        match self {
+            Value::String(s) => s.len() <= MAX,
+            Value::Bytes(b) => b.len() <= MAX,
+            Value::List(items) => {
+                items.len() <= MAX
+                    && items.iter().all(|s| match s {
+                        Scalar::String(s) => s.len() <= MAX,
+                        _ => true,
+                    })
+            }
+            Value::Null | Value::Bool(_) | Value::I64(_) | Value::F64(_) => true,
+        }
     }
 }
 
