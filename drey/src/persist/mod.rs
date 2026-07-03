@@ -399,8 +399,15 @@ fn pid_alive(pid: u32) -> bool {
 fn create_lock(lock: &Path) -> std::io::Result<bool> {
     match OpenOptions::new().write(true).create_new(true).open(lock) {
         Ok(mut f) => {
-            let _ = write!(f, "{} {}", std::process::id(), boot_id());
-            let _ = f.sync_all();
+            // A half-stamped lock reads as malformed and would be reclaimed as
+            // stale by another opener while we believe we hold it — two writers.
+            // Propagate the error and remove the partial file instead.
+            if let Err(e) =
+                write!(f, "{} {}", std::process::id(), boot_id()).and_then(|()| f.sync_all())
+            {
+                let _ = fs::remove_file(lock);
+                return Err(e);
+            }
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
