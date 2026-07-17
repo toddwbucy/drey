@@ -481,12 +481,32 @@ fn update_edge_weight_op(idx: &FixtureIndex, rng: &mut DetRng) -> WorkloadOp {
     }
 }
 
-fn decay_op(idx: &FixtureIndex, rng: &mut DetRng, batch: usize) -> WorkloadOp {
-    WorkloadOp::DecayEdges {
-        edge_type: idx.edge_types.choose(rng).cloned(),
-        factor: 0.9,
-        batch,
-    }
+/// A decay maker that pairs every decay (factor 0.9) with a restore of the
+/// SAME edge type at the reciprocal factor on its next call. Without the
+/// pairing, a measurement plan's thousands of decay instances compound —
+/// weights collapse toward zero, so every later min_weight-filtered read and
+/// weighted shortest path measures a degenerate graph instead of the fixture
+/// (2026-07 repo review). The factor is not part of the bucket key, so both
+/// halves land in the same `decay_edges:batch=` bucket and exercise the same
+/// batch-sized write; the per-type net exposure never exceeds one 0.9 step.
+fn decay_maker(batch: usize) -> Maker {
+    let pending: std::cell::RefCell<Option<Option<String>>> = std::cell::RefCell::new(None);
+    Box::new(move |idx, rng| {
+        let mut pending = pending.borrow_mut();
+        let (edge_type, factor) = match pending.take() {
+            Some(t) => (t, 1.0 / 0.9_f32),
+            None => {
+                let t = idx.edge_types.choose(rng).cloned();
+                *pending = Some(t.clone());
+                (t, 0.9)
+            }
+        };
+        WorkloadOp::DecayEdges {
+            edge_type,
+            factor,
+            batch,
+        }
+    })
 }
 
 /// The read-class makers (one per budget-table read bucket).
@@ -526,9 +546,9 @@ fn sim_makers() -> Vec<Maker> {
 fn mut_makers() -> Vec<Maker> {
     vec![
         Box::new(update_edge_weight_op),
-        Box::new(|idx, rng| decay_op(idx, rng, 1_000)),
-        Box::new(|idx, rng| decay_op(idx, rng, 10_000)),
-        Box::new(|idx, rng| decay_op(idx, rng, 100_000)),
+        decay_maker(1_000),
+        decay_maker(10_000),
+        decay_maker(100_000),
     ]
 }
 
