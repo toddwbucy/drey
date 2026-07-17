@@ -89,6 +89,9 @@ impl SimilarityEvaluator for ExhaustiveScan {
         candidates: &[(NodeId, &[f32])],
         k: usize,
     ) -> Vec<(NodeId, f32)> {
+        if k == 0 {
+            return Vec::new(); // before the O(n·dim) scoring pass, not after
+        }
         // Finite inputs do not guarantee a finite score: an f32 dot product can
         // overflow to ±inf, and cosine's inf/inf is NaN. Under the descending
         // `total_cmp` sort NaN ranks as the largest value, so an overflowed score
@@ -106,12 +109,21 @@ impl SimilarityEvaluator for ExhaustiveScan {
                 (*n, if s.is_finite() { s } else { worst })
             })
             .collect();
-        if metric.higher_is_better() {
-            scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        // Rank comparator: best first, id tie-break for determinism.
+        let better = if metric.higher_is_better() {
+            |a: &(NodeId, f32), b: &(NodeId, f32)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
         } else {
-            scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            |a: &(NodeId, f32), b: &(NodeId, f32)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+        };
+        // Partial selection before the sort: O(n + k log k) instead of
+        // O(n log n) on the full candidate set. The comparator is total
+        // (total_cmp + id tie-break), so the k winners are exactly the k the
+        // full sort would produce — determinism is preserved.
+        if scored.len() > k {
+            scored.select_nth_unstable_by(k - 1, better);
+            scored.truncate(k);
         }
-        scored.truncate(k);
+        scored.sort_by(better);
         scored
     }
 }
@@ -136,11 +148,16 @@ pub struct SimilarityQuery {
     pub vector: Embedding,
     pub metric: SimilarityMetric,
     pub k: usize,
+    /// Restrict candidates to these node types. `None` means no type
+    /// constraint; `Some(vec![])` names an empty allow-list and deliberately
+    /// matches **nothing** — the two are not interchangeable.
     pub node_types: Option<Vec<NodeType>>,
     pub property_filter: Option<PropertyQuery>,
     pub within: Option<ReachabilityFilter>,
-    /// Permit scanning more than the config ceiling of candidates. Off by
-    /// default so an unfiltered query is bounded (PRD §13.1).
+    /// Permit probing more than the config ceiling of candidates. Off by
+    /// default so an unfiltered query is bounded (PRD §13.1). The ceiling
+    /// bounds the candidates *examined* (the filter survivors the scan must
+    /// probe for embeddings), not merely the vectors scored.
     pub allow_full_scan: bool,
 }
 
@@ -168,6 +185,12 @@ impl Graph {
     /// stored embedding therefore returns `Ok(vec![])`, not an error — the graph
     /// may hold several node types at different embedding dimensions, so a
     /// dimension that misses one type is not globally invalid.
+    ///
+    /// The scan ceiling bounds the candidates the query may *examine* — the
+    /// survivors of the structural/property filters that must each be probed
+    /// for a scorable embedding — not merely the vectors ultimately scored.
+    /// An unfiltered query over a graph larger than the ceiling is rejected
+    /// even when few nodes carry embeddings, unless `allow_full_scan` is set.
     pub fn similar_nodes(&self, query: SimilarityQuery) -> Result<Vec<(NodeId, f32)>> {
         // A non-finite query vector degenerates every score to NaN and returns a
         // meaningless ranking; reject it (stored embeddings are already finite,
@@ -180,7 +203,14 @@ impl Graph {
         // 1. Structural + property filters first (PRD §13.1 evaluation order).
         let candidates = self.candidate_set(&query)?;
 
-        // 2. Keep only same-dimension embeddings (enforces dimensionality, PRD
+        // 2. Bound the scan (PRD §13.1) — on the candidates the query will
+        //    *probe*, before any per-candidate work. Checking only the scored
+        //    (dimension-matching) survivors, as this used to, let an unfiltered
+        //    query walk the entire node set as long as few nodes carried
+        //    embeddings — O(V) work the ceiling exists to forbid.
+        self.ensure_scan_ceiling(candidates.len(), query.allow_full_scan)?;
+
+        // 3. Keep only same-dimension embeddings (enforces dimensionality, PRD
         //    §9.4 / §17) and materialize the `(id, embedding)` slice for the seam
         //    in one pass — one hash lookup per candidate, not two. A query vector
         //    whose dimension matches no stored embedding yields an empty set here
@@ -194,16 +224,6 @@ impl Graph {
             })
             .collect();
 
-        // 3. Bound the scan (PRD §13.1).
-        let ceiling = self.config.scan_ceiling.max_candidates;
-        if cand.len() > ceiling && !query.allow_full_scan {
-            return Err(Error::UnsupportedQuery(format!(
-                "similarity candidate set {} exceeds scan ceiling {}; narrow the filters or set allow_full_scan",
-                cand.len(),
-                ceiling
-            )));
-        }
-
         // 4–5. Score + rank the survivors behind the evaluation seam (PRD §13.2),
         // so an ANN structure can replace the exhaustive scan without touching
         // this method. The seam ranks a pre-filtered set (PRD §13.1 order); it
@@ -211,6 +231,22 @@ impl Graph {
         let q = query.vector.as_slice();
         let evaluator: &dyn SimilarityEvaluator = &ExhaustiveScan;
         Ok(evaluator.top_k(q, query.metric, &cand, query.k))
+    }
+
+    /// The single enforcement point for the scan ceiling (PRD §13.1): the
+    /// policy — what is counted (candidates *probed*) and how it is lifted
+    /// (`allow_full_scan`) — lives here so the pre-materialization check in
+    /// `candidate_set` and the post-filter check in `similar_nodes` cannot
+    /// drift apart.
+    fn ensure_scan_ceiling(&self, candidates: usize, allow_full_scan: bool) -> Result<()> {
+        let ceiling = self.config.scan_ceiling.max_candidates;
+        if candidates > ceiling && !allow_full_scan {
+            return Err(Error::UnsupportedQuery(format!(
+                "similarity candidate set {candidates} exceeds scan ceiling {ceiling}; \
+                 narrow the filters or set allow_full_scan"
+            )));
+        }
+        Ok(())
     }
 
     /// The candidate node set surviving all non-vector filters.
@@ -267,8 +303,17 @@ impl Graph {
             });
         }
 
-        // No constraint named a subset → the whole node set (scan-ceiling bounded).
-        Ok(set.unwrap_or_else(|| self.store.nodes.keys().copied().collect()))
+        match set {
+            Some(s) => Ok(s),
+            None => {
+                // No constraint named a subset → the whole node set. Enforce the
+                // ceiling BEFORE materializing: the bound exists to cap work, so
+                // allocating an O(V) set just to count-and-reject it (or probe
+                // every node for an embedding) would defeat it on large graphs.
+                self.ensure_scan_ceiling(self.store.nodes.len(), query.allow_full_scan)?;
+                Ok(self.store.nodes.keys().copied().collect())
+            }
+        }
     }
 
     /// The set of nodes reachable from `filter.from` within `max_hops`,
@@ -278,6 +323,7 @@ impl Graph {
     /// which would blow up exponentially on hub-heavy graphs. Work is O(V + E)
     /// within the hop bound.
     fn reachable_set(&self, filter: &ReachabilityFilter) -> Result<HashSet<u64>> {
+        crate::graph::validate_min_weight(filter.min_weight)?;
         // Validate the anchor like neighbors/traverse/shortest_path do. Without
         // this a missing `from` yields an empty reachable set (just `{from}`
         // intersected away), so `similar_nodes` returns Ok(empty) instead of the

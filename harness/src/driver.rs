@@ -356,6 +356,13 @@ impl GraphDriver for DreyDriver {
                             .collect(),
                     ),
                     property_filter,
+                    // The plan's cand_target sweep defines the scan size being
+                    // measured; the crate's scan ceiling (which now bounds
+                    // candidates PROBED, not vectors scored) must not clip it.
+                    // At stress scale the 10k sweep point composes ~104k
+                    // probed candidates — over the default 100k ceiling — and
+                    // without this the whole bench run aborts.
+                    allow_full_scan: true,
                     ..SimilarityQuery::new(emb, SimilarityMetric::Cosine, *k)
                 };
                 let hits = self.g().similar_nodes(query).map_err(|e| e.to_string())?;

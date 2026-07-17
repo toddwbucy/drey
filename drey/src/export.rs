@@ -22,10 +22,15 @@ pub struct FeatureSpec {
 
 /// A deterministic, contiguous mapping between `NodeId` and a dense `0..n`
 /// index space, plus its inverse (PRD §14 required export forms).
+///
+/// The backing vector is private: [`NodeIndexMap::index_of`] resolves through
+/// `binary_search`, so the mapping is only correct while the vector stays
+/// sorted. Construction (in [`GraphFeatureExport::node_index_map`]) sorts it
+/// once; no public surface can un-sort it afterwards.
 #[derive(Clone, Debug)]
 pub struct NodeIndexMap {
     /// `dense index -> NodeId`, sorted by `NodeId` for determinism.
-    pub to_node: Vec<NodeId>,
+    to_node: Vec<NodeId>,
 }
 
 impl NodeIndexMap {
@@ -34,6 +39,11 @@ impl NodeIndexMap {
     }
     pub fn is_empty(&self) -> bool {
         self.to_node.is_empty()
+    }
+    /// The dense-index → `NodeId` mapping, read-only: `nodes()[i]` is the node
+    /// at dense index `i`, sorted ascending by id.
+    pub fn nodes(&self) -> &[NodeId] {
+        &self.to_node
     }
     /// Dense index of a node, if present.
     pub fn index_of(&self, node: NodeId) -> Option<usize> {
@@ -147,6 +157,7 @@ impl GraphFeatureExport for Graph {
     }
 
     fn edge_index(&self, map: &NodeIndexMap, filter: &EdgeFilter) -> Result<Vec<(usize, usize)>> {
+        crate::graph::validate_min_weight(filter.min_weight)?;
         let ids = self.edges_matching(filter);
         let mut out = Vec::with_capacity(ids.len());
         for e in ids {
@@ -171,6 +182,7 @@ impl GraphFeatureExport for Graph {
     }
 
     fn edge_weights(&self, filter: &EdgeFilter) -> Result<Vec<f32>> {
+        crate::graph::validate_min_weight(filter.min_weight)?;
         Ok(self
             .edges_matching(filter)
             .into_iter()
@@ -179,6 +191,7 @@ impl GraphFeatureExport for Graph {
     }
 
     fn edge_types(&self, filter: &EdgeFilter) -> Result<Vec<u32>> {
+        crate::graph::validate_min_weight(filter.min_weight)?;
         Ok(self
             .edges_matching(filter)
             .into_iter()

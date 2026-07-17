@@ -905,3 +905,237 @@ fn similarity_node_type_filter_excludes_other_types() {
         "robot must be excluded by the node_types filter"
     );
 }
+
+// ---- Regression coverage: issue #22 + 2026-07 repo review ----
+
+#[test]
+fn mixed_variant_numeric_predicates_compare_by_value_on_both_paths() {
+    // Review finding: cross-variant Range/Eq used to be decided by variant
+    // rank, so Range{min: I64(0), max: F64(10.0)} admitted F64(-5.0). Both the
+    // index path (indexed property) and the scan path (unindexed) must agree
+    // on value-based answers.
+    let config = GraphConfig::default().with_indexed_property(person(), "score");
+    let mut g = Graph::in_memory(config);
+    g.register_node_type(person(), None).unwrap();
+    let neg = g
+        .add_node(person(), props(&[("score", Value::F64(-5.0))]))
+        .unwrap();
+    let five_int = g
+        .add_node(person(), props(&[("score", Value::I64(5))]))
+        .unwrap();
+    let five_float = g
+        .add_node(person(), props(&[("score", Value::F64(5.0))]))
+        .unwrap();
+    let big = g
+        .add_node(person(), props(&[("score", Value::F64(50.0))]))
+        .unwrap();
+
+    // "score" is indexed; "shadow" (same values, different key) is not — the
+    // scan path must give the same answers.
+    for n in [neg, five_int, five_float, big] {
+        let v = g.node(n).unwrap().unwrap().properties["score"].clone();
+        g.update_node_properties(n, PropertyPatch::new().set("shadow", v))
+            .unwrap();
+    }
+    for key in ["score", "shadow"] {
+        let range = g
+            .nodes_by_property(PropertyQuery {
+                node_type: person(),
+                key: key.into(),
+                predicate: ScalarPredicate::Range {
+                    min: Some(Scalar::I64(0)),
+                    max: Some(Scalar::F64(10.0)),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            range,
+            vec![five_int, five_float],
+            "({key}) mixed-variant range must admit exactly the in-range values"
+        );
+        let eq = g
+            .nodes_by_property(PropertyQuery {
+                node_type: person(),
+                key: key.into(),
+                predicate: ScalarPredicate::Eq(Scalar::F64(5.0)),
+            })
+            .unwrap();
+        assert_eq!(
+            eq,
+            vec![five_int, five_float],
+            "({key}) Eq(F64(5.0)) must match a stored I64(5)"
+        );
+    }
+}
+
+#[test]
+fn nan_property_equality_is_bit_pattern_independent() {
+    // A runtime 0.0/0.0 produces a negative-quiet NaN on x86; querying with
+    // the positive f64::NAN constant must still match it — all NaN payloads
+    // are one value under the index's total order.
+    let mut g = base_graph();
+    // Pinned bit pattern, not a runtime 0.0/0.0: the division constant-folds
+    // to the canonical positive NaN at opt-level > 0, which would silently
+    // drop the negative-NaN coverage from `cargo test --release`.
+    let negative_quiet_nan = f64::from_bits(0xFFF8_0000_0000_0000);
+    let stored = g
+        .add_node(person(), props(&[("x", Value::F64(negative_quiet_nan))]))
+        .unwrap();
+    let hits = g
+        .nodes_by_property(PropertyQuery {
+            node_type: person(),
+            key: "x".into(),
+            predicate: ScalarPredicate::Eq(Scalar::F64(f64::NAN)),
+        })
+        .unwrap();
+    assert_eq!(hits, vec![stored]);
+}
+
+#[test]
+fn nan_min_weight_is_rejected_on_every_surface() {
+    // NaN makes `weight < min` and `weight >= min` both false, so the two
+    // filter surfaces would silently disagree (traversal passes everything,
+    // scans pass nothing). Every entry accepting min_weight must reject it.
+    let mut g = base_graph();
+    let a = g.add_node(person(), props(&[])).unwrap();
+    let b = g.add_node(person(), props(&[])).unwrap();
+    g.add_edge(a, b, knows(), 1.0, props(&[])).unwrap();
+
+    assert!(g
+        .neighbors(
+            a,
+            NeighborOptions {
+                min_weight: Some(f32::NAN),
+                ..NeighborOptions::default()
+            }
+        )
+        .is_err());
+    assert!(g
+        .traverse(
+            a,
+            TraversalOptions {
+                min_weight: Some(f32::NAN),
+                ..TraversalOptions::default()
+            }
+        )
+        .is_err());
+    assert!(g
+        .shortest_path(
+            a,
+            b,
+            ShortestPathOptions {
+                min_weight: Some(f32::NAN),
+                ..ShortestPathOptions::default()
+            }
+        )
+        .is_err());
+    assert!(g
+        .decay_edges(EdgeFilter::new().with_min_weight(f32::NAN), 0.5)
+        .is_err());
+    assert!(g
+        .edge_weights(&EdgeFilter::new().with_min_weight(f32::NAN))
+        .is_err());
+    let q = SimilarityQuery {
+        within: Some(drey::similarity::ReachabilityFilter {
+            from: a,
+            max_hops: 2,
+            edge_types: vec![],
+            min_weight: Some(f32::NAN),
+            direction: Direction::Outbound,
+        }),
+        ..SimilarityQuery::new(
+            Embedding::new(vec![1.0, 0.0, 0.0, 0.0]),
+            SimilarityMetric::Cosine,
+            3,
+        )
+    };
+    assert!(g.similar_nodes(q).is_err());
+}
+
+#[test]
+fn similarity_ceiling_bounds_probed_candidates_not_scored_vectors() {
+    // Issue #22 item 6: the ceiling bounds the candidates the scan must
+    // EXAMINE. An unfiltered query over a graph larger than the ceiling is
+    // rejected even when only a handful of nodes carry embeddings (the old
+    // check counted scored vectors, so this query walked the whole node set).
+    let mut config = GraphConfig::default();
+    config.scan_ceiling.max_candidates = 3;
+    let mut g = Graph::in_memory(config);
+    g.register_node_type(person(), Some(2)).unwrap();
+    let mut with_embedding = None;
+    for i in 0..10 {
+        let n = g.add_node(person(), props(&[])).unwrap();
+        if i == 0 {
+            g.set_node_embedding(n, Embedding::new(vec![1.0, 0.0]))
+                .unwrap();
+            with_embedding = Some(n);
+        }
+    }
+    let q = SimilarityQuery::new(Embedding::new(vec![1.0, 0.0]), SimilarityMetric::Cosine, 5);
+    assert!(
+        matches!(g.similar_nodes(q.clone()), Err(Error::UnsupportedQuery(_))),
+        "10 probed candidates over a ceiling of 3 must be rejected despite 1 scorable vector"
+    );
+    // The explicit override still works and returns the single scorable node.
+    let full = g
+        .similar_nodes(SimilarityQuery {
+            allow_full_scan: true,
+            ..q.clone()
+        })
+        .unwrap();
+    assert_eq!(full.len(), 1);
+    assert_eq!(full[0].0, with_embedding.unwrap());
+    // A type-filtered query with an over-ceiling candidate set is equally
+    // bounded — the filter result is what gets probed.
+    let filtered = SimilarityQuery {
+        node_types: Some(vec![person()]),
+        ..q
+    };
+    assert!(matches!(
+        g.similar_nodes(filtered),
+        Err(Error::UnsupportedQuery(_))
+    ));
+}
+
+#[test]
+fn empty_node_type_allow_list_matches_nothing() {
+    // Some(vec![]) is an empty allow-list, deliberately distinct from None
+    // (no constraint): documented policy, pinned here.
+    let mut g = base_graph();
+    let n = g.add_node(person(), props(&[])).unwrap();
+    g.set_node_embedding(n, Embedding::new(vec![1.0, 0.0, 0.0, 0.0]))
+        .unwrap();
+    let q = SimilarityQuery {
+        node_types: Some(vec![]),
+        ..SimilarityQuery::new(
+            Embedding::new(vec![1.0, 0.0, 0.0, 0.0]),
+            SimilarityMetric::Cosine,
+            3,
+        )
+    };
+    assert!(g.similar_nodes(q).unwrap().is_empty());
+}
+
+#[test]
+fn node_index_map_accessor_is_sorted_and_consistent() {
+    // NodeIndexMap's inverse lookup uses binary_search; the accessor exposes
+    // the mapping read-only, so consumers can no longer un-sort it (issue #22
+    // item 1 — the field used to be public and mutable).
+    let mut g = base_graph();
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        ids.push(g.add_node(person(), props(&[])).unwrap());
+    }
+    g.remove_node(ids[2], RemoveNodeMode::RejectIfEdgesExist)
+        .unwrap();
+    let map = g.node_index_map();
+    let nodes = map.nodes();
+    assert!(
+        nodes.windows(2).all(|w| w[0] < w[1]),
+        "mapping must be sorted"
+    );
+    for (dense, id) in nodes.iter().enumerate() {
+        assert_eq!(map.index_of(*id), Some(dense));
+    }
+    assert_eq!(map.index_of(ids[2]), None);
+}
