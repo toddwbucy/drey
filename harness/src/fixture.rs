@@ -220,12 +220,28 @@ pub fn read_workload(dir: &Path, name: &str) -> Result<Vec<crate::workload::Work
     let (_, first) = lines
         .next()
         .ok_or_else(|| format!("{file}: empty workload file"))?;
-    let header: PlanHeader = serde_json::from_str(first).map_err(|_| {
-        format!(
-            "{file}: no plan_version header — this plan predates plan versioning (v1) and \
-             would replay semantics this build no longer measures; regenerate the fixture"
-        )
-    })?;
+    let header: PlanHeader = match serde_json::from_str(first) {
+        Ok(h) => h,
+        // Distinguish a genuine v1 file from a damaged v2 one: regeneration
+        // under the same seed now yields a semantically different plan (the
+        // reworked decay ops consume RNG draws on a different cadence), so an
+        // operator who regenerates for a merely-damaged header silently loses
+        // run-to-run comparability that restoring the file would keep.
+        Err(e) => {
+            if serde_json::from_str::<crate::workload::WorkloadOp>(first).is_ok() {
+                return Err(format!(
+                    "{file}: no plan_version header — this plan predates plan versioning (v1) \
+                     and would replay semantics this build no longer measures; regenerate \
+                     the fixture"
+                ));
+            }
+            return Err(format!(
+                "{file}: first line is neither a plan_version header nor a v1 op ({e}); \
+                 the file may be damaged — restore it from backup (preserves run-to-run \
+                 comparability) or regenerate the fixture"
+            ));
+        }
+    };
     if header.plan_version != PLAN_VERSION {
         return Err(format!(
             "{file}: plan_version {} but this build requires {PLAN_VERSION}; \
