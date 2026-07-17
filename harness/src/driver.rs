@@ -146,6 +146,18 @@ impl DreyDriver {
     fn g_mut(&mut self) -> &mut Graph {
         self.graph.as_mut().expect("fixture not loaded")
     }
+    /// Materialize the Similar seed's embedding — the one block shared by
+    /// `prepare_op` (the untimed path) and `run_op`'s fallback, so the two
+    /// cannot drift.
+    fn resolve_seed_embedding(&self, fixture_id: u64) -> Result<Embedding, String> {
+        let seed = self.node(fixture_id)?;
+        self.g()
+            .node(seed)
+            .map_err(|e| e.to_string())?
+            .and_then(|n| n.embedding)
+            .ok_or_else(|| "seed node has no embedding".to_string())
+    }
+
     fn node(&self, fixture_id: u64) -> Result<NodeId, String> {
         self.node_map
             .get(&fixture_id)
@@ -247,13 +259,7 @@ impl GraphDriver for DreyDriver {
     fn prepare_op(&mut self, op: &WorkloadOp) -> Result<(), String> {
         self.seed_cache = None;
         if let WorkloadOp::Similar { seed_node, .. } = op {
-            let seed = self.node(*seed_node)?;
-            let emb = self
-                .g()
-                .node(seed)
-                .map_err(|e| e.to_string())?
-                .and_then(|n| n.embedding)
-                .ok_or("seed node has no embedding")?;
+            let emb = self.resolve_seed_embedding(*seed_node)?;
             self.seed_cache = Some((*seed_node, emb));
         }
         Ok(())
@@ -368,14 +374,7 @@ impl GraphDriver for DreyDriver {
                 // fallback keeps `run_op` correct if called without prepare.
                 let emb = match self.seed_cache.take() {
                     Some((cached_for, emb)) if cached_for == *seed_node => emb,
-                    _ => {
-                        let seed = self.node(*seed_node)?;
-                        self.g()
-                            .node(seed)
-                            .map_err(|e| e.to_string())?
-                            .and_then(|n| n.embedding)
-                            .ok_or("seed node has no embedding")?
-                    }
+                    _ => self.resolve_seed_embedding(*seed_node)?,
                 };
                 // Compose the type filter (one or more types) and an optional
                 // property filter so the scan is bounded to the sweep target
@@ -482,6 +481,9 @@ pub struct NaiveDriver {
     edges: HashMap<u64, NaiveEdge>,
     out_adj: HashMap<u64, Vec<u64>>, // from -> edge ids
     in_adj: HashMap<u64, Vec<u64>>,  // to -> edge ids
+    /// Seed embedding resolved by `prepare_op` for the next `Similar` op,
+    /// mirroring DreyDriver so both drivers time the same region.
+    seed_cache: Option<(u64, Vec<f32>)>,
 }
 
 impl NaiveDriver {
@@ -527,6 +529,24 @@ impl GraphDriver for NaiveDriver {
             nodes: self.nodes.len(),
             edges: self.edges.len(),
         })
+    }
+
+    fn prepare_op(&mut self, op: &WorkloadOp) -> Result<(), String> {
+        // Same untimed seed resolution as DreyDriver: the mirror must time the
+        // same region, or naive similar_nodes rows carry per-sample work the
+        // drey rows exclude and the side-by-side comparison skews.
+        self.seed_cache = None;
+        if let WorkloadOp::Similar { seed_node, .. } = op {
+            let emb = self
+                .nodes
+                .get(seed_node)
+                .ok_or("unknown seed node")?
+                .embedding
+                .clone()
+                .ok_or("seed node has no embedding")?;
+            self.seed_cache = Some((*seed_node, emb));
+        }
+        Ok(())
     }
 
     fn run_op(&mut self, op: &WorkloadOp) -> Result<OpOutcome, String> {
@@ -660,13 +680,16 @@ impl GraphDriver for NaiveDriver {
                 // type allow-list, an optional Eq property filter (which drey
                 // resolves against the FIRST listed type), same-dimension
                 // candidates only, cosine, top-k. Linear scan by design.
-                let emb = self
-                    .nodes
-                    .get(seed_node)
-                    .ok_or("unknown seed node")?
-                    .embedding
-                    .clone()
-                    .ok_or("seed node has no embedding")?;
+                let emb = match self.seed_cache.take() {
+                    Some((cached_for, emb)) if cached_for == *seed_node => emb,
+                    _ => self
+                        .nodes
+                        .get(seed_node)
+                        .ok_or("unknown seed node")?
+                        .embedding
+                        .clone()
+                        .ok_or("seed node has no embedding")?,
+                };
                 let cosine = |a: &[f32], b: &[f32]| -> f32 {
                     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
                     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -702,11 +725,20 @@ impl GraphDriver for NaiveDriver {
                     }
                     scored.push((*id, cosine(&emb, e)));
                 }
+                // `candidates` reports the survivors this scan ACTUALLY
+                // examined — not the plan's precomputed field, which DreyDriver
+                // echoes (:the crate API exposes no probed-count). Comparing
+                // naive-actual against drey/plan-constant is what turns the
+                // counter check into a real cross-validation of the two
+                // drivers' candidate-set composition; echoing the constant on
+                // both sides made agreement vacuous.
+                let survivors = scored.len() as u64;
+                let _ = candidates; // plan's precomputed count; drey reports it
                 scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 scored.truncate(*k);
                 Ok(OpOutcome::ok(c(&[
                     ("results", scored.len() as u64),
-                    ("candidates", *candidates),
+                    ("candidates", survivors),
                 ])))
             }
             // NaiveDriver only implements enough op classes to prove mechanics;

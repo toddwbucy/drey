@@ -481,32 +481,47 @@ fn update_edge_weight_op(idx: &FixtureIndex, rng: &mut DetRng) -> WorkloadOp {
     }
 }
 
-/// A decay maker that pairs every decay (factor 0.9) with a restore of the
-/// SAME edge type at the reciprocal factor on its next call. Without the
-/// pairing, a measurement plan's thousands of decay instances compound —
-/// weights collapse toward zero, so every later min_weight-filtered read and
-/// weighted shortest path measures a degenerate graph instead of the fixture
-/// (2026-07 repo review). The factor is not part of the bucket key, so both
+fn decay_op(idx: &FixtureIndex, rng: &mut DetRng, batch: usize) -> WorkloadOp {
+    WorkloadOp::DecayEdges {
+        edge_type: idx.edge_types.choose(rng).cloned(),
+        factor: 0.9,
+        batch,
+    }
+}
+
+/// Pair every decay with an immediate reciprocal restore of the same edge
+/// type, inserted as plan **structure** (like the Commit cadence — outside
+/// any mix percentages). Without restores, a plan's thousands of decays
+/// compound and weights collapse toward zero, so later min_weight-filtered
+/// reads and weighted paths measure a degenerate graph (2026-07 repo
+/// review). The restore being the *very next op* is what makes the bound
+/// exact: no other maker can stack a second decay on the type and no
+/// interleaved `Set` can land inside the window and be inflated by the
+/// restore — gaps a per-maker pairing state provably had (review of this
+/// change, finding 1). The factor is not part of the bucket key, so both
 /// halves land in the same `decay_edges:batch=` bucket and exercise the same
-/// batch-sized write; the per-type net exposure never exceeds one 0.9 step.
-fn decay_maker(batch: usize) -> Maker {
-    let pending: std::cell::RefCell<Option<Option<String>>> = std::cell::RefCell::new(None);
-    Box::new(move |idx, rng| {
-        let mut pending = pending.borrow_mut();
-        let (edge_type, factor) = match pending.take() {
-            Some(t) => (t, 1.0 / 0.9_f32),
-            None => {
-                let t = idx.edge_types.choose(rng).cloned();
-                *pending = Some(t.clone());
-                (t, 0.9)
-            }
+/// batch-sized write.
+fn with_decay_restores(plan: Vec<WorkloadOp>) -> Vec<WorkloadOp> {
+    let mut out = Vec::with_capacity(plan.len() * 2);
+    for op in plan {
+        let restore = match &op {
+            WorkloadOp::DecayEdges {
+                edge_type,
+                factor,
+                batch,
+            } if *factor < 1.0 => Some(WorkloadOp::DecayEdges {
+                edge_type: edge_type.clone(),
+                factor: 1.0 / *factor,
+                batch: *batch,
+            }),
+            _ => None,
         };
-        WorkloadOp::DecayEdges {
-            edge_type,
-            factor,
-            batch,
+        out.push(op);
+        if let Some(restore) = restore {
+            out.push(restore);
         }
-    })
+    }
+    out
 }
 
 /// The read-class makers (one per budget-table read bucket).
@@ -546,9 +561,9 @@ fn sim_makers() -> Vec<Maker> {
 fn mut_makers() -> Vec<Maker> {
     vec![
         Box::new(update_edge_weight_op),
-        decay_maker(1_000),
-        decay_maker(10_000),
-        decay_maker(100_000),
+        Box::new(|idx, rng| decay_op(idx, rng, 1_000)),
+        Box::new(|idx, rng| decay_op(idx, rng, 10_000)),
+        Box::new(|idx, rng| decay_op(idx, rng, 100_000)),
     ]
 }
 
@@ -572,7 +587,7 @@ pub fn measurement_plan(fx: &Fixture, samples_per_bucket: usize) -> Vec<Workload
             plan.push(make(&idx, &mut rng));
         }
     }
-    plan
+    with_decay_restores(plan)
 }
 
 /// The instances-per-bucket a measurement plan needs to retain the floor after
@@ -633,7 +648,9 @@ pub fn mix_plan(fx: &Fixture, mix: Mix, ops_total: usize) -> Vec<WorkloadOp> {
             mutations_since_commit = 0;
         }
     }
-    plan
+    // Restores are inserted after assembly so each sits IMMEDIATELY after its
+    // decay — interleaving and the commit cadence can never separate a pair.
+    with_decay_restores(plan)
 }
 
 /// Build `n` ops by cycling through `makers` (bucket k gets every k-th slot), so
