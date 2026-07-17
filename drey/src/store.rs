@@ -83,6 +83,7 @@ impl Store {
         node_type: &NodeType,
         embedding_dim: Option<usize>,
     ) -> Result<()> {
+        validate_label(node_type.as_str(), Error::InvalidNodeType)?;
         let id = self.node_types.intern(node_type.as_str());
         match self.embedding_dim.get(&id) {
             Some(existing) if *existing != embedding_dim => Err(Error::InvalidNodeType(format!(
@@ -99,7 +100,7 @@ impl Store {
         }
     }
 
-    fn require_registered(&self, node_type: &NodeType) -> Result<u32> {
+    pub(crate) fn require_registered(&self, node_type: &NodeType) -> Result<u32> {
         self.node_types
             .get(node_type.as_str())
             .filter(|id| self.embedding_dim.contains_key(id))
@@ -114,13 +115,7 @@ impl Store {
         properties: Properties,
     ) -> Result<NodeId> {
         let type_id = self.require_registered(node_type)?;
-        for (k, v) in &properties {
-            if !v.is_valid() {
-                return Err(Error::InvalidPropertyValue(format!(
-                    "property {k:?} is not a valid v0.1 value"
-                )));
-            }
-        }
+        validate_properties(&properties)?;
         let id = self.next_node_id;
         self.next_node_id += 1;
 
@@ -184,13 +179,13 @@ impl Store {
         // property-update paths validate; edge creation must not be the one hole
         // through which an oversized String/Bytes/List (whose length the codec
         // prefixes with a u32) reaches the WAL/snapshot and corrupts it.
-        for (k, v) in &properties {
-            if !v.is_valid() {
-                return Err(Error::InvalidPropertyValue(format!(
-                    "property {k:?} is not a valid v0.1 value"
-                )));
-            }
-        }
+        validate_properties(&properties)?;
+        // A NaN/±inf weight is malformed input: it silently becomes a zero-cost
+        // edge in weighted shortest_path (f32::max(NaN, 0.0) == 0.0) and defeats
+        // the min_weight filter. Validated here — not only in the public API —
+        // so WAL replay and snapshot load pass through the same gate.
+        validate_weight(weight)?;
+        validate_label(edge_type.as_str(), Error::InvalidEdgeType)?;
         let type_id = self.edge_types.intern(edge_type.as_str());
         let id = self.next_edge_id;
         self.next_edge_id += 1;
@@ -212,12 +207,64 @@ impl Store {
     }
 
     pub(crate) fn set_edge_weight(&mut self, edge: EdgeId, weight: f32) -> Result<f32> {
+        // Store-side finiteness gate: `update_edge_weight` and `decay_edges`
+        // validate their computed results with richer messages first, but this
+        // is the backstop every path — including WAL replay — must pass.
+        validate_weight(weight)?;
         let rec = self
             .edges
             .get_mut(&edge.0)
             .ok_or(Error::EdgeNotFound(edge))?;
         rec.weight = weight;
         Ok(weight)
+    }
+
+    /// Apply a property patch to a node, validating the merged map before any
+    /// mutation. Shared by the public mutation API and WAL replay so both apply
+    /// identical semantics — a missing node is a typed error on both paths,
+    /// never a silent no-op.
+    pub(crate) fn update_node_properties(
+        &mut self,
+        node: NodeId,
+        patch: &BTreeMap<String, Option<Value>>,
+    ) -> Result<()> {
+        let old = self
+            .nodes
+            .get(&node.0)
+            .ok_or(Error::NodeNotFound(node))?
+            .properties
+            .clone();
+        let mut new = old.clone();
+        apply_patch(&mut new, patch);
+        validate_properties(&new)?;
+        self.reindex_node(node.0, &old, &new);
+        self.nodes.get_mut(&node.0).unwrap().properties = new;
+        Ok(())
+    }
+
+    /// Apply a property patch to an edge. Shared by the public API and WAL
+    /// replay (see [`Store::update_node_properties`]).
+    pub(crate) fn update_edge_properties(
+        &mut self,
+        edge: EdgeId,
+        patch: &BTreeMap<String, Option<Value>>,
+    ) -> Result<()> {
+        for (k, v) in patch {
+            validate_key(k)?;
+            if let Some(v) = v {
+                if !v.is_valid() {
+                    return Err(Error::InvalidPropertyValue(format!(
+                        "property {k:?} is not a valid v0.1 value"
+                    )));
+                }
+            }
+        }
+        let rec = self
+            .edges
+            .get_mut(&edge.0)
+            .ok_or(Error::EdgeNotFound(edge))?;
+        apply_patch(&mut rec.properties, patch);
+        Ok(())
     }
 
     pub(crate) fn remove_edge(&mut self, edge: EdgeId) -> Result<()> {
@@ -452,6 +499,57 @@ fn adj_remove(adj: &mut HashMap<u64, BTreeMap<u32, Vec<u64>>>, node: u64, etype:
             adj.remove(&node);
         }
     }
+}
+
+/// Validate a whole property map: every key within the codec's u32 length
+/// prefix, every value a well-formed v0.1 value. The single gate shared by
+/// node/edge creation, both property-update paths, WAL replay, and snapshot
+/// load — so no path can admit a value another path would reject.
+pub(crate) fn validate_properties(properties: &Properties) -> Result<()> {
+    for (k, v) in properties {
+        validate_key(k)?;
+        if !v.is_valid() {
+            return Err(Error::InvalidPropertyValue(format!(
+                "property {k:?} is not a valid v0.1 value"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The on-disk codec prefixes every string with a u32 length; a key longer
+/// than that would silently wrap the prefix and corrupt the WAL/snapshot.
+pub(crate) fn validate_key(key: &str) -> Result<()> {
+    if key.len() > u32::MAX as usize {
+        return Err(Error::InvalidPropertyValue(
+            "property key exceeds the u32 codec length limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Same u32-length-prefix ceiling for interned type labels (node and edge
+/// type names), which the snapshot persists as length-prefixed strings.
+/// `err` wraps the message in the caller's error category (node vs edge type).
+pub(crate) fn validate_label(label: &str, err: fn(String) -> Error) -> Result<()> {
+    if label.len() > u32::MAX as usize {
+        return Err(err(
+            "type label exceeds the u32 codec length limit".to_string()
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a non-finite edge weight (NaN/±inf): it would poison weighted
+/// shortest_path and the min_weight filter. Applied at the store so the live
+/// API, WAL replay, and snapshot load share one gate.
+pub(crate) fn validate_weight(weight: f32) -> Result<()> {
+    if !weight.is_finite() {
+        return Err(Error::InvalidPropertyValue(
+            "edge weight must be finite (not NaN or infinite)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Helper for property-patch application shared with the public API.

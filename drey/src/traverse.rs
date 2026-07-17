@@ -194,6 +194,7 @@ impl Graph {
 
     /// List a node's neighbors (PRD §9.3).
     pub fn neighbors(&self, node: NodeId, opts: NeighborOptions) -> Result<Vec<Neighbor>> {
+        crate::graph::validate_min_weight(opts.min_weight)?;
         if !self.store.nodes.contains_key(&node.0) {
             return Err(Error::NodeNotFound(node));
         }
@@ -225,6 +226,7 @@ impl Graph {
     /// to it for stack safety, so a graph deeper than 64 hops is out of scope for
     /// bounded traversal.
     pub fn traverse(&self, from: NodeId, mut opts: TraversalOptions) -> Result<Vec<Path>> {
+        crate::graph::validate_min_weight(opts.min_weight)?;
         if !self.store.nodes.contains_key(&from.0) {
             return Err(Error::NodeNotFound(from));
         }
@@ -309,6 +311,7 @@ impl Graph {
         to: NodeId,
         opts: ShortestPathOptions,
     ) -> Result<Option<Path>> {
+        crate::graph::validate_min_weight(opts.min_weight)?;
         if !self.store.nodes.contains_key(&from.0) {
             return Err(Error::NodeNotFound(from));
         }

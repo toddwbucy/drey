@@ -77,6 +77,7 @@ impl PropertyGraphRead for Graph {
         &'a self,
         filter: EdgeFilter,
     ) -> Result<Box<dyn Iterator<Item = EdgeId> + 'a>> {
+        crate::graph::validate_min_weight(filter.min_weight)?;
         let ids: Vec<EdgeId> = self
             .edges_matching(&filter)
             .into_iter()

@@ -39,6 +39,11 @@ pub enum Error {
     UnsupportedQuery(String),
     /// The persisted format version does not match this build.
     VersionMismatch { found: u32, supported: u32 },
+    /// The WAL belongs to a newer snapshot generation than the snapshot on
+    /// disk — the snapshot was replaced by an older copy (e.g. a backup
+    /// restore) or the files were read mid-rotation. Replaying would blend
+    /// mutations onto the wrong base image.
+    GenerationMismatch { wal_epoch: u64, snapshot_epoch: u64 },
     /// A file lock could not be acquired (concurrent writer).
     LockConflict(String),
 }
@@ -68,6 +73,16 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "format version mismatch: found {found}, this build supports {supported}"
+                )
+            }
+            Error::GenerationMismatch {
+                wal_epoch,
+                snapshot_epoch,
+            } => {
+                write!(
+                    f,
+                    "generation mismatch: WAL epoch {wal_epoch} is newer than snapshot epoch \
+                     {snapshot_epoch}; the snapshot is not the base this WAL was written against"
                 )
             }
             Error::LockConflict(m) => write!(f, "lock conflict: {m}"),

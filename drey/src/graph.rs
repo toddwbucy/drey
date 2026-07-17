@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use crate::config::GraphConfig;
 use crate::error::{Error, Result};
 use crate::mutation::{DecayReport, EdgeFilter, PropertyPatch, RemoveNodeMode, WeightUpdate};
-use crate::store::{apply_patch, Store};
+use crate::store::Store;
 use crate::types::{Edge, EdgeId, EdgeType, Embedding, Node, NodeId, NodeType, Properties};
 
 /// An embedded property graph (PRD §9). Single writer: mutations take `&mut
@@ -21,6 +21,15 @@ pub struct Graph {
     pub(crate) config: GraphConfig,
     /// The persistence backend, present when the graph is file-backed (M2).
     pub(crate) persist: Option<Box<dyn crate::persist::Persistence>>,
+    /// The durability epoch the graph was loaded at. Kept on the graph (not
+    /// only on the persistence backend) so a read-only open — which attaches
+    /// no backend — still stamps the true epoch into `export` images instead
+    /// of a fabricated 0.
+    pub(crate) loaded_epoch: u64,
+    /// The graph directory this handle was opened from, when file-backed
+    /// (including read-only opens). Lets `export` refuse destinations that
+    /// alias the live `wal.log` / `snapshot.bin` / `LOCK`.
+    pub(crate) origin_dir: Option<std::path::PathBuf>,
 }
 
 // `Graph` must stay `Send + Sync` — a consumer may move it between threads or
@@ -46,6 +55,8 @@ impl Graph {
             store,
             config,
             persist: None,
+            loaded_epoch: 0,
+            origin_dir: None,
         }
     }
 
@@ -72,23 +83,7 @@ impl Graph {
         embedding_dim: Option<usize>,
     ) -> Result<()> {
         self.ensure_writable()?;
-        // The codec prefixes the embedding vector with a u32 count, so a declared
-        // dimension beyond u32::MAX would be truncated on persist. Reject it
-        // unconditionally (independent of the optional config max).
-        if let Some(dim) = embedding_dim {
-            if dim > u32::MAX as usize {
-                return Err(Error::InvalidNodeType(format!(
-                    "embedding dim {dim} exceeds the u32 codec limit"
-                )));
-            }
-        }
-        if let (Some(max), Some(dim)) = (self.config.max_embedding_dim, embedding_dim) {
-            if dim > max {
-                return Err(Error::InvalidNodeType(format!(
-                    "embedding dim {dim} exceeds configured max {max}"
-                )));
-            }
-        }
+        validate_embedding_dim(&self.config, embedding_dim)?;
         self.store.register_node_type(&node_type, embedding_dim)?;
         self.log(Mutation::RegisterNodeType {
             node_type,
@@ -98,42 +93,35 @@ impl Graph {
 
     pub fn add_node(&mut self, node_type: NodeType, properties: Properties) -> Result<NodeId> {
         self.ensure_writable()?;
-        let id = self.store.add_node(&node_type, properties.clone())?;
-        self.log(Mutation::AddNode {
-            id,
-            node_type,
-            properties,
-        })?;
+        // Clone the payload for the WAL record only when a WAL exists: for an
+        // in-memory graph the clone would be built just to be dropped by `log`.
+        let logged = self.persist.is_some().then(|| properties.clone());
+        let id = self.store.add_node(&node_type, properties)?;
+        if let Some(properties) = logged {
+            self.log(Mutation::AddNode {
+                id,
+                node_type,
+                properties,
+            })?;
+        }
         Ok(id)
     }
 
     pub fn set_node_embedding(&mut self, node: NodeId, embedding: Embedding) -> Result<()> {
         self.ensure_writable()?;
-        self.store.set_node_embedding(node, embedding.0.clone())?;
-        self.log(Mutation::SetNodeEmbedding {
-            node,
-            embedding: embedding.0,
-        })
+        let logged = self.persist.is_some().then(|| embedding.0.clone());
+        self.store.set_node_embedding(node, embedding.0)?;
+        if let Some(embedding) = logged {
+            self.log(Mutation::SetNodeEmbedding { node, embedding })?;
+        }
+        Ok(())
     }
 
     pub fn update_node_properties(&mut self, node: NodeId, patch: PropertyPatch) -> Result<()> {
         self.ensure_writable()?;
-        let old = self
-            .store
-            .nodes
-            .get(&node.0)
-            .ok_or(Error::NodeNotFound(node))?
-            .properties
-            .clone();
-        let mut new = old.clone();
-        apply_patch(&mut new, &patch.0);
-        for (k, v) in &new {
-            if !v.is_valid() {
-                return Err(Error::InvalidPropertyValue(format!("property {k:?}")));
-            }
-        }
-        self.store.reindex_node(node.0, &old, &new);
-        self.store.nodes.get_mut(&node.0).unwrap().properties = new;
+        // Validation and application live in the store so WAL replay applies
+        // byte-identical semantics (same errors, same index maintenance).
+        self.store.update_node_properties(node, &patch.0)?;
         self.log(Mutation::UpdateNodeProperties {
             node,
             patch: patch.0,
@@ -156,26 +144,22 @@ impl Graph {
         properties: Properties,
     ) -> Result<EdgeId> {
         self.ensure_writable()?;
-        if !weight.is_finite() {
-            // A NaN/±inf weight is malformed input: it silently becomes a
-            // zero-cost edge in weighted shortest_path (f32::max(NaN, 0.0) == 0.0)
-            // and defeats the min_weight filter. Reject at the boundary, as the
-            // embedding path rejects non-finite components.
-            return Err(Error::InvalidPropertyValue(
-                "edge weight must be finite (not NaN or infinite)".into(),
-            ));
-        }
+        // Weight finiteness and property validity are enforced inside
+        // `Store::add_edge`, the gate shared with WAL replay and snapshot load.
+        let logged = self.persist.is_some().then(|| properties.clone());
         let id = self
             .store
-            .add_edge(from, to, &edge_type, weight, properties.clone())?;
-        self.log(Mutation::AddEdge {
-            id,
-            from,
-            to,
-            edge_type,
-            weight,
-            properties,
-        })?;
+            .add_edge(from, to, &edge_type, weight, properties)?;
+        if let Some(properties) = logged {
+            self.log(Mutation::AddEdge {
+                id,
+                from,
+                to,
+                edge_type,
+                weight,
+                properties,
+            })?;
+        }
         Ok(id)
     }
 
@@ -208,19 +192,8 @@ impl Graph {
 
     pub fn update_edge_properties(&mut self, edge: EdgeId, patch: PropertyPatch) -> Result<()> {
         self.ensure_writable()?;
-        // Validate patched values before mutating, mirroring
-        // `update_node_properties` so invalid values cannot be committed on edges.
-        for v in patch.0.values().flatten() {
-            if !v.is_valid() {
-                return Err(Error::InvalidPropertyValue("edge property".into()));
-            }
-        }
-        let rec = self
-            .store
-            .edges
-            .get_mut(&edge.0)
-            .ok_or(Error::EdgeNotFound(edge))?;
-        apply_patch(&mut rec.properties, &patch.0);
+        // Validation and application live in the store, shared with WAL replay.
+        self.store.update_edge_properties(edge, &patch.0)?;
         self.log(Mutation::UpdateEdgeProperties {
             edge,
             patch: patch.0,
@@ -243,6 +216,7 @@ impl Graph {
                 "decay factor must be finite (not NaN or infinite)".into(),
             ));
         }
+        validate_min_weight(filter.min_weight)?;
         let ids = self.edges_matching(&filter);
         let update = WeightUpdate::multiply(factor);
         // Compute and validate every result BEFORE mutating anything: a finite
@@ -343,6 +317,51 @@ impl Graph {
         }
         Ok(())
     }
+}
+
+/// Validate a declared embedding dimension against the codec's hard u32 limit
+/// and the config's optional ceiling. Shared by the live `register_node_type`
+/// and WAL replay / snapshot load, so a reopened graph is held to the same
+/// rules the mutation API enforces (a stricter `max_embedding_dim` at reopen
+/// is a typed error, not a silently retained over-limit type).
+pub(crate) fn validate_embedding_dim(
+    config: &GraphConfig,
+    embedding_dim: Option<usize>,
+) -> Result<()> {
+    if let Some(dim) = embedding_dim {
+        // The codec prefixes the embedding vector with a u32 count, so a declared
+        // dimension beyond u32::MAX would be truncated on persist. Reject it
+        // unconditionally (independent of the optional config max).
+        if dim > u32::MAX as usize {
+            return Err(Error::InvalidNodeType(format!(
+                "embedding dim {dim} exceeds the u32 codec limit"
+            )));
+        }
+        if let Some(max) = config.max_embedding_dim {
+            if dim > max {
+                return Err(Error::InvalidNodeType(format!(
+                    "embedding dim {dim} exceeds configured max {max}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a NaN `min_weight` filter value. NaN makes every `weight < min` /
+/// `weight >= min` comparison false, so the two filter surfaces silently
+/// disagree: traversal (`< min` → skip) would pass every edge while scans
+/// (`>= min` → keep) would pass none. Checked at every public entry that
+/// accepts a `min_weight` — traversal, shortest path, neighbors, similarity
+/// reachability, decay, and feature export. ±inf stays legal: both surfaces
+/// agree on it (`+inf` matches nothing, `-inf` matches everything).
+pub(crate) fn validate_min_weight(min_weight: Option<f32>) -> Result<()> {
+    if min_weight.is_some_and(f32::is_nan) {
+        return Err(Error::InvalidPropertyValue(
+            "min_weight must not be NaN".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The replayable unit of mutation. Every public mutation records exactly one

@@ -52,22 +52,25 @@ impl Interner {
 
     /// Reconstruct an interner from its persisted label vector, rebuilding the
     /// lookup index. Ids are the vector positions, so they match what was saved.
-    pub(crate) fn from_labels(labels: Vec<String>) -> Self {
+    ///
+    /// Duplicate labels are rejected: `intern` can never produce them, so a
+    /// duplicate proves a malformed (checksum-valid but hand-altered or buggy)
+    /// image. Accepting one would leave two live ids for one label with the
+    /// lookup map resolving only the later — collapsing distinct type ids on
+    /// every subsequent mutation.
+    pub(crate) fn from_labels(labels: Vec<String>) -> crate::error::Result<Self> {
         let mut it = Interner {
             labels,
             index: std::collections::HashMap::new(),
         };
-        it.rebuild_index();
-        it
-    }
-
-    /// Rebuild the `index` side after deserialization (the `labels` vector is
-    /// the persisted source of truth; the map is derived).
-    pub fn rebuild_index(&mut self) {
-        self.index.clear();
-        for (i, label) in self.labels.iter().enumerate() {
-            self.index.insert(label.clone(), i as u32);
+        for (i, label) in it.labels.iter().enumerate() {
+            if it.index.insert(label.clone(), i as u32).is_some() {
+                return Err(crate::error::Error::Codec(format!(
+                    "duplicate interned type label {label:?} in persisted image"
+                )));
+            }
         }
+        Ok(it)
     }
 }
 
@@ -88,12 +91,12 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_index_restores_lookups() {
-        let mut it = Interner::default();
-        it.intern("x");
-        it.intern("y");
-        it.index.clear(); // simulate a load that restored only `labels`
-        it.rebuild_index();
+    fn from_labels_restores_lookups_and_rejects_duplicates() {
+        let it = Interner::from_labels(vec!["x".into(), "y".into()]).unwrap();
         assert_eq!(it.get("y"), Some(1));
+        assert_eq!(it.label(0), Some("x"));
+        // A duplicate label proves a malformed image: two ids would share one
+        // label with lookups resolving only the later — reject at decode.
+        assert!(Interner::from_labels(vec!["x".into(), "x".into()]).is_err());
     }
 }

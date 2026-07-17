@@ -8,7 +8,7 @@
 //! scan over the type; the index is an optimization, not a correctness
 //! requirement.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::graph::Graph;
 use crate::types::{NodeId, NodeType, Scalar, ScalarKey};
 
@@ -51,15 +51,10 @@ impl ScalarPredicate {
 impl Graph {
     /// Resolve a node type to its interned id, or error if it is not registered.
     /// Shared by the type and property queries (and the similarity candidate
-    /// seed) so they stay in sync.
+    /// seed) so they stay in sync. Delegates to the store's gate so the query
+    /// and mutation sides can never drift on what "registered" means.
     pub(crate) fn resolve_registered_type(&self, node_type: &NodeType) -> Result<u32> {
-        self.store
-            .node_types
-            .get(node_type.as_str())
-            .filter(|id| self.store.embedding_dim.contains_key(id))
-            .ok_or_else(|| {
-                Error::InvalidNodeType(format!("node type {:?} not registered", node_type.as_str()))
-            })
+        self.store.require_registered(node_type)
     }
 
     /// All node ids of a registered type (PRD §9.3). Returns an empty vector,

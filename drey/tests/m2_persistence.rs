@@ -822,6 +822,10 @@ fn empty_committed_graph_roundtrips() {
     }
     let g = Graph::open(&dir, config()).unwrap();
     assert_eq!(g.counts(), (0, 0));
+    // The registration itself must survive replay: nodes_by_type errors on an
+    // unregistered type, so this would catch a silently no-op'd
+    // RegisterNodeType frame that the counts assertion alone cannot see.
+    assert_eq!(g.nodes_by_type(&person()).unwrap(), Vec::<NodeId>::new());
     // Degenerate reads on an empty graph must not panic.
     let sim = g
         .similar_nodes(drey::similarity::SimilarityQuery::new(
@@ -831,4 +835,350 @@ fn empty_committed_graph_roundtrips() {
         ))
         .unwrap();
     assert!(sim.is_empty());
+}
+
+// ---- Regression coverage: issue #22 + 2026-07 repo review ----
+
+#[test]
+fn mid_wal_corruption_in_acknowledged_batch_fails_open_without_truncation() {
+    // Issue #22 item 7: three committed batches; a bit flips inside batch 2's
+    // payload. Batch 3's bytes prove batch 2's fsync was acknowledged, so this
+    // is corruption of durable history — open must refuse with a typed error
+    // and must NOT truncate the later committed bytes away (the old behavior
+    // silently loaded batch 1 and destroyed batches 2–3 on the next open).
+    let dir = tmp("mid_wal_corruption");
+    let size_after_first;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap(); // batch 1
+        size_after_first = fs::metadata(dir.join("wal.log")).unwrap().len();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap(); // batch 2
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap(); // batch 3
+    }
+    // Flip the last payload byte of batch 2's first frame (length prefix intact).
+    let path = dir.join("wal.log");
+    let mut bytes = fs::read(&path).unwrap();
+    let off = size_after_first as usize;
+    let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+    bytes[off + 8 + len - 1] ^= 0xFF;
+    fs::write(&path, &bytes).unwrap();
+
+    match Graph::open(&dir, config()) {
+        Err(Error::Codec(m)) => assert!(m.contains("acknowledged"), "unexpected message: {m}"),
+        Err(other) => panic!("expected a Codec corruption error, got {other}"),
+        Ok(_) => panic!("open silently truncated acknowledged commits"),
+    }
+    // The failed open must not have repaired/truncated anything.
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "failed open must leave the WAL untouched"
+    );
+}
+
+#[test]
+fn corruption_in_final_batch_still_recovers_as_torn_commit() {
+    // The counterpart cell: damage confined to the FINAL batch with nothing
+    // after it is byte-indistinguishable from a torn, unacknowledged commit
+    // (the kernel may persist a batch's pages in any order before fsync
+    // returns), so recovery discards that batch instead of refusing — the
+    // long-standing crash-recovery contract.
+    let dir = tmp("final_batch_corruption");
+    let a;
+    let size_after_first;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        size_after_first = fs::metadata(dir.join("wal.log")).unwrap().len();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    let path = dir.join("wal.log");
+    let mut bytes = fs::read(&path).unwrap();
+    let off = size_after_first as usize;
+    let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+    bytes[off + 8 + len - 1] ^= 0xFF;
+    fs::write(&path, &bytes).unwrap();
+
+    let g = Graph::open(&dir, config()).unwrap();
+    assert_eq!(g.counts().0, 1);
+    assert!(g.node(a).unwrap().is_some());
+}
+
+#[test]
+fn restored_older_snapshot_beside_newer_wal_fails_open() {
+    // Issue #22 item 8: an operator restores snapshot.bin from a backup (epoch
+    // 1) next to the current epoch-2 WAL. Replaying epoch-2 frames onto the
+    // epoch-1 image would silently blend generations; open must refuse with a
+    // typed generation mismatch and mutate neither file.
+    let dir = tmp("older_snapshot_restore");
+    let epoch1_snapshot;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap(); // epoch 1
+        epoch1_snapshot = fs::read(dir.join("snapshot.bin")).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap(); // epoch 2; WAL re-headered at epoch 2
+    }
+    fs::write(dir.join("snapshot.bin"), &epoch1_snapshot).unwrap();
+    let wal_before = fs::read(dir.join("wal.log")).unwrap();
+
+    match Graph::open(&dir, config()) {
+        Err(Error::GenerationMismatch {
+            wal_epoch,
+            snapshot_epoch,
+        }) => {
+            assert_eq!((wal_epoch, snapshot_epoch), (2, 1));
+        }
+        Err(other) => panic!("expected GenerationMismatch, got {other}"),
+        Ok(_) => panic!("open silently blended two snapshot generations"),
+    }
+    assert_eq!(
+        fs::read(dir.join("wal.log")).unwrap(),
+        wal_before,
+        "failed open must not repair the WAL"
+    );
+    assert_eq!(
+        fs::read(dir.join("snapshot.bin")).unwrap(),
+        epoch1_snapshot,
+        "failed open must not touch the snapshot"
+    );
+}
+
+#[test]
+fn read_only_open_with_newer_wal_generation_fails_after_retries() {
+    // The same mismatch through the lock-free read-only path: the bounded
+    // rotation-retry re-reads a few times (a racing snapshot() resolves in one
+    // pass) and then surfaces the mismatch instead of serving blended state.
+    let dir = tmp("ro_generation_mismatch");
+    let epoch1_snapshot;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap(); // epoch 1
+        epoch1_snapshot = fs::read(dir.join("snapshot.bin")).unwrap();
+        g.snapshot().unwrap(); // epoch 2
+    }
+    fs::write(dir.join("snapshot.bin"), &epoch1_snapshot).unwrap();
+    match Graph::open(&dir, config().read_only()) {
+        Err(Error::GenerationMismatch { .. }) => {}
+        Err(other) => panic!("expected GenerationMismatch, got {other}"),
+        Ok(_) => panic!("read-only open served state from mismatched generations"),
+    }
+}
+
+#[test]
+fn missing_wal_beside_snapshot_fails_open() {
+    // The mirror of missing_snapshot_with_newer_wal: wal.log exists in every
+    // legitimate state once snapshot.bin does (create writes it first;
+    // snapshot() truncates in place, never unlinks), so its absence proves
+    // file loss. Opening at snapshot state would silently drop every
+    // post-snapshot commit.
+    let dir = tmp("missing_wal");
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap(); // post-snapshot commit that lives only in the WAL
+    }
+    fs::remove_file(dir.join("wal.log")).unwrap();
+    match Graph::open(&dir, config()) {
+        Err(Error::Storage(m)) => assert!(m.contains("wal.log is missing"), "unexpected: {m}"),
+        Err(other) => panic!("expected a storage error about the missing WAL, got {other}"),
+        Ok(_) => panic!("open silently dropped post-snapshot commits"),
+    }
+}
+
+#[test]
+fn torn_wal_reheader_after_snapshot_recovers_at_snapshot_state() {
+    // The legitimate crash window the missing-WAL refusal must NOT catch: a
+    // crash mid-way through snapshot()'s WAL re-header leaves wal.log torn
+    // below the 20-byte header. Everything is already folded into the new
+    // snapshot, so opening at snapshot state is exact recovery, not loss.
+    let dir = tmp("torn_reheader");
+    let a;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap();
+    }
+    let wal = dir.join("wal.log");
+    let bytes = fs::read(&wal).unwrap();
+    fs::write(&wal, &bytes[..7]).unwrap(); // torn mid-header
+
+    let c;
+    {
+        let mut g = Graph::open(&dir, config()).unwrap();
+        assert_eq!(g.counts().0, 1);
+        assert!(g.node(a).unwrap().is_some());
+        c = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    let g = Graph::open(&dir, config()).unwrap();
+    assert!(g.node(c).unwrap().is_some(), "post-recovery commit lost");
+}
+
+#[test]
+fn uncommitted_ids_are_reallocated_after_drop_without_commit() {
+    // Contract pin (documented in docs/specs/m2-durability.md): ids handed out
+    // for mutations that were never committed do NOT survive an uncommitted
+    // close — the allocator resumes from committed state, so the same id can
+    // be assigned to a different entity. Design commitment 5 ("ids survive
+    // close/reopen exactly") applies to COMMITTED entities; consumers must
+    // treat ids of uncommitted entities as invalidated by drop.
+    let dir = tmp("uncommitted_id_reuse");
+    let a;
+    let b_uncommitted;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        b_uncommitted = g.add_node(person(), props(&[])).unwrap();
+        // Drop without commit: b's mutation is discarded (see
+        // recovery_crash_before_commit_loses_uncommitted).
+    }
+    let mut g = Graph::open(&dir, config()).unwrap();
+    let c = g.add_node(person(), props(&[])).unwrap();
+    assert_ne!(c, a, "committed ids are never reused");
+    assert_eq!(
+        c, b_uncommitted,
+        "the uncommitted id returns to the allocator — the documented contract"
+    );
+}
+
+#[test]
+fn export_refuses_uncommitted_mutations_and_allows_after_commit() {
+    // export is the backup verb: an image must never disagree with what a
+    // reopen would load, so a dirty (appended-but-uncommitted) graph refuses.
+    let dir = tmp("export_dirty");
+    let mut g = Graph::create(dir.join("live"), config()).unwrap();
+    g.register_node_type(person(), None).unwrap();
+    g.add_node(person(), props(&[])).unwrap();
+    let dest = dir.join("backup.drey");
+    match g.export(&dest) {
+        Err(Error::Storage(m)) => assert!(m.contains("uncommitted"), "unexpected: {m}"),
+        Err(other) => panic!("expected a storage error about uncommitted state, got {other}"),
+        Ok(_) => panic!("export published uncommitted mutations"),
+    }
+    g.commit().unwrap();
+    g.export(&dest).unwrap();
+    let imported = Graph::import(&dest, config()).unwrap();
+    assert_eq!(imported.counts().0, 1);
+}
+
+#[test]
+fn export_refuses_destinations_aliasing_live_graph_files() {
+    // Issue #22 item 4: an export whose atomic rename lands on wal.log,
+    // snapshot.bin, or LOCK would replace a file the live writer holds open —
+    // failed recovery or lost commits. Direct paths, relative aliases, and
+    // (on Unix) hard links must all be refused; unrelated destinations still work.
+    let dir = tmp("export_alias");
+    let mut g = Graph::create(&dir, config()).unwrap();
+    g.register_node_type(person(), None).unwrap();
+    g.add_node(person(), props(&[])).unwrap();
+    g.commit().unwrap();
+    g.snapshot().unwrap(); // snapshot.bin now exists too
+
+    for reserved in ["wal.log", "snapshot.bin", "LOCK"] {
+        assert!(
+            g.export(dir.join(reserved)).is_err(),
+            "direct alias {reserved} must be refused"
+        );
+        // Relative alias through a subdirectory and `..`.
+        let dodge = dir.join("sub").join("..").join(reserved);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        assert!(
+            g.export(&dodge).is_err(),
+            "relative alias to {reserved} must be refused"
+        );
+    }
+    #[cfg(unix)]
+    {
+        let link = dir.join("innocent-name.bin");
+        fs::hard_link(dir.join("wal.log"), &link).unwrap();
+        assert!(
+            g.export(&link).is_err(),
+            "hard-link alias to wal.log must be refused"
+        );
+    }
+    // An unrelated destination — even inside the graph directory — still works.
+    g.export(dir.join("backup.drey")).unwrap();
+    assert!(Graph::import(dir.join("backup.drey"), config()).is_ok());
+}
+
+#[test]
+fn read_only_export_carries_the_true_epoch_not_zero() {
+    // A read-only open attaches no persister; export must still stamp the
+    // epoch the graph was loaded at. A fabricated epoch-0 image dropped in as
+    // a snapshot replacement beside a surviving epoch-N WAL would replay
+    // non-idempotent mutations the image already contains.
+    let dir = tmp("ro_export_epoch");
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap(); // epoch 1
+    }
+    let ro = Graph::open(&dir, config().read_only()).unwrap();
+    let dest = dir.join("ro-backup.drey");
+    ro.export(&dest).unwrap();
+    // The image epoch lives at bytes 8..16 (after magic + version), little-endian.
+    let bytes = fs::read(&dest).unwrap();
+    let epoch = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    assert_eq!(epoch, 1, "read-only export must carry the loaded epoch");
+}
+
+#[test]
+fn reopen_under_stricter_max_embedding_dim_fails_not_silently_retains() {
+    // Replay and snapshot load apply the same registration gates as the live
+    // API: a graph holding a dim-8 type refuses to open under a config that
+    // caps dims at 4, instead of silently retaining the over-limit type.
+    let strict = || GraphConfig {
+        max_embedding_dim: Some(4),
+        ..config()
+    };
+    // Via WAL replay (no snapshot).
+    let dir = tmp("strict_dim_wal");
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), Some(8)).unwrap();
+        g.commit().unwrap();
+    }
+    match Graph::open(&dir, strict()) {
+        Err(Error::InvalidNodeType(m)) => assert!(m.contains("exceeds"), "{m}"),
+        Err(other) => panic!("expected InvalidNodeType, got {other}"),
+        Ok(_) => panic!("over-limit type silently retained through WAL replay"),
+    }
+    // Via snapshot load.
+    let dir = tmp("strict_dim_snap");
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), Some(8)).unwrap();
+        g.commit().unwrap();
+        g.snapshot().unwrap();
+    }
+    match Graph::open(&dir, strict()) {
+        Err(Error::InvalidNodeType(m)) => assert!(m.contains("exceeds"), "{m}"),
+        Err(other) => panic!("expected InvalidNodeType, got {other}"),
+        Ok(_) => panic!("over-limit type silently retained through snapshot load"),
+    }
 }
