@@ -178,6 +178,21 @@ pub fn workload_filename(name: &str) -> String {
     format!("workload.{name}.jsonl")
 }
 
+/// Plan format version, stamped as the first line of every workload file and
+/// required by `read_workload`. The op schema alone cannot express semantic
+/// changes to what a plan measures: v1 plans (no header) predate the
+/// decay/restore pairing, so replaying one silently reintroduces the weight
+/// collapse the pairing fixed — the fix would appear shipped while every
+/// previously generated fixture kept the old behavior. Bump on any change
+/// that alters what existing plans measure, and `bench` refuses stale files
+/// instead of silently running them.
+pub const PLAN_VERSION: u32 = 2;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PlanHeader {
+    plan_version: u32,
+}
+
 /// Materialize a workload plan next to the fixture as `workload.<name>.jsonl`,
 /// one op per line in execution order (spec §3.6 — the workload is data, not
 /// code, so a run is reproducible from artifacts alone).
@@ -186,7 +201,13 @@ pub fn write_workload(
     name: &str,
     plan: &[crate::workload::WorkloadOp],
 ) -> Result<(), String> {
-    let bytes = canonical::jsonl(plan.iter()).into_bytes();
+    let header = serde_json::to_string(&PlanHeader {
+        plan_version: PLAN_VERSION,
+    })
+    .map_err(|e| e.to_string())?;
+    let mut bytes = header.into_bytes();
+    bytes.push(b'\n');
+    bytes.extend_from_slice(canonical::jsonl(plan.iter()).as_bytes());
     write_all(dir.join(workload_filename(name)), &bytes)
 }
 
@@ -194,7 +215,48 @@ pub fn write_workload(
 /// sequence rather than synthesizing a plan in process.
 pub fn read_workload(dir: &Path, name: &str) -> Result<Vec<crate::workload::WorkloadOp>, String> {
     let file = workload_filename(name);
-    parse_jsonl(&dir.join(&file)).map_err(|e| format!("{file}: {e}"))
+    let text = fs::read_to_string(dir.join(&file)).map_err(|e| format!("{file}: {e}"))?;
+    let mut lines = text.lines().enumerate();
+    let (_, first) = lines
+        .next()
+        .ok_or_else(|| format!("{file}: empty workload file"))?;
+    let header: PlanHeader = match serde_json::from_str(first) {
+        Ok(h) => h,
+        // Distinguish a genuine v1 file from a damaged v2 one: regeneration
+        // under the same seed now yields a semantically different plan (the
+        // reworked decay ops consume RNG draws on a different cadence), so an
+        // operator who regenerates for a merely-damaged header silently loses
+        // run-to-run comparability that restoring the file would keep.
+        Err(e) => {
+            if serde_json::from_str::<crate::workload::WorkloadOp>(first).is_ok() {
+                return Err(format!(
+                    "{file}: no plan_version header — this plan predates plan versioning (v1) \
+                     and would replay semantics this build no longer measures; regenerate \
+                     the fixture"
+                ));
+            }
+            return Err(format!(
+                "{file}: first line is neither a plan_version header nor a v1 op ({e}); \
+                 the file may be damaged — restore it from backup (preserves run-to-run \
+                 comparability) or regenerate the fixture"
+            ));
+        }
+    };
+    if header.plan_version != PLAN_VERSION {
+        return Err(format!(
+            "{file}: plan_version {} but this build requires {PLAN_VERSION}; \
+             regenerate the fixture",
+            header.plan_version
+        ));
+    }
+    let mut out = Vec::new();
+    for (i, line) in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push(serde_json::from_str(line).map_err(|e| format!("{file}: line {}: {e}", i + 1))?);
+    }
+    Ok(out)
 }
 
 fn parse_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {

@@ -155,7 +155,22 @@ impl WorkloadOp {
             WorkloadOp::PropertyRange { sel, .. } => format!("property_range:sel={sel}"),
             WorkloadOp::Similar { cand_target, .. } => format!("similar_nodes:cand={cand_target}"),
             WorkloadOp::UpdateEdgeWeight { .. } => "update_edge_weight".into(),
-            WorkloadOp::DecayEdges { batch, .. } => format!("decay_edges:batch={batch}"),
+            WorkloadOp::DecayEdges { batch, factor, .. } => {
+                if *factor > 1.0 {
+                    // Restores are cache-warm twins of the decay they follow
+                    // (identical filter, working set just touched), so their
+                    // timings must not blend into the budgeted decay
+                    // percentiles — the two documented m3-findings overruns
+                    // are decay buckets, and warm twins could flip them as a
+                    // measurement artifact. `budget_for` knows no
+                    // decay_restore class, so these rows report but never
+                    // pass/fail, and `plan_self_check` excludes them from the
+                    // §4.2.1 floor.
+                    format!("decay_restore:batch={batch}")
+                } else {
+                    format!("decay_edges:batch={batch}")
+                }
+            }
             WorkloadOp::Commit => "commit".into(),
         }
     }
@@ -489,6 +504,48 @@ fn decay_op(idx: &FixtureIndex, rng: &mut DetRng, batch: usize) -> WorkloadOp {
     }
 }
 
+/// The reciprocal restore for a decay op: same edge type, same batch label,
+/// inverse factor. `None` for anything that is not a decay.
+fn restore_for(op: &WorkloadOp) -> Option<WorkloadOp> {
+    match op {
+        WorkloadOp::DecayEdges {
+            edge_type,
+            factor,
+            batch,
+        } if *factor < 1.0 => Some(WorkloadOp::DecayEdges {
+            edge_type: edge_type.clone(),
+            factor: 1.0 / *factor,
+            batch: *batch,
+        }),
+        _ => None,
+    }
+}
+
+/// Pair every decay with an immediate reciprocal restore of the same edge
+/// type, inserted as plan **structure** (like the Commit cadence). Without
+/// restores, a plan's thousands of decays compound and weights collapse
+/// toward zero, so later min_weight-filtered reads and weighted paths
+/// measure a degenerate graph (2026-07 repo review). The restore being the
+/// *very next op* is what makes the bound exact: no other maker can stack a
+/// second decay on the type and no interleaved `Set` can land inside the
+/// window (re-review round 1). Restores land in their own unbudgeted
+/// `decay_restore:` bucket — see [`WorkloadOp::bucket`] — so their cache-warm
+/// timings never blend into the budgeted decay percentiles (re-review
+/// round 2). Used directly by `measurement_plan`; `mix_plan` inserts
+/// restores inline during assembly so its commit-window accounting can count
+/// them.
+fn with_decay_restores(plan: Vec<WorkloadOp>) -> Vec<WorkloadOp> {
+    let mut out = Vec::with_capacity(plan.len() * 2);
+    for op in plan {
+        let restore = restore_for(&op);
+        out.push(op);
+        if let Some(restore) = restore {
+            out.push(restore);
+        }
+    }
+    out
+}
+
 /// The read-class makers (one per budget-table read bucket).
 fn read_makers() -> Vec<Maker> {
     let mut v: Vec<Maker> = vec![
@@ -552,7 +609,7 @@ pub fn measurement_plan(fx: &Fixture, samples_per_bucket: usize) -> Vec<Workload
             plan.push(make(&idx, &mut rng));
         }
     }
-    plan
+    with_decay_restores(plan)
 }
 
 /// The instances-per-bucket a measurement plan needs to retain the floor after
@@ -607,7 +664,22 @@ pub fn mix_plan(fx: &Fixture, mix: Mix, ops_total: usize) -> Vec<WorkloadOp> {
         if op.is_mutation() {
             mutations_since_commit += 1;
         }
+        // A decay's reciprocal restore goes in as the immediately following
+        // op, *inside* the cadence accounting: restores execute as real
+        // mutations, so they count toward the 1,000-mutation commit window —
+        // otherwise a "1,000-mutation" commit batch would actually carry up
+        // to ~1,750 executed mutations and every M2 commit-latency sample
+        // would measure an undeclared batch size (re-review round 2). The
+        // pair stays adjacent because the window check runs after both are
+        // pushed. Note the executed op mix therefore carries one extra
+        // decay-class op per drawn decay beyond the §4.2 shares — restores
+        // are plan structure, reported in their own unbudgeted bucket.
+        let restore = restore_for(&op);
         plan.push(op);
+        if let Some(restore) = restore {
+            mutations_since_commit += 1;
+            plan.push(restore);
+        }
         if mutations_since_commit >= 1_000 {
             plan.push(WorkloadOp::Commit);
             mutations_since_commit = 0;
