@@ -129,6 +129,12 @@ pub struct DreyDriver {
     /// Seed embedding resolved by `prepare_op` for the next `Similar` op,
     /// keyed by the fixture seed id it was resolved for.
     seed_cache: Option<(u64, Embedding)>,
+    /// Actual scored-candidate counts per Similar filter shape, measured
+    /// untimed (once per shape) so the reported `candidates` counter reflects
+    /// what the measured query really examined rather than echoing the
+    /// plan's precomputed constant — making the drey/naive/plan three-way
+    /// counter agreement a real cross-validation.
+    candidates_cache: HashMap<String, u64>,
 }
 
 impl DreyDriver {
@@ -138,6 +144,7 @@ impl DreyDriver {
             node_map: HashMap::new(),
             edge_map: HashMap::new(),
             seed_cache: None,
+            candidates_cache: HashMap::new(),
         }
     }
     fn g(&self) -> &Graph {
@@ -176,6 +183,48 @@ impl Default for DreyDriver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The similarity query a `Similar` op composes — one builder shared by the
+/// timed `run_op` execution and `prepare_op`'s untimed candidate count, so
+/// the two can never drift.
+fn similar_query(
+    emb: Embedding,
+    k: usize,
+    node_types: &[String],
+    prop_filter: &Option<(String, PropVal)>,
+) -> SimilarityQuery {
+    let property_filter = prop_filter.as_ref().map(|(pk, pv)| PropertyQuery {
+        node_type: NodeType::new(node_types.first().cloned().unwrap_or_default()),
+        key: pk.clone(),
+        predicate: ScalarPredicate::Eq(scalar(pv)),
+    });
+    SimilarityQuery {
+        node_types: Some(
+            node_types
+                .iter()
+                .map(|t| NodeType::new(t.clone()))
+                .collect(),
+        ),
+        property_filter,
+        // The plan's cand_target sweep defines the scan size being measured;
+        // the crate's scan ceiling (which bounds candidates PROBED, not
+        // vectors scored) must not clip it. At stress scale the 10k sweep
+        // point composes ~104k probed candidates — over the default 100k
+        // ceiling — and without this the whole bench run aborts.
+        allow_full_scan: true,
+        ..SimilarityQuery::new(emb, SimilarityMetric::Cosine, k)
+    }
+}
+
+/// Cache key for a Similar op's filter shape (candidate counts depend on the
+/// filters and the query dimension, not on which seed node asks).
+fn similar_shape_key(
+    dim: usize,
+    node_types: &[String],
+    prop_filter: &Option<(String, PropVal)>,
+) -> String {
+    format!("{dim}|{node_types:?}|{prop_filter:?}")
 }
 
 impl GraphDriver for DreyDriver {
@@ -258,8 +307,32 @@ impl GraphDriver for DreyDriver {
 
     fn prepare_op(&mut self, op: &WorkloadOp) -> Result<(), String> {
         self.seed_cache = None;
-        if let WorkloadOp::Similar { seed_node, .. } = op {
+        if let WorkloadOp::Similar {
+            seed_node,
+            node_types,
+            prop_filter,
+            ..
+        } = op
+        {
             let emb = self.resolve_seed_embedding(*seed_node)?;
+            // Untimed actual-candidate count, once per filter shape: a
+            // k=usize::MAX run returns every scored candidate. Cached by
+            // shape so timed samples do not routinely run behind a
+            // same-shape cache-warming scan (only the first sample per shape
+            // does, and the per-bucket warmup discard absorbs it).
+            let key = similar_shape_key(emb.dim(), node_types, prop_filter);
+            if !self.candidates_cache.contains_key(&key) {
+                let all = self
+                    .g()
+                    .similar_nodes(similar_query(
+                        emb.clone(),
+                        usize::MAX,
+                        node_types,
+                        prop_filter,
+                    ))
+                    .map_err(|e| e.to_string())?;
+                self.candidates_cache.insert(key, all.len() as u64);
+            }
             self.seed_cache = Some((*seed_node, emb));
         }
         Ok(())
@@ -376,36 +449,22 @@ impl GraphDriver for DreyDriver {
                     Some((cached_for, emb)) if cached_for == *seed_node => emb,
                     _ => self.resolve_seed_embedding(*seed_node)?,
                 };
-                // Compose the type filter (one or more types) and an optional
-                // property filter so the scan is bounded to the sweep target
-                // (spec §4.1). The realized candidate count is carried in the op
-                // and reported here without re-scanning inside the timed region.
-                let property_filter = prop_filter.as_ref().map(|(pk, pv)| PropertyQuery {
-                    node_type: NodeType::new(node_types.first().cloned().unwrap_or_default()),
-                    key: pk.clone(),
-                    predicate: ScalarPredicate::Eq(scalar(pv)),
-                });
-                let query = SimilarityQuery {
-                    node_types: Some(
-                        node_types
-                            .iter()
-                            .map(|t| NodeType::new(t.clone()))
-                            .collect(),
-                    ),
-                    property_filter,
-                    // The plan's cand_target sweep defines the scan size being
-                    // measured; the crate's scan ceiling (which now bounds
-                    // candidates PROBED, not vectors scored) must not clip it.
-                    // At stress scale the 10k sweep point composes ~104k
-                    // probed candidates — over the default 100k ceiling — and
-                    // without this the whole bench run aborts.
-                    allow_full_scan: true,
-                    ..SimilarityQuery::new(emb, SimilarityMetric::Cosine, *k)
-                };
+                // The `candidates` counter is the ACTUAL scored-candidate
+                // count, measured untimed by prepare_op (cached per filter
+                // shape) — not the plan's precomputed constant, which would
+                // make the drey/naive counter agreement vacuous. Fallback to
+                // the plan constant only if run without prepare.
+                let shape = similar_shape_key(emb.dim(), node_types, prop_filter);
+                let actual = self
+                    .candidates_cache
+                    .get(&shape)
+                    .copied()
+                    .unwrap_or(*candidates);
+                let query = similar_query(emb, *k, node_types, prop_filter);
                 let hits = self.g().similar_nodes(query).map_err(|e| e.to_string())?;
                 Ok(OpOutcome::ok(c(&[
                     ("results", hits.len() as u64),
-                    ("candidates", *candidates),
+                    ("candidates", actual),
                 ])))
             }
             WorkloadOp::UpdateEdgeWeight {
