@@ -931,6 +931,77 @@ fn corrupt_commit_marker_fails_open_not_silent_batch_merge() {
 }
 
 #[test]
+fn corrupt_final_marker_with_bytes_after_fails_open() {
+    // Re-review round 2, finding 1: the FINAL marker is the most likely tear
+    // victim (the next append's shared-block write lands on its block), and
+    // the round-1 classifier only examined frames strictly before the last
+    // TRUSTED marker — so a corrupt final marker with acknowledgment-proving
+    // bytes after it was silently truncated. Two layouts:
+    // (a) [m0][M1][m2][M2*][fragment] — a trusted earlier marker exists;
+    // (b) [m0][M1*][fragment] — no trusted marker survives at all.
+    for (name, batches) in [("with_prior_marker", 2usize), ("only_marker", 1usize)] {
+        let dir = tmp(&format!("final_marker_{name}"));
+        {
+            let mut g = Graph::create(&dir, config()).unwrap();
+            g.register_node_type(person(), None).unwrap();
+            for _ in 0..batches {
+                g.add_node(person(), props(&[])).unwrap();
+                g.commit().unwrap();
+            }
+        }
+        let path = dir.join("wal.log");
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1; // the final marker's 1-byte payload
+        bytes[last] ^= 0xFF;
+        // Acknowledgment evidence: a torn fragment of the next append.
+        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]);
+        fs::write(&path, &bytes).unwrap();
+
+        match Graph::open(&dir, config()) {
+            Err(Error::Codec(m)) => {
+                assert!(m.contains("acknowledged"), "({name}) unexpected: {m}")
+            }
+            Err(other) => panic!("({name}) expected Codec corruption error, got {other}"),
+            Ok(g) => panic!(
+                "({name}) open succeeded with {} nodes — acknowledged final batch truncated",
+                g.counts().0
+            ),
+        }
+    }
+}
+
+#[test]
+fn corrupt_final_marker_at_eof_recovers_as_torn_commit() {
+    // The counterpart guard (the over-refusal direction): a corrupt final
+    // marker with NOTHING after it is byte-indistinguishable from a torn
+    // commit whose marker page landed as garbage — recovery discards that
+    // batch and loads the prior state, it must not refuse.
+    let dir = tmp("final_marker_eof");
+    let a;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        a = g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    let path = dir.join("wal.log");
+    let mut bytes = fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF; // final marker payload garbled, nothing after
+    fs::write(&path, &bytes).unwrap();
+
+    let g = Graph::open(&dir, config()).unwrap();
+    assert_eq!(
+        g.counts().0,
+        1,
+        "torn final commit must be discarded, not refused"
+    );
+    assert!(g.node(a).unwrap().is_some());
+}
+
+#[test]
 fn torn_fragment_after_damaged_final_batch_fails_open() {
     // Review follow-up (finding 2): raw bytes past the damaged batch's marker
     // prove its fsync was acknowledged even when they are a torn fragment the

@@ -441,9 +441,12 @@ impl Graph {
     /// our read and our lock, and the post-lock WAL repair would then truncate
     /// its acknowledged commit away.
     ///
-    /// A **read-only** open takes no lock (PRD §9.1), so it instead verifies
-    /// the snapshot generation was stable across its reads and retries a
-    /// bounded number of times when it observes a concurrent rotation.
+    /// A **read-only** open takes no lock (PRD §9.1). Every state its reads
+    /// can capture is internally consistent (an equal-epoch snapshot+WAL
+    /// pair, or a stale-skipped snapshot alone) but may be one rotation
+    /// stale; reads racing a rotation or a writable open's WAL repair can
+    /// surface as a generation mismatch or a corruption classification, so
+    /// those retry a bounded number of times before the error stands.
     pub fn open(path: impl AsRef<Path>, config: GraphConfig) -> Result<Self> {
         let dir = path.as_ref().to_path_buf();
         if !dir.join(SNAPSHOT_FILE).exists() && !dir.join(WAL_FILE).exists() {
@@ -471,7 +474,16 @@ impl Graph {
                         graph.origin_dir = Some(dir);
                         return Ok(graph);
                     }
-                    Err(e @ Error::GenerationMismatch { .. }) => last_err = Some(e),
+                    // Codec errors retry too, not only generation mismatches:
+                    // a lock-free read racing a writable open's WAL repair
+                    // (shrink + re-append at reused offsets) can capture a
+                    // blended byte sequence that classifies as corruption. A
+                    // benign blend loads cleanly on re-read; genuine
+                    // corruption fails identically every time and surfaces
+                    // after the bounded retries.
+                    Err(e @ (Error::GenerationMismatch { .. } | Error::Codec(_))) => {
+                        last_err = Some(e)
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -536,9 +548,10 @@ impl Graph {
             )));
         }
         // Recovery-matrix cell: a snapshot with no WAL beside it. `create`
-        // writes the WAL before any commit and `snapshot` truncates it in
-        // place (never unlinks), so in every legitimate state — including
-        // every crash window — wal.log exists whenever snapshot.bin does. Its
+        // writes the WAL before any commit and every later reset atomically
+        // renames a fresh header over it (`reset_wal` — the file is replaced,
+        // never unlinked), so in every legitimate state — including every
+        // crash window — wal.log exists whenever snapshot.bin does. Its
         // absence proves file loss; opening at snapshot state would silently
         // drop every post-snapshot commit (PRD §10.2.1: never a silent
         // partial load). The mirror cell (WAL present, snapshot missing) is
@@ -934,10 +947,16 @@ fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalRep
             break; // torn payload at EOF (or a corrupt length driving past it)
         };
         let payload = &bytes[start..end];
+        // A zero-length frame is structural damage, not a valid frame: no
+        // writer emits one (every real payload carries at least a tag byte),
+        // but a zeroed torn page parses as a run of them — len=0, stored CRC
+        // 0, and crc32(b"") == 0, so they self-validate. Without this they
+        // would sail through classification and turn a plain torn-tail power
+        // loss into a permanent phase-3 decode refusal.
         frames.push(RawFrame {
             payload,
             end,
-            crc_ok: crc32(payload) == crc,
+            crc_ok: len != 0 && crc32(payload) == crc,
         });
         pos = end;
     }
@@ -954,43 +973,61 @@ fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalRep
     // (`None` = no committed batch survives).
     let mut apply_through: Option<usize> = markers.last().copied();
     let mut valid_len = apply_through.map_or(WAL_HEADER_LEN, |i| frames[i].end);
-    if let Some(&last) = markers.last() {
-        // Every CRC-bad frame before the last trustworthy marker matters, not
-        // just the first: the confined-torn-commit escape below is only sound
-        // if NONE of the damaged frames could hide a batch boundary.
-        let bad: Vec<usize> = (0..last).filter(|&i| !frames[i].crc_ok).collect();
-        if !bad.is_empty() {
-            // A commit marker is the only 1-byte payload `commit()` ever
-            // writes, so a CRC-bad frame of exactly that size is a damaged
-            // *marker*: its batch's boundary is unknowable, and the
-            // trustworthy marker after it proves a later batch — and
-            // therefore this one's fsync — was acknowledged. Treating it as
-            // an ordinary mutation frame would merge two batches and let the
-            // discard branch below truncate acknowledged history.
-            let possible_marker = bad.iter().any(|&i| frames[i].payload.len() == 1);
-            // A mutation-sized bad frame's batch ends at the first
-            // trustworthy marker at/after it. RAW bytes past that marker —
-            // parsed frames and torn fragments alike; the fsync-barrier
-            // argument does not care whether they frame cleanly — prove the
-            // batch's fsync returned.
-            let first_bad = bad[0];
-            let batch_marker = *markers
-                .iter()
-                .find(|&&m| m >= first_bad)
-                .expect("a marker follows every frame before the last marker");
-            let bytes_after_batch = bytes.len() > frames[batch_marker].end;
-            if possible_marker || batch_marker != last || bytes_after_batch {
-                return Err(Error::Codec(format!(
-                    "WAL frame at byte offset {} fails its CRC inside an acknowledged commit \
-                     (fsync barrier proves the batch was durable); refusing to truncate \
-                     committed history — restore from a snapshot/export instead",
-                    frames[first_bad].end - frames[first_bad].payload.len() - 8,
-                )));
+
+    // Every damaged frame is judged by evidence AFTER its own batch — raw
+    // bytes, parsed or torn-fragment alike (the fsync-barrier argument does
+    // not care whether they frame cleanly), because a later batch's bytes
+    // reach the file only after this batch's fsync returned. The loop
+    // deliberately covers frames at and beyond the last trusted marker, and
+    // the no-trusted-marker-at-all case: a corrupted FINAL marker with
+    // acknowledgment-proving bytes after it is the most physically likely
+    // damage site of all — the shared-block tear of the *next* append lands
+    // exactly there.
+    for (i, frame) in frames.iter().enumerate() {
+        if frame.crc_ok {
+            continue;
+        }
+        let refuse = if frame.payload.len() == 1 {
+            // Marker-sized: a commit marker is the only 1-byte payload
+            // `commit()` writes, so treat this as a damaged marker whose
+            // batch ends HERE — any raw bytes beyond it are later writes.
+            // (The benign alternative — torn-write garbage that happens to
+            // encode len == 1 and realign the scan on the very next frame —
+            // needs a ~2^-32 length-prefix coincidence, where a damaged real
+            // marker needs one ordinary bit flip. Refusal is the safe side
+            // and overwhelmingly the likely truth; the residual over-refusal
+            // is recoverable by an operator, silent truncation is not.)
+            bytes.len() > frame.end
+        } else {
+            // Mutation-sized: its batch ends at the first trusted marker at
+            // or after it. No such marker → an unterminated trailing batch —
+            // torn tail, never applied, nothing to refuse. Note the marker's
+            // own presence proves only that the write reached disk, not that
+            // its fsync returned — so evidence must lie beyond the MARKER,
+            // not merely beyond the damaged frame.
+            match markers.iter().find(|&&m| m >= i) {
+                Some(&m) => bytes.len() > frames[m].end,
+                None => false,
             }
-            // Damage confined to mutation frames of the final complete batch,
-            // with nothing at all after its marker: indistinguishable from a
-            // torn unacknowledged commit (pages of one write may persist in
-            // any order). Discard the batch — apply through the prior marker.
+        };
+        if refuse {
+            return Err(Error::Codec(format!(
+                "WAL frame at byte offset {} fails its CRC inside an acknowledged commit \
+                 (fsync barrier proves the batch was durable); refusing to truncate \
+                 committed history — restore from a snapshot/export instead",
+                frame.end - frame.payload.len() - 8,
+            )));
+        }
+    }
+    // Damage that survives the loop is confined to the final complete batch
+    // (whose marker is the last thing in the file) or to the unacknowledged
+    // tail after the last trusted marker. Tail damage needs no action — those
+    // frames are never applied. Damage inside the final complete batch means
+    // a torn, unacknowledged commit whose marker page persisted (pages of one
+    // write may land in any order): discard that batch, apply through the
+    // prior marker.
+    if let Some(&last) = markers.last() {
+        if frames[..last].iter().any(|f| !f.crc_ok) {
             apply_through = markers.len().checked_sub(2).map(|i| markers[i]);
             valid_len = apply_through.map_or(WAL_HEADER_LEN, |i| frames[i].end);
         }
@@ -1535,7 +1572,10 @@ fn load_snapshot(
             .map_err(|_| Error::Codec(format!("node count {n} does not fit in usize")))?,
         17,
     )?;
-    store.nodes.reserve(n);
+    store
+        .nodes
+        .try_reserve(n)
+        .map_err(|e| Error::Codec(format!("snapshot node table reservation failed: {e}")))?;
     let mut max_node_id: Option<u64> = None;
     for _ in 0..n {
         let id = r.u64()?;
@@ -1593,7 +1633,10 @@ fn load_snapshot(
             .map_err(|_| Error::Codec(format!("edge count {n} does not fit in usize")))?,
         36,
     )?;
-    store.edges.reserve(n);
+    store
+        .edges
+        .try_reserve(n)
+        .map_err(|e| Error::Codec(format!("snapshot edge table reservation failed: {e}")))?;
     let mut max_edge_id: Option<u64> = None;
     for _ in 0..n {
         let id = r.u64()?;
@@ -2216,6 +2259,71 @@ mod tests {
             1.0,
             "the NaN filter matched nothing historically; replay must preserve that"
         );
+    }
+
+    #[test]
+    fn zeroed_torn_pages_recover_when_unacknowledged_and_refuse_when_acked() {
+        // Re-review round 2, finding 3: a zeroed torn page parses as a run of
+        // CRC-valid len=0 frames (stored crc 0 == crc32(b"")), which round-1
+        // classification passed straight to phase 3 — turning a plain torn
+        // power loss into a permanent decode refusal. len==0 frames are now
+        // structural damage.
+        let reg = Mutation::RegisterNodeType {
+            node_type: person(),
+            embedding_dim: None,
+        };
+        let add = |id: u64| Mutation::AddNode {
+            id: NodeId(id),
+            node_type: person(),
+            properties: no_props(),
+        };
+        let frame_of = |m: &Mutation| {
+            let mut w = Writer::default();
+            w.u8(TAG_MUTATION);
+            write_mutation(&mut w, m);
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &w.buf).unwrap();
+            buf
+        };
+        let marker = {
+            let mut w = Writer::default();
+            w.u8(TAG_COMMIT);
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &w.buf).unwrap();
+            buf
+        };
+
+        // Case A — torn single commit: [reg][16 zero bytes][marker], nothing
+        // after. The zeros are two len=0 pseudo-frames inside the final
+        // batch; recovery must discard the batch (nothing was acknowledged),
+        // not refuse and not brick in phase 3.
+        let dir = tmp("zeroed_torn");
+        fs::create_dir_all(&dir).unwrap();
+        let mut wal = wal_header(0).to_vec();
+        wal.extend_from_slice(&frame_of(&reg));
+        wal.extend_from_slice(&[0u8; 16]);
+        wal.extend_from_slice(&marker);
+        fs::write(dir.join(WAL_FILE), &wal).unwrap();
+        let g = Graph::open(&dir, GraphConfig::default())
+            .unwrap_or_else(|e| panic!("zeroed torn commit must recover, got {e}"));
+        assert_eq!(g.counts(), (0, 0), "the torn batch must be discarded");
+
+        // Case B — the same zero run with a later committed batch after it:
+        // the zeros sit in acknowledged territory and must refuse.
+        let dir = tmp("zeroed_acked");
+        fs::create_dir_all(&dir).unwrap();
+        let mut wal = wal_header(0).to_vec();
+        wal.extend_from_slice(&frame_of(&reg));
+        wal.extend_from_slice(&[0u8; 16]);
+        wal.extend_from_slice(&marker);
+        wal.extend_from_slice(&frame_of(&add(0)));
+        wal.extend_from_slice(&marker);
+        fs::write(dir.join(WAL_FILE), &wal).unwrap();
+        match Graph::open(&dir, GraphConfig::default()) {
+            Err(Error::Codec(m)) => assert!(m.contains("acknowledged"), "{m}"),
+            Err(other) => panic!("expected Codec refusal, got {other}"),
+            Ok(_) => panic!("zeroed frames in acknowledged territory loaded silently"),
+        }
     }
 
     #[test]

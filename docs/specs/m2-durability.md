@@ -102,32 +102,45 @@ the structure:
   frame. On replay, only fully committed batches apply. Frame payloads ≥ 4 GiB
   are rejected at write time (the length prefix is u32).
 
-  **Torn tail vs. corruption (issue #22 item 7):** damage is classified by
-  where it sits relative to the fsync barriers commits create - batch N+1's
-  bytes exist on disk only if batch N's fsync returned. Damage confined to
-  mutation-sized frames of the *final* batch, with nothing at all after its
-  marker, is indistinguishable from a torn unacknowledged commit and is
-  discarded/truncated: crash recovery. Open refuses with a typed `Codec`
-  error - leaving the file untouched - when a CRC-bad frame has **raw bytes**
-  (parsed frames or torn fragments alike) after its batch's commit marker, or
-  when the damaged frame is **marker-sized** (a 1-byte payload is the only
-  thing `commit()` writes at that size): a damaged marker makes its batch
-  boundary unknowable, and treating it as a mutation frame would merge two
-  batches and truncate acknowledged history.
+  **Torn tail vs. corruption (issue #22 item 7):** every damaged frame is
+  judged by evidence *after its own batch* - raw bytes, parsed or
+  torn-fragment alike - because batch N+1's bytes exist on disk only if
+  batch N's fsync returned. A **marker-sized** damaged frame (1-byte payload
+  - the only size `commit()` writes for a marker) is a damaged commit
+  marker whose batch ends at that frame: any raw bytes beyond it refuse. A
+  **mutation-sized** damaged frame's batch ends at the first trusted marker
+  at/after it: raw bytes beyond that *marker* refuse (the marker's own
+  presence proves the write reached disk, not that its fsync returned). This
+  covers the final marker - the most likely tear victim, since the next
+  append's shared-block write lands on its block - and the
+  no-surviving-marker case. Zero-length frames are structural damage (no
+  writer emits them; a zeroed torn page parses as a self-validating run of
+  them since `crc32("") == 0`). Damage that no evidence condemns is a torn,
+  unacknowledged commit: the final batch (or tail) is discarded/truncated -
+  crash recovery. Refusals leave the file untouched.
   The repair truncation is in-place (`set_len`), so the discarded
   unacknowledged tail is not preserved; copy `wal.log` aside before a
   writable open if the torn tail has forensic value.
-  Known limit: damage to a frame's *length prefix* mid-file can derail the
-  structural scan itself, in which case everything beyond it is unreachable
-  and treated as torn tail; distinguishing that would require per-frame
-  sequence numbers (a format change - revisit if it ever bites).
+  Known limit - length prefixes are outside the frame CRC, so prefix damage
+  has two forms: scan *derailment* (everything beyond is unreachable and
+  treated as torn tail), and - rarer, needing the mutated length to land
+  exactly on a later frame boundary - clean *realignment* that swallows a
+  following frame and can classify acknowledged damage as a torn final
+  commit, silently truncating it. Both forms close only by covering the
+  prefix in the frame CRC or adding per-frame sequence numbers - format
+  changes deferred (this branch deliberately ships format-compatible);
+  revisit at the next FORMAT_VERSION bump.
   Threat-model note: appending batch N+1 rewrites the final filesystem block
   shared with batch N's fsynced tail, so on media without powersafe
   overwrite (SQLite's `POWERSAFE_OVERWRITE` concern) an ordinary power loss
   can corrupt acknowledged bytes in that shared block - which this
   classifier will then refuse as corruption (or, if the tear hits N's
   marker, refuse as a damaged marker). The refusal is the safe outcome, but
-  on such media it can follow a plain crash, not just bit rot.
+  on such media it can follow a plain crash, not just bit rot. A further
+  footnote on the same media class: the in-place `set_len` repair leaves
+  discarded frame bytes beyond the shrunken length, and markers carry no
+  batch sequence - a later same-length tear could in principle resurrect a
+  stale marker; multiply-coincidental, recorded for completeness.
 
   **Replay compatibility:** one pre-hardening artifact is tolerated rather
   than refused - `DecayEdges` frames whose filter carries a NaN
@@ -202,8 +215,10 @@ reading either persistence file - read-then-lock was a TOCTOU where a
 concurrent writer's commit, landed between the read and the lock, was
 truncated away by the post-lock WAL repair. Read-only opens take no lock;
 when their reads race a snapshot rotation they observe a WAL one generation
-ahead of the snapshot, and retry a bounded number of times before surfacing
-the typed error. Every state a pass *can* load is internally consistent (an
+ahead of the snapshot, and a read racing a writable open's WAL repair can
+capture a byte blend that classifies as corruption; both retry a bounded
+number of times before the typed error stands (a benign blend loads cleanly
+on re-read; genuine corruption fails identically every time). Every state a pass *can* load is internally consistent (an
 equal-epoch snapshot+WAL pair, or a stale-skipped snapshot alone); the
 read-only guarantee is consistency, not freshness - a load racing a rotation
 may serve committed state up to one rotation old, which is inherent to
