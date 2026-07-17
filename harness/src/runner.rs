@@ -36,6 +36,9 @@ pub fn run(
 
     for op in plan {
         let key = op.bucket();
+        // Pre-timing setup (e.g. Similar seed-embedding resolution) is plan
+        // material, not measured work — it runs before the clock starts.
+        driver.prepare_op(op)?;
         let start = Instant::now();
         let outcome = driver.run_op(op)?;
         let elapsed_us = start.elapsed().as_nanos() as f64 / 1000.0;
