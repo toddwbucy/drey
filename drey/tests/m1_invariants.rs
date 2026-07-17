@@ -974,9 +974,12 @@ fn nan_property_equality_is_bit_pattern_independent() {
     // the positive f64::NAN constant must still match it — all NaN payloads
     // are one value under the index's total order.
     let mut g = base_graph();
-    let zero = f64::from(0u8);
+    // Pinned bit pattern, not a runtime 0.0/0.0: the division constant-folds
+    // to the canonical positive NaN at opt-level > 0, which would silently
+    // drop the negative-NaN coverage from `cargo test --release`.
+    let negative_quiet_nan = f64::from_bits(0xFFF8_0000_0000_0000);
     let stored = g
-        .add_node(person(), props(&[("x", Value::F64(zero / zero))]))
+        .add_node(person(), props(&[("x", Value::F64(negative_quiet_nan))]))
         .unwrap();
     let hits = g
         .nodes_by_property(PropertyQuery {

@@ -336,9 +336,10 @@ mod tests {
     #[test]
     fn all_nan_payloads_compare_equal_and_rank_above_numbers() {
         // A runtime 0.0/0.0 NaN carries a different bit pattern (negative-quiet
-        // on x86) than the f64::NAN constant; the order must not care.
-        let zero = f64::from(0u8); // opaque to constant folding
-        let runtime_nan = zero / zero;
+        // on x86) than the f64::NAN constant; the order must not care. The bit
+        // pattern is pinned rather than computed — a 0.0/0.0 expression
+        // constant-folds to the canonical positive NaN in release builds.
+        let runtime_nan = f64::from_bits(0xFFF8_0000_0000_0000);
         assert_eq!(
             Scalar::F64(runtime_nan).total_order(&Scalar::F64(f64::NAN)),
             Ordering::Equal

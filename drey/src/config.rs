@@ -8,9 +8,18 @@ use crate::types::NodeType;
 /// Which similarity scans are bounded, and by how much (PRD §13.1). Every
 /// similarity query obeys this ceiling unless the caller explicitly opts into
 /// an unbounded scan.
+///
+/// The ceiling bounds the candidates a query may **examine** (the survivors
+/// of the structural/property filters, each of which must be probed for a
+/// scorable embedding) — not merely the vectors ultimately scored. This is
+/// what makes it a real work bound. Migration note (2026-07 hardening): it
+/// previously counted only scored vectors, so a ceiling sized to "embeddings
+/// I expect to score" may now reject queries whose *filter survivors* exceed
+/// it — resize to the candidate-set bound you intend, or set
+/// `allow_full_scan` on the queries meant to sweep.
 #[derive(Clone, Copy, Debug)]
 pub struct ScanCeiling {
-    /// Maximum candidate vectors scored in one similarity query.
+    /// Maximum candidates examined in one similarity query.
     pub max_candidates: usize,
 }
 

@@ -32,7 +32,19 @@ Platform note: directory fsync is a POSIX durability point; on non-Unix
 targets `fsync_dir` is a no-op (Windows cannot open a directory via
 `File::open`, and NTFS handles rename durability through its journal). File
 contents are still fsynced everywhere; the rename-durability guarantee above
-is formally Unix-only.
+is formally Unix-only. **Concretely, off Unix the snapshot cutover's ordering
+premise does not hold**: the WAL re-header can become durable while the
+snapshot rename is lost to a power cut (exFAT; NTFS is saved only by its own
+journal ordering), leaving `snapshot(N) + WAL(N+1)` on disk — a state the
+generation gate then refuses on every open (`GenerationMismatch`), with the
+pre-rotation commits unrecoverable because the old WAL was reset. On non-Unix
+targets, treat `snapshot()` as carrying this residual risk (or avoid it and
+rely on WAL-only durability + `export` for compaction); a structural fix
+(epoch-named WAL files, so the old WAL survives until the new generation is
+verifiably durable) is a format change deferred until a non-Unix consumer
+exists. This is also the third possible cause of `GenerationMismatch`,
+alongside a backup-restored older snapshot and a lock-free read racing a
+rotation.
 
 ### Export preconditions (issue #22 item 4 / review)
 
@@ -93,16 +105,42 @@ the structure:
   **Torn tail vs. corruption (issue #22 item 7):** damage is classified by
   where it sits relative to the fsync barriers commits create - batch N+1's
   bytes exist on disk only if batch N's fsync returned. Damage confined to
-  the *final* batch (torn frame at EOF, unmarked frames, or a CRC-bad frame
-  whose commit marker ends the file) is indistinguishable from a torn
-  unacknowledged commit and is discarded/truncated: crash recovery. A CRC-bad
-  frame with any bytes after its batch's commit marker sits in an
-  *acknowledged* batch; open refuses with a typed `Codec` error and leaves
-  the file untouched, rather than silently truncating durable history.
+  mutation-sized frames of the *final* batch, with nothing at all after its
+  marker, is indistinguishable from a torn unacknowledged commit and is
+  discarded/truncated: crash recovery. Open refuses with a typed `Codec`
+  error - leaving the file untouched - when a CRC-bad frame has **raw bytes**
+  (parsed frames or torn fragments alike) after its batch's commit marker, or
+  when the damaged frame is **marker-sized** (a 1-byte payload is the only
+  thing `commit()` writes at that size): a damaged marker makes its batch
+  boundary unknowable, and treating it as a mutation frame would merge two
+  batches and truncate acknowledged history.
+  The repair truncation is in-place (`set_len`), so the discarded
+  unacknowledged tail is not preserved; copy `wal.log` aside before a
+  writable open if the torn tail has forensic value.
   Known limit: damage to a frame's *length prefix* mid-file can derail the
   structural scan itself, in which case everything beyond it is unreachable
   and treated as torn tail; distinguishing that would require per-frame
   sequence numbers (a format change - revisit if it ever bites).
+  Threat-model note: appending batch N+1 rewrites the final filesystem block
+  shared with batch N's fsynced tail, so on media without powersafe
+  overwrite (SQLite's `POWERSAFE_OVERWRITE` concern) an ordinary power loss
+  can corrupt acknowledged bytes in that shared block - which this
+  classifier will then refuse as corruption (or, if the tear hits N's
+  marker, refuse as a damaged marker). The refusal is the safe outcome, but
+  on such media it can follow a plain crash, not just bit rot.
+
+  **Replay compatibility:** one pre-hardening artifact is tolerated rather
+  than refused - `DecayEdges` frames whose filter carries a NaN
+  `min_weight`, which older writers of this same FORMAT_VERSION legally
+  committed. The filter matched nothing then (`w >= NaN` is false) and
+  replay reproduces that no-op; the live `decay_edges` entry rejects NaN at
+  the source so new frames never carry it.
+
+  **WAL reset recipe:** every WAL re-header (create, stale-WAL repair, and
+  the snapshot cutover) goes through tmp+fsync+rename (`reset_wal`), not an
+  in-place truncate+write - in-place, the equal-length new header could
+  persist while the shrink's metadata did not, leaving residual old-epoch
+  frames frame-aligned and replayable under the new epoch.
 
   **Generation gate (issue #22 item 8):** the WAL replays only when its epoch
   **equals** the snapshot's. An older WAL is the legitimate
@@ -163,9 +201,13 @@ Ordering (issue #22 item 3): a writable `open` acquires the lock **before**
 reading either persistence file - read-then-lock was a TOCTOU where a
 concurrent writer's commit, landed between the read and the lock, was
 truncated away by the post-lock WAL repair. Read-only opens take no lock;
-instead they verify the snapshot generation was stable across their reads
-and retry a bounded number of times on an observed rotation (an unstable
-epoch or a WAL one generation ahead), then surface a typed error.
+when their reads race a snapshot rotation they observe a WAL one generation
+ahead of the snapshot, and retry a bounded number of times before surfacing
+the typed error. Every state a pass *can* load is internally consistent (an
+equal-epoch snapshot+WAL pair, or a stale-skipped snapshot alone); the
+read-only guarantee is consistency, not freshness - a load racing a rotation
+may serve committed state up to one rotation old, which is inherent to
+reading without the writer lock.
 
 ## Drop semantics (PRD §24 Q9, decided)
 

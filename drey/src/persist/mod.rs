@@ -33,7 +33,7 @@ static EXPORT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 use crate::config::GraphConfig;
 use crate::error::{Error, Result};
 use crate::graph::{Graph, Mutation};
-use crate::store::{EdgeRecord, NodeRecord, Store};
+use crate::store::Store;
 use crate::types::{EdgeId, EdgeType, NodeId, NodeType, Value};
 
 /// On-disk format version, written into the snapshot header and the WAL header.
@@ -56,6 +56,7 @@ const MAGIC: &[u8; 4] = b"DREY";
 const SNAPSHOT_FILE: &str = "snapshot.bin";
 const SNAPSHOT_TMP_FILE: &str = "snapshot.bin.tmp";
 const WAL_FILE: &str = "wal.log";
+const WAL_TMP_FILE: &str = "wal.log.tmp";
 const LOCK_FILE: &str = "LOCK";
 
 /// How many times a read-only open re-reads the files when it observes a
@@ -283,16 +284,7 @@ impl Persistence for WalPersistence {
             #[cfg(test)]
             fail::hit(&fail::CUTOVER_DIR_FSYNC)?;
             fsync_dir(&dir)?; // make the rename durable
-            {
-                let mut wal = OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .create(true)
-                    .open(dir.join(WAL_FILE))?;
-                wal.write_all(&wal_header(new_epoch))?;
-                wal.sync_all()?;
-            }
-            fsync_dir(&dir)?;
+            reset_wal(&dir, new_epoch)?;
             let new_wal = OpenOptions::new().append(true).open(dir.join(WAL_FILE))?;
             self.wal = new_wal;
             self.epoch = new_epoch;
@@ -360,6 +352,25 @@ fn write_file_atomic(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Reset `wal.log` to a header-only file at `epoch`, via the same
+/// tmp+fsync+rename recipe as every other durability point. The previous
+/// in-place `truncate(true)` + header write had a crash window: the 20-byte
+/// header's data writeback can persist while the truncate's metadata shrink
+/// does not, and since old and new headers are the same length, residual
+/// old-epoch frames beyond the header stayed frame-aligned and CRC-valid
+/// under the new epoch — replayable double-application of already-snapshotted
+/// mutations. A rename cannot leave residual frames: the file is either the
+/// old WAL or the complete fresh header.
+fn reset_wal(dir: &Path, epoch: u64) -> Result<()> {
+    write_file_atomic(
+        &dir.join(WAL_FILE),
+        &dir.join(WAL_TMP_FILE),
+        &wal_header(epoch),
+    )?;
+    fsync_dir(dir)?;
+    Ok(())
+}
+
 /// Write a length+crc framed record into `out`. The frame length is a `u32`, so
 /// a payload of 4 GiB or more cannot be encoded without truncating the prefix
 /// (which would misalign every following frame and strand acknowledged data on
@@ -390,6 +401,12 @@ impl Graph {
             )));
         }
         fs::create_dir_all(&dir)?;
+        // Canonicalize once, now that the directory exists: every stored path
+        // (the persister's dir, `origin_dir` for export-alias refusal) must
+        // stay valid if the process later changes cwd — a relative path
+        // re-resolved under a new cwd would silently point elsewhere and, for
+        // the alias check, let an export rename over the live WAL.
+        let dir = dir.canonicalize()?;
         // fsync the parent so the newly created directory entry itself is durable
         // — on POSIX, mkdir is a metadata change to the parent, and without this a
         // power failure can lose the whole graph directory despite commit()'s
@@ -401,13 +418,8 @@ impl Graph {
         let locked = acquire_lock(&dir, &config)?;
         // A fresh graph starts at epoch 0; write the WAL header up front so the
         // file is always version-tagged before any frame is appended.
-        let mut wal = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(WAL_FILE))?;
-        wal.write_all(&wal_header(0))?;
-        wal.sync_all()?;
-        fsync_dir(&dir)?;
+        reset_wal(&dir, 0)?;
+        let wal = OpenOptions::new().append(true).open(dir.join(WAL_FILE))?;
         graph.persist = Some(Box::new(WalPersistence {
             dir: dir.clone(),
             wal,
@@ -440,29 +452,25 @@ impl Graph {
                 dir.display()
             )));
         }
+        // Canonicalize once (the directory provably exists — it holds graph
+        // files): stored paths must survive a later cwd change (see `create`).
+        let dir = dir.canonicalize()?;
 
         if config.read_only {
+            // Lock-free readers can observe a snapshot rotation as a WAL one
+            // generation ahead of the snapshot they read; a re-read picks up
+            // the fresh snapshot and resolves it. Every state a retry-free
+            // pass CAN load is internally consistent (an equal-epoch pair, or
+            // a stale-skipped snapshot alone) — at worst one rotation stale,
+            // which is inherent to reading without the writer lock.
             let mut last_err: Option<Error> = None;
             for _ in 0..READ_ONLY_OPEN_RETRIES {
                 match Self::load_committed(&dir, &config) {
                     Ok(loaded) => {
-                        // Epoch-stability check: if the snapshot generation on
-                        // disk is no longer the one we loaded, a rotation raced
-                        // our reads and the loaded state may be blended.
-                        if snapshot_epoch_on_disk(&dir) == loaded.snap_epoch_on_disk() {
-                            let mut graph = loaded.graph;
-                            graph.origin_dir = Some(dir);
-                            return Ok(graph);
-                        }
-                        last_err = Some(Error::Storage(format!(
-                            "snapshot at {} rotated during a read-only open",
-                            dir.display()
-                        )));
+                        let mut graph = loaded.graph;
+                        graph.origin_dir = Some(dir);
+                        return Ok(graph);
                     }
-                    // A WAL one generation ahead of the snapshot is what a
-                    // rotation race looks like from a lock-free reader:
-                    // re-read and the fresh snapshot resolves it. If it
-                    // persists, it is a real mismatch and surfaces below.
                     Err(e @ Error::GenerationMismatch { .. }) => last_err = Some(e),
                     Err(e) => return Err(e),
                 }
@@ -485,14 +493,7 @@ impl Graph {
         // to its last committed frame.
         let wal_path = dir.join(WAL_FILE);
         let epoch = if replay.stale {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&wal_path)?;
-            f.write_all(&wal_header(snap_epoch))?;
-            f.sync_all()?;
-            fsync_dir(&dir)?;
+            reset_wal(&dir, snap_epoch)?;
             snap_epoch
         } else {
             let f = OpenOptions::new().write(true).open(&wal_path)?;
@@ -524,6 +525,10 @@ impl Graph {
 
         let snapshot_present = dir.join(SNAPSHOT_FILE).exists();
         let wal_present = dir.join(WAL_FILE).exists();
+        // Deliberately duplicates `open`'s pre-lock existence check: that one
+        // exists so a writable open of a non-graph directory errors BEFORE
+        // `acquire_lock` drops a LOCK file into it; this one guards the
+        // read-only retry loop, where the files are re-read per attempt.
         if !snapshot_present && !wal_present {
             return Err(Error::Storage(format!(
                 "no graph at {}; use create()",
@@ -541,8 +546,11 @@ impl Graph {
         if snapshot_present && !wal_present {
             return Err(Error::Storage(format!(
                 "snapshot.bin exists at {} but wal.log is missing; refusing to open at \
-                 snapshot state, which would silently drop any post-snapshot commits",
-                dir.display()
+                 snapshot state, which would silently drop any post-snapshot commits. \
+                 If the WAL is known lost, recover the snapshot image explicitly via \
+                 Graph::import(\"{}\") — snapshots and exports share one encoding",
+                dir.display(),
+                dir.join(SNAPSHOT_FILE).display()
             )));
         }
 
@@ -573,7 +581,6 @@ impl Graph {
             graph,
             replay,
             snap_epoch,
-            snapshot_present,
         })
     }
 
@@ -622,7 +629,13 @@ impl Graph {
             }
         }
         if let Some(dir) = &self.origin_dir {
-            for reserved in [SNAPSHOT_FILE, SNAPSHOT_TMP_FILE, WAL_FILE, LOCK_FILE] {
+            for reserved in [
+                SNAPSHOT_FILE,
+                SNAPSHOT_TMP_FILE,
+                WAL_FILE,
+                WAL_TMP_FILE,
+                LOCK_FILE,
+            ] {
                 let reserved = dir.join(reserved);
                 if paths_alias(path, &reserved) {
                     return Err(Error::Storage(format!(
@@ -685,7 +698,12 @@ impl Graph {
 /// identity is compared where the platform exposes it (dev+inode on Unix —
 /// which also catches hard links); otherwise the comparison falls back to
 /// canonicalized paths, resolving the parent when the target does not exist
-/// yet (an export destination usually doesn't).
+/// yet (an export destination usually doesn't). `reserved` is always rooted
+/// at the graph's canonicalized `origin_dir`, so a cwd change between open
+/// and export cannot re-point it. A check-to-rename TOCTOU window remains
+/// for an *external* process re-linking the destination between this check
+/// and the rename — unavoidable without O_NOFOLLOW-style open semantics, and
+/// out of scope for the single-process model (PRD §11).
 fn paths_alias(target: &Path, reserved: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -755,15 +773,6 @@ struct LoadedState {
     graph: Graph,
     replay: WalReplay,
     snap_epoch: u64,
-    snapshot_present: bool,
-}
-
-impl LoadedState {
-    /// The snapshot generation this load observed, in the same shape
-    /// [`snapshot_epoch_on_disk`] reports: `None` when no snapshot existed.
-    fn snap_epoch_on_disk(&self) -> Option<u64> {
-        self.snapshot_present.then_some(self.snap_epoch)
-    }
 }
 
 /// Refine a [`Error::GenerationMismatch`] into the sharper missing-snapshot
@@ -784,20 +793,6 @@ fn refine_generation_mismatch(dir: &Path, e: Error) -> Error {
         }
         e => e,
     }
-}
-
-/// The snapshot generation currently on disk (`None` if absent or its header
-/// is unreadable). Used by read-only opens for the epoch-stability check —
-/// only the 16-byte header is read, never the payload.
-fn snapshot_epoch_on_disk(dir: &Path) -> Option<u64> {
-    use std::io::Read;
-    let mut f = File::open(dir.join(SNAPSHOT_FILE)).ok()?;
-    let mut header = [0u8; 16];
-    f.read_exact(&mut header).ok()?;
-    if &header[0..4] != MAGIC {
-        return None;
-    }
-    Some(u64::from_le_bytes(header[8..16].try_into().unwrap()))
 }
 
 /// The outcome of a WAL replay, used to normalize the on-disk WAL on open.
@@ -959,34 +954,46 @@ fn replay_wal(graph: &mut Graph, bytes: &[u8], snap_epoch: u64) -> Result<WalRep
     // (`None` = no committed batch survives).
     let mut apply_through: Option<usize> = markers.last().copied();
     let mut valid_len = apply_through.map_or(WAL_HEADER_LEN, |i| frames[i].end);
-    if let Some(bad) = frames
-        .iter()
-        .take(markers.last().map_or(0, |&last| last))
-        .position(|f| !f.crc_ok)
-    {
-        // A CRC-bad frame before the last commit marker. Its own batch ends at
-        // the first marker at/after it; bytes beyond that marker prove the
-        // batch's fsync was acknowledged (see doc comment).
-        let batch_marker = *markers
-            .iter()
-            .find(|&&m| m >= bad)
-            .expect("a marker follows every frame before the last marker");
-        let batch_is_final = batch_marker == *markers.last().unwrap();
-        let bytes_after_batch =
-            frames.last().map(|f| f.end).unwrap_or(WAL_HEADER_LEN) > frames[batch_marker].end;
-        if !batch_is_final || bytes_after_batch {
-            return Err(Error::Codec(format!(
-                "WAL frame at byte offset {} fails its CRC inside an acknowledged commit \
-                 (fsync barrier proves the batch was durable); refusing to truncate \
-                 committed history — restore from a snapshot/export instead",
-                frames[bad].end - frames[bad].payload.len() - 8,
-            )));
+    if let Some(&last) = markers.last() {
+        // Every CRC-bad frame before the last trustworthy marker matters, not
+        // just the first: the confined-torn-commit escape below is only sound
+        // if NONE of the damaged frames could hide a batch boundary.
+        let bad: Vec<usize> = (0..last).filter(|&i| !frames[i].crc_ok).collect();
+        if !bad.is_empty() {
+            // A commit marker is the only 1-byte payload `commit()` ever
+            // writes, so a CRC-bad frame of exactly that size is a damaged
+            // *marker*: its batch's boundary is unknowable, and the
+            // trustworthy marker after it proves a later batch — and
+            // therefore this one's fsync — was acknowledged. Treating it as
+            // an ordinary mutation frame would merge two batches and let the
+            // discard branch below truncate acknowledged history.
+            let possible_marker = bad.iter().any(|&i| frames[i].payload.len() == 1);
+            // A mutation-sized bad frame's batch ends at the first
+            // trustworthy marker at/after it. RAW bytes past that marker —
+            // parsed frames and torn fragments alike; the fsync-barrier
+            // argument does not care whether they frame cleanly — prove the
+            // batch's fsync returned.
+            let first_bad = bad[0];
+            let batch_marker = *markers
+                .iter()
+                .find(|&&m| m >= first_bad)
+                .expect("a marker follows every frame before the last marker");
+            let bytes_after_batch = bytes.len() > frames[batch_marker].end;
+            if possible_marker || batch_marker != last || bytes_after_batch {
+                return Err(Error::Codec(format!(
+                    "WAL frame at byte offset {} fails its CRC inside an acknowledged commit \
+                     (fsync barrier proves the batch was durable); refusing to truncate \
+                     committed history — restore from a snapshot/export instead",
+                    frames[first_bad].end - frames[first_bad].payload.len() - 8,
+                )));
+            }
+            // Damage confined to mutation frames of the final complete batch,
+            // with nothing at all after its marker: indistinguishable from a
+            // torn unacknowledged commit (pages of one write may persist in
+            // any order). Discard the batch — apply through the prior marker.
+            apply_through = markers.len().checked_sub(2).map(|i| markers[i]);
+            valid_len = apply_through.map_or(WAL_HEADER_LEN, |i| frames[i].end);
         }
-        // Damage confined to the final complete batch with nothing after it:
-        // indistinguishable from a torn unacknowledged commit. Discard the
-        // batch — apply only through the previous marker.
-        apply_through = markers.len().checked_sub(2).map(|i| markers[i]);
-        valid_len = apply_through.map_or(WAL_HEADER_LEN, |i| frames[i].end);
     }
 
     // Phase 3 — decode and apply the acknowledged prefix. Every frame here is
@@ -1060,23 +1067,9 @@ fn apply_replay(
             node_type,
             properties,
         } => {
-            // The live add_node's gates, minus allocation (the id is explicit).
-            let type_id = store.require_registered(&node_type)?;
-            crate::store::validate_properties(&properties)?;
-            if store.nodes.contains_key(&id.0) {
-                return Err(Error::Codec(format!(
-                    "WAL AddNode reuses live node id {}",
-                    id.0
-                )));
-            }
-            store.insert_node_raw(
-                id.0,
-                NodeRecord {
-                    node_type: type_id,
-                    properties,
-                    embedding: None,
-                },
-            );
+            // The live add_node's gate set, with the WAL's explicit id
+            // restored instead of allocated (PRD §7.4).
+            store.insert_node_checked(id.0, &node_type, properties)?;
             *max_node = (*max_node).max(id.0 + 1);
         }
         Mutation::SetNodeEmbedding { node, embedding } => {
@@ -1097,32 +1090,8 @@ fn apply_replay(
             weight,
             properties,
         } => {
-            // The live add_edge's gates, minus allocation.
-            if !store.nodes.contains_key(&from.0) {
-                return Err(Error::NodeNotFound(from));
-            }
-            if !store.nodes.contains_key(&to.0) {
-                return Err(Error::NodeNotFound(to));
-            }
-            crate::store::validate_properties(&properties)?;
-            crate::store::validate_weight(weight)?;
-            if store.edges.contains_key(&id.0) {
-                return Err(Error::Codec(format!(
-                    "WAL AddEdge reuses live edge id {}",
-                    id.0
-                )));
-            }
-            let type_id = store.edge_types.intern(edge_type.as_str());
-            store.insert_edge_raw(
-                id.0,
-                EdgeRecord {
-                    from: from.0,
-                    to: to.0,
-                    edge_type: type_id,
-                    weight,
-                    properties,
-                },
-            );
+            // The live add_edge's gate set, id restored instead of allocated.
+            store.insert_edge_checked(id.0, from, to, &edge_type, weight, properties)?;
             *max_edge = (*max_edge).max(id.0 + 1);
         }
         Mutation::SetEdgeWeight { edge, weight } => {
@@ -1136,10 +1105,17 @@ fn apply_replay(
         }
         Mutation::DecayEdges { filter, factor } => {
             // Deterministic recomputation of the batch the live call applied;
-            // the live path's filter/factor gates first, then each write goes
-            // through set_edge_weight so the store-side finiteness gate holds
-            // on this path too.
-            crate::graph::validate_min_weight(filter.min_weight)?;
+            // each write goes through set_edge_weight so the store-side
+            // finiteness gate holds on this path too.
+            //
+            // Compatibility: `filter.min_weight` is deliberately NOT
+            // NaN-gated here, unlike the live decay_edges entry. Pre-hardening
+            // writers of this same FORMAT_VERSION legally committed
+            // NaN-min_weight frames; the filter matched nothing (`w >= NaN`
+            // is false), so `edges_matching` below reproduces the historical
+            // no-op exactly. Rejecting the frame would permanently brick
+            // every open of such a graph with no version gate to explain why.
+            // The live entry stops NEW NaN frames at the source.
             if !factor.is_finite() {
                 return Err(Error::InvalidPropertyValue(
                     "decay factor must be finite (not NaN or infinite)".into(),
@@ -1552,6 +1528,14 @@ fn load_snapshot(
     }
 
     let n = r.u64()?;
+    // A node record is at least 17 bytes (id 8 + type 4 + embedding tag 1 +
+    // property count 4), so a corrupt count cannot drive a huge reserve.
+    let n = r.checked_len(
+        usize::try_from(n)
+            .map_err(|_| Error::Codec(format!("node count {n} does not fit in usize")))?,
+        17,
+    )?;
+    store.nodes.reserve(n);
     let mut max_node_id: Option<u64> = None;
     for _ in 0..n {
         let id = r.u64()?;
@@ -1602,6 +1586,14 @@ fn load_snapshot(
     }
 
     let n = r.u64()?;
+    // An edge record is at least 36 bytes (id 8 + from 8 + to 8 + type 4 +
+    // weight 4 + property count 4).
+    let n = r.checked_len(
+        usize::try_from(n)
+            .map_err(|_| Error::Codec(format!("edge count {n} does not fit in usize")))?,
+        36,
+    )?;
+    store.edges.reserve(n);
     let mut max_edge_id: Option<u64> = None;
     for _ in 0..n {
         let id = r.u64()?;
@@ -2174,6 +2166,56 @@ mod tests {
             Err(other) => panic!("expected InvalidPropertyValue, got {other}"),
             Ok(_) => panic!("inconsistent WAL opened successfully"),
         }
+    }
+
+    #[test]
+    fn replay_of_legacy_nan_min_weight_decay_is_a_noop_not_an_error() {
+        // Compat regression (review finding 3, reproduced with an old-crate
+        // writer): pre-hardening builds of this same FORMAT_VERSION legally
+        // committed DecayEdges frames with a NaN min_weight filter — the
+        // filter matched nothing (`w >= NaN` is false). Replay must reproduce
+        // that no-op, not refuse: the live decay_edges entry now rejects NaN
+        // at the source, but a typed error here would permanently brick every
+        // open of an existing graph.
+        let muts = [
+            Mutation::RegisterNodeType {
+                node_type: person(),
+                embedding_dim: None,
+            },
+            Mutation::AddNode {
+                id: NodeId(0),
+                node_type: person(),
+                properties: no_props(),
+            },
+            Mutation::AddNode {
+                id: NodeId(1),
+                node_type: person(),
+                properties: no_props(),
+            },
+            Mutation::AddEdge {
+                id: EdgeId(0),
+                from: NodeId(0),
+                to: NodeId(1),
+                edge_type: EdgeType::new("knows"),
+                weight: 1.0,
+                properties: no_props(),
+            },
+            Mutation::DecayEdges {
+                filter: crate::mutation::EdgeFilter {
+                    edge_types: Vec::new(),
+                    min_weight: Some(f32::NAN),
+                },
+                factor: 0.5,
+            },
+        ];
+        let g = open_with_wal("replay_legacy_nan_decay", &muts)
+            .unwrap_or_else(|e| panic!("legacy NaN-min_weight WAL must open, got {e}"));
+        assert_eq!(g.counts(), (2, 1));
+        assert_eq!(
+            g.edge(EdgeId(0)).unwrap().unwrap().weight,
+            1.0,
+            "the NaN filter matched nothing historically; replay must preserve that"
+        );
     }
 
     #[test]

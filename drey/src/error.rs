@@ -12,7 +12,13 @@ use crate::types::{EdgeId, NodeId};
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Error categories per PRD §19.
+///
+/// `#[non_exhaustive]`: new failure modes get new variants (as
+/// `GenerationMismatch` did), and consumers matching exhaustively would break
+/// on every such addition. Match the variants you handle and keep a wildcard
+/// arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// A persistence/storage-layer failure (I/O, etc.).
     Storage(String),

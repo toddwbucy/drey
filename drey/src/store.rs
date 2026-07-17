@@ -114,11 +114,29 @@ impl Store {
         node_type: &NodeType,
         properties: Properties,
     ) -> Result<NodeId> {
+        let id = self.next_node_id;
+        self.insert_node_checked(id, node_type, properties)?;
+        self.next_node_id += 1;
+        Ok(NodeId(id))
+    }
+
+    /// Insert a node at an explicit id behind the full `add_node` gate set
+    /// (registration, property validity, id availability). The single shared
+    /// gate for the live path (which allocates the id) and WAL replay (which
+    /// restores an explicit one), so the two cannot drift.
+    pub(crate) fn insert_node_checked(
+        &mut self,
+        id: u64,
+        node_type: &NodeType,
+        properties: Properties,
+    ) -> Result<()> {
         let type_id = self.require_registered(node_type)?;
         validate_properties(&properties)?;
-        let id = self.next_node_id;
-        self.next_node_id += 1;
-
+        if self.nodes.contains_key(&id) {
+            // Unreachable from the allocating live path; from replay it means
+            // a logically inconsistent WAL.
+            return Err(Error::Codec(format!("insert reuses live node id {id}")));
+        }
         self.nodes_by_type.entry(type_id).or_default().push(id);
         self.index_node_properties(type_id, node_type, id, &properties);
         self.nodes.insert(
@@ -129,7 +147,7 @@ impl Store {
                 embedding: None,
             },
         );
-        Ok(NodeId(id))
+        Ok(())
     }
 
     pub(crate) fn set_node_embedding(&mut self, node: NodeId, embedding: Vec<f32>) -> Result<()> {
@@ -169,27 +187,44 @@ impl Store {
         weight: f32,
         properties: Properties,
     ) -> Result<EdgeId> {
+        let id = self.next_edge_id;
+        self.insert_edge_checked(id, from, to, edge_type, weight, properties)?;
+        self.next_edge_id += 1;
+        Ok(EdgeId(id))
+    }
+
+    /// Insert an edge at an explicit id behind the full `add_edge` gate set —
+    /// shared by the live path and WAL replay (see
+    /// [`Store::insert_node_checked`]).
+    ///
+    /// The gates: endpoints exist; property values within the codec's u32
+    /// length ceiling (edge creation must not be the one hole through which
+    /// an oversized String/Bytes/List reaches the WAL/snapshot); weight
+    /// finite (a NaN/±inf weight silently becomes a zero-cost edge in
+    /// weighted shortest_path and defeats the min_weight filter); type label
+    /// within the codec ceiling; id available.
+    pub(crate) fn insert_edge_checked(
+        &mut self,
+        id: u64,
+        from: NodeId,
+        to: NodeId,
+        edge_type: &EdgeType,
+        weight: f32,
+        properties: Properties,
+    ) -> Result<()> {
         if !self.nodes.contains_key(&from.0) {
             return Err(Error::NodeNotFound(from));
         }
         if !self.nodes.contains_key(&to.0) {
             return Err(Error::NodeNotFound(to));
         }
-        // Enforce the value ceiling on edge properties too. `add_node` and both
-        // property-update paths validate; edge creation must not be the one hole
-        // through which an oversized String/Bytes/List (whose length the codec
-        // prefixes with a u32) reaches the WAL/snapshot and corrupts it.
         validate_properties(&properties)?;
-        // A NaN/±inf weight is malformed input: it silently becomes a zero-cost
-        // edge in weighted shortest_path (f32::max(NaN, 0.0) == 0.0) and defeats
-        // the min_weight filter. Validated here — not only in the public API —
-        // so WAL replay and snapshot load pass through the same gate.
         validate_weight(weight)?;
         validate_label(edge_type.as_str(), Error::InvalidEdgeType)?;
+        if self.edges.contains_key(&id) {
+            return Err(Error::Codec(format!("insert reuses live edge id {id}")));
+        }
         let type_id = self.edge_types.intern(edge_type.as_str());
-        let id = self.next_edge_id;
-        self.next_edge_id += 1;
-
         adj_insert(&mut self.out_adj, from.0, type_id, id);
         adj_insert(&mut self.in_adj, to.0, type_id, id);
         self.edges_by_type.entry(type_id).or_default().push(id);
@@ -203,7 +238,7 @@ impl Store {
                 properties,
             },
         );
-        Ok(EdgeId(id))
+        Ok(())
     }
 
     pub(crate) fn set_edge_weight(&mut self, edge: EdgeId, weight: f32) -> Result<f32> {

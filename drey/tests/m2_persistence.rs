@@ -881,6 +881,91 @@ fn mid_wal_corruption_in_acknowledged_batch_fails_open_without_truncation() {
 }
 
 #[test]
+fn corrupt_commit_marker_fails_open_not_silent_batch_merge() {
+    // Review follow-up (finding 1): a CRC-bad frame of marker size must be
+    // treated as a damaged commit marker — its batch boundary is unknowable,
+    // and a trustworthy marker after it proves acknowledged history. The old
+    // classifier dropped it from `markers`, merged two batches, and the
+    // discard branch truncated acknowledged (and fully intact) batches away.
+    // Case A: middle marker of three batches ([m0][M1][m2][M2*][m3][M3]).
+    // Case B: first marker of two ([m0][M1*][m2][M2]) — previously truncated
+    // the WHOLE WAL to its header.
+    for (name, batches, corrupt_after_batch) in [("mid", 3usize, 2usize), ("first", 2usize, 1usize)]
+    {
+        let dir = tmp(&format!("corrupt_marker_{name}"));
+        let mut ends = Vec::new();
+        {
+            let mut g = Graph::create(&dir, config()).unwrap();
+            g.register_node_type(person(), None).unwrap();
+            for _ in 0..batches {
+                g.add_node(person(), props(&[])).unwrap();
+                g.commit().unwrap();
+                ends.push(fs::metadata(dir.join("wal.log")).unwrap().len());
+            }
+        }
+        // A commit marker is the last frame of its batch: len(4) + crc(4) +
+        // 1-byte payload. Flip the payload byte — CRC now fails, the length
+        // prefix (1) is intact.
+        let path = dir.join("wal.log");
+        let mut bytes = fs::read(&path).unwrap();
+        let marker_payload = ends[corrupt_after_batch - 1] as usize - 1;
+        bytes[marker_payload] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+
+        match Graph::open(&dir, config()) {
+            Err(Error::Codec(m)) => {
+                assert!(m.contains("acknowledged"), "({name}) unexpected: {m}")
+            }
+            Err(other) => panic!("({name}) expected Codec corruption error, got {other}"),
+            Ok(g) => panic!(
+                "({name}) open succeeded with {} nodes — acknowledged batches were merged/truncated",
+                g.counts().0
+            ),
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "({name}) failed open must leave the WAL untouched"
+        );
+    }
+}
+
+#[test]
+fn torn_fragment_after_damaged_final_batch_fails_open() {
+    // Review follow-up (finding 2): raw bytes past the damaged batch's marker
+    // prove its fsync was acknowledged even when they are a torn fragment the
+    // structural scan cannot frame. The old check compared against the last
+    // *parsed* frame, so the fragment was invisible and the acknowledged
+    // batch was silently discarded.
+    let dir = tmp("fragment_after_damage");
+    let size_after_first;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        size_after_first = fs::metadata(dir.join("wal.log")).unwrap().len();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    let path = dir.join("wal.log");
+    let mut bytes = fs::read(&path).unwrap();
+    // Corrupt batch 2's mutation payload...
+    let off = size_after_first as usize;
+    let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+    bytes[off + 8 + len - 1] ^= 0xFF;
+    // ...and append a torn fragment of a "batch 3" after batch 2's marker.
+    bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]);
+    fs::write(&path, &bytes).unwrap();
+
+    match Graph::open(&dir, config()) {
+        Err(Error::Codec(m)) => assert!(m.contains("acknowledged"), "unexpected: {m}"),
+        Err(other) => panic!("expected Codec corruption error, got {other}"),
+        Ok(_) => panic!("open discarded a batch the trailing fragment proves was acknowledged"),
+    }
+}
+
+#[test]
 fn corruption_in_final_batch_still_recovers_as_torn_commit() {
     // The counterpart cell: damage confined to the FINAL batch with nothing
     // after it is byte-indistinguishable from a torn, unacknowledged commit
