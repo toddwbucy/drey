@@ -13,6 +13,14 @@ This resolves the length-prefix loss reproduced in issue #29. Version-3 director
 are refused explicitly; `Graph::import_v3_snapshot` provides a read-only snapshot
 conversion bridge without guessing about legacy WAL acknowledgements.
 
+Open first reads the snapshot prefix, WAL header and validated commit seal. A
+seal newer than the snapshot prefix rejects before record decoding, including
+every read-only retry. This is a rejection-only optimization: a damaged snapshot
+prefix can also cause `GenerationMismatch`. Accepting a snapshot or skipping a
+stale WAL still requires the complete snapshot checksum and structural validation;
+replay still requires the sealed WAL hash. Header and body reads use the same file
+handle so a concurrent rename cannot mix snapshot images.
+
 The remaining text records the original design and format evolution. Where it
 classifies damage from following frames alone or describes a remaining length-prefix
 limitation, that is historical behavior before the v4 seal, not current recovery.
