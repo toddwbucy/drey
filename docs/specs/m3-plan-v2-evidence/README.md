@@ -21,7 +21,8 @@ after #25 corrected timed similarity setup and separated decay restores.
 - [legacy-plan-rejection.json](legacy-plan-rejection.json): the release `bench`
   refused both a headerless v1 plan and an explicit version-1 header, exiting 1
   without run JSON. The two generation logs record successful fixture/plan checks.
-- [verify.py](verify.py): checks recorded budgets/verdicts, sample floors, restore
+- [verify.py](verify.py): checks budgets against `harness/src/output.rs::budget_for`
+  at the measured commit, then checks verdicts, sample floors, restore
   exclusions, repetitions, and candidate-counter agreement. With regenerated fixtures
   it also verifies every recorded hash and independently recounts the actual work.
 
@@ -132,7 +133,13 @@ Python 3 uses only its standard library. Check the committed evidence directly:
 
 ```sh
 python3 docs/specs/m3-plan-v2-evidence/verify.py
+python3 -B -m unittest discover -s docs/specs/m3-plan-v2-evidence -p 'test_verify.py'
 ```
+
+The verifier freezes that commit's latency and throughput budgets for both drivers,
+including null restore budgets. Later budget revisions cannot reinterpret this
+record. The regression tests reject coordinated budget/verdict/summary edits that
+would otherwise remain internally consistent.
 
 To regenerate the exact fixtures and measure again, start at this documentation
 checkout and use an isolated checkout of the measured commit. Rust dependencies
@@ -180,6 +187,9 @@ format check, and clippy with warnings denied. The standalone verifier passed on
 the original fixtures and a second generation in fresh directories. Deliberately
 changed candidate counters, decay distributions, and restore budgets were rejected
 in disposable copies. All 18 table rows were checked against the original JSON.
+The four Python regression tests also cover unchanged evidence, coordinated latency
+and throughput budget edits (including removing the throughput requirement), and
+budget drift in naive records with null verdicts.
 The two representative `bench` exit-3 results are the recorded budget failures;
 they are distinct from the passing correctness and documentation checks.
 
