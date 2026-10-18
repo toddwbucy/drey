@@ -1,0 +1,114 @@
+{
+  "small-drey-1": {
+    "command": [
+      "/tmp/drey-engine-target/release/bench",
+      "/tmp/drey-issue27-kxgzcp4u/small",
+      "drey",
+      "measurement"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 1.059938170015812,
+    "user_s": 1.048618,
+    "system_s": 0.006966,
+    "major_faults": 0,
+    "minor_faults": 4921
+  },
+  "small-drey-2": {
+    "command": [
+      "/tmp/drey-engine-target/release/bench",
+      "/tmp/drey-issue27-kxgzcp4u/small",
+      "drey",
+      "measurement"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 1.05395418102853,
+    "user_s": 1.0425430000000002,
+    "system_s": 0.006967000000000001,
+    "major_faults": 0,
+    "minor_faults": 4917
+  },
+  "small-naive-1": {
+    "command": [
+      "/tmp/drey-engine-target/release/bench",
+      "/tmp/drey-issue27-kxgzcp4u/small",
+      "naive",
+      "measurement"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 0.49145525717176497,
+    "user_s": 0.48234699999999986,
+    "system_s": 0.006978999999999999,
+    "major_faults": 0,
+    "minor_faults": 3817
+  },
+  "small-naive-2": {
+    "command": [
+      "/tmp/drey-engine-target/release/bench",
+      "/tmp/drey-issue27-kxgzcp4u/small",
+      "naive",
+      "measurement"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 0.48834641301073134,
+    "user_s": 0.4781770000000001,
+    "system_s": 0.007970000000000005,
+    "major_faults": 0,
+    "minor_faults": 3814
+  },
+  "representative-drey-1": {
+    "command": [
+      "/tmp/drey-engine-target/release/bench",
+      "/tmp/drey-issue27-kxgzcp4u/representative",
+      "drey",
+      "measurement"
+    ],
+    "exit_code": 3,
+    "elapsed_s": 51.85208414401859,
+    "user_s": 51.415155999999996,
+    "system_s": 0.237054,
+    "major_faults": 0,
+    "minor_faults": 155310
+  },
+  "representative-drey-2": {
+    "command": [
+      "/tmp/drey-engine-target/release/bench",
+      "/tmp/drey-issue27-kxgzcp4u/representative",
+      "drey",
+      "measurement"
+    ],
+    "exit_code": 3,
+    "elapsed_s": 51.940010937163606,
+    "user_s": 51.535075,
+    "system_s": 0.20509899999999998,
+    "major_faults": 0,
+    "minor_faults": 153350
+  },
+  "representative-naive-1": {
+    "command": [
+      "/tmp/drey-engine-target/release/bench",
+      "/tmp/drey-issue27-kxgzcp4u/representative",
+      "naive",
+      "measurement"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 36.2499464659486,
+    "user_s": 35.95365699999999,
+    "system_s": 0.15440299999999996,
+    "major_faults": 0,
+    "minor_faults": 106932
+  },
+  "representative-naive-2": {
+    "command": [
+      "/tmp/drey-engine-target/release/bench",
+      "/tmp/drey-issue27-kxgzcp4u/representative",
+      "naive",
+      "measurement"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 36.354366251965985,
+    "user_s": 36.063909000000024,
+    "system_s": 0.14538400000000007,
+    "major_faults": 0,
+    "minor_faults": 106971
+  }
+}

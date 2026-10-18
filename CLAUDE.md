@@ -17,7 +17,10 @@ The milestones M1–M5 are built and tested; M0/M3 apparatus runs. The 2026-07-0
 whole-codebase audit (issue #5, closed) was remediated in PRs #6–#15; the two remaining
 budget-gate overruns at representative scale (`decay_edges batch=1000`,
 `similar_nodes cand=10000`) are documented with their revision options in
-`docs/specs/m3-findings.md` (the PRD §16.3 "written reason to revise" exit). The M5
+`docs/specs/m3-findings.md`. The 2026-10-18 plan-version-2 re-baseline for issue #27
+still passes 16/18 representative latency/throughput buckets; candidate and decay
+labels are nominal, with actual work recorded in the evidence. The written reason
+to revise is the PRD §21 M3 exit, not a claim that all §16.3 gates pass. The M5
 query-layer decision is in `docs/specs/m5-query-seam-decision.md` (defer Cypher; ship the
 seam), and the persistence/similarity seams (design commitment 6) are ratified in
 `docs/specs/persistence-seam-decision.md`. The M2 durability contract, on-disk format

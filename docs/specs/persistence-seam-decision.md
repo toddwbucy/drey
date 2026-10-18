@@ -3,9 +3,16 @@
 Status: **ratified + implemented**, 2026-07-03. Addresses the last open
 finding from audit #5 (`persist/mod.rs:57`): *"No persistence trait and no
 internal similarity-evaluation seam, both named deliverables of the design
-commitments and M2/§13.2."* This is a **design decision, not a defect** — the
-crate behaves correctly today; what is missing is the *swappable-internals
-boundary* the PRD promises.
+commitments and M2/§13.2."* This was a **design decision**: the crate's existing
+behavior was retained while introducing the *swappable-internals boundary*
+the PRD promises. The pre-implementation state and proposal are recorded below.
+
+**Performance correction, 2026-10-18 (#27):** the [plan-version-2
+re-baseline](m3-findings.md#current-baseline)
+passes 16/18 representative latency/throughput buckets. The decay modeling gap
+and large filtered-similarity overrun remain open. They justify further
+measurement; they do not select ANN or a different persistence backend. The
+design history below retains the decision to ship the seams and defer alternatives.
 
 ## 1. What the commitments require
 
@@ -21,7 +28,7 @@ boundary* the PRD promises.
 Two seams, one shape: an internal trait with exactly one implementation today,
 so a second implementation can drop in later **without touching the public API**.
 
-## 2. Current state
+## 2. State before the seam implementation (2026-07-03)
 
 Neither seam exists as a trait; both internals are concrete.
 
@@ -52,11 +59,12 @@ the `PropertyGraphRead` seam, defer Cypher). Concretely:
    the internals are swappable.
 2. **Do not build a second implementation** (embedded-KV persistence, ANN
    similarity) in this change. The PRD gates the ANN swap on *"only if the M3
-   budget gate fails,"* and after the PR #7 Zipf-truncation fix the representative
-   gate **passes** (`docs/specs/m3-findings.md`). No measurement is asking for an ANN,
-   so building one now would violate "budgets, not comparisons" and add weight
-   for no evidenced need. Same logic for an alternative persistence backend:
-   WAL+snapshot meets M2, so a KV backend is unmotivated.
+   budget gate fails."* The [current representative results](m3-findings.md)
+   include a filtered-similarity failure, so evaluation is warranted; an overrun
+   alone does not establish which implementation meets the consumer's workload
+   and correctness requirements. F5 records the alternatives and the missing
+   capture. The decay/similarity measurements also provide no evidence that a
+   different persistence backend would solve these costs.
 
 The deliverable is therefore an **internal refactor with zero public-API change**
 that converts "we have one hard-coded internal" into "we have one internal
@@ -160,9 +168,10 @@ be a trap.
   6 and §13.2 name the seams as *deliverables*, not aspirations; a reviewer
   re-running the audit would re-flag it. The seam is cheap; skipping it leaves a
   standing gap against a stated commitment.
-- **Build the ANN / KV backend now.** Rejected: no measurement demands it (M3
-  gate passes), so it would be speed/feature work the PRD explicitly gates behind
-  a failing budget — "budgets, not comparisons" (commitment 7).
+- **Build the ANN / KV backend now.** Deferred: the synthetic similarity overrun
+  motivates evaluation, but does not choose ANN over exact-scan improvements or
+  narrower candidate sets. Budget changes require workload-derived tolerances.
+  Persistence replacement is not supported by these in-memory measurements.
 - **Public traits.** Rejected: the consumer never swaps these; a public trait
   freezes an internal shape we may want to revise when a real second impl lands.
 
@@ -178,8 +187,9 @@ All four recommendations were accepted:
 3. **Similarity seam is candidates-in.** `top_k(query, metric, candidates, k)`
    ranks a pre-filtered set, encoding the §13.1 evaluation order.
 4. **Ship the seams, defer the alternatives.** No ANN and no alternative
-   persistence backend — the M3 gate passes, so the PRD's ANN trigger has not
-   fired.
+   persistence backend. The earlier "M3 gate passes" rationale is superseded
+   by [F3/F5 and the current baseline](m3-findings.md); a failing synthetic
+   budget permits investigation, not an automatic implementation choice.
 
 ## 7. Implementation (as shipped)
 

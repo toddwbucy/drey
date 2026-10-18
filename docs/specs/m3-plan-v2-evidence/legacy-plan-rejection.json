@@ -1,0 +1,14 @@
+[
+  {
+    "probe": "headerless-v1",
+    "exit_code": 1,
+    "stderr": "failed to read workload \"measurement\": workload.measurement.jsonl: no plan_version header \u2014 this plan predates plan versioning (v1) and would replay semantics this build no longer measures; regenerate the fixture\n(run `generate` to materialize workload.*.jsonl next to the fixture)",
+    "stdout_bytes": 0
+  },
+  {
+    "probe": "version-1-header",
+    "exit_code": 1,
+    "stderr": "failed to read workload \"measurement\": workload.measurement.jsonl: plan_version 1 but this build requires 2; regenerate the fixture\n(run `generate` to materialize workload.*.jsonl next to the fixture)",
+    "stdout_bytes": 0
+  }
+]

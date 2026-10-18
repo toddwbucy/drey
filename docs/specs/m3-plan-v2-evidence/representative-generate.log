@@ -1,0 +1,7 @@
+generating 50000 nodes, 250000 edges (fanout Medium), seed 42…
+wrote fixture to /tmp/drey-issue27-kxgzcp4u/representative: 50000 nodes, 250000 edges, 25066 embeddings
+wrote workload.measurement.jsonl: 23100 ops
+wrote workload.traversal_heavy.jsonl: 107517 ops
+wrote workload.similarity_heavy.jsonl: 107517 ops
+wrote workload.update_heavy.jsonl: 156381 ops
+wrote workload.mixed.jsonl: 118793 ops
