@@ -64,6 +64,8 @@ impl Default for Limits {
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub types: BTreeMap<String, Option<Space>>,
+    /// Opt-in `(node_type, property_key)` scalar indexes, restored on open.
+    /// Property names have no special indexing behavior or uniqueness guarantee.
     pub indexes: Vec<(String, String)>,
     #[serde(default)]
     pub limits: Limits,
@@ -229,6 +231,8 @@ pub struct Hit {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueryResult {
     pub sequence: u64,
+    /// Logical visits: index seek, each matching range bucket, and selected
+    /// node/adjacency visits. Tree comparisons and serialization are not counted.
     pub work: usize,
     pub candidates: usize,
     pub hits: Vec<Hit>,
