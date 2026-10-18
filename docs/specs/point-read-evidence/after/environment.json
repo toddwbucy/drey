@@ -1,0 +1,36 @@
+{
+  "recorded_at": "2026-10-18T20:11:07.549352+00:00",
+  "commit": "6ae81fb40d1427823145292e3f8836cb30192346",
+  "drey_tree": "72a1c48d0063b36b9700874907e373c3b6ffa6a0",
+  "probe_sha256": "45d4859d20a76fe45cea48f004b55e78bb0ead85358f23b14493c8456e240291",
+  "repository_lock_sha256": "5a620b2be5a7aa9852b5abd82b7aaa9c036aad376a7e8b0d842574c062cb2c0a",
+  "probe_lock_sha256": "45b09bf01cca9ad328d332f60e2ecf4308ba98b51565b5346d2addf1ed701e5d",
+  "dependency_pins_verified": true,
+  "build": [
+    "cargo",
+    "build",
+    "--release",
+    "--offline"
+  ],
+  "rustflags": "-D warnings",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+  "cpu": "AMD Ryzen Threadripper 7960X 24-Cores",
+  "logical_cpus": 48,
+  "memory_kib": 261004756,
+  "kernel": "7.2.8-1-cachyos",
+  "architecture": "x86_64",
+  "conditions": "Sequential, unpinned, uncontrolled background load; no IPC; no vectors/edges.",
+  "populations": [
+    100,
+    1000,
+    10000
+  ],
+  "warmup": 200,
+  "samples": 1000,
+  "percentiles": "nearest rank p50/p95/p99, microseconds",
+  "sha256": {
+    "run-1.jsonl": "26c9e294b9035d4024cf40417607736ca459d9da3db0cfb0e191642396888cb4",
+    "run-2.jsonl": "125e889bcd58349b2094f9df1505aa134313128ca200a83e933c62b48591c33c"
+  }
+}
