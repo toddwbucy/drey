@@ -1,0 +1,343 @@
+{
+  "small": {
+    "plan_header": {
+      "plan_version": 2
+    },
+    "plan_ops": 23100,
+    "fixture_counts": {
+      "nodes": 1000,
+      "edges": 5000,
+      "embeddings": 513,
+      "dimensions": [
+        256
+      ]
+    },
+    "counters_repeat_exactly": {
+      "drey": true,
+      "naive": true
+    },
+    "shared_final_counters_match": {
+      "neighbors": true,
+      "property_eq:sel=common": true,
+      "property_eq:sel=rare": true,
+      "property_eq:sel=uncommon": true,
+      "similar_nodes:cand=100": true,
+      "similar_nodes:cand=1000": true,
+      "similar_nodes:cand=10000": true,
+      "update_edge_weight": true
+    },
+    "candidate_crosscheck": [
+      {
+        "bucket": "similar_nodes:cand=100",
+        "plan": 16,
+        "fixture_probe_nodes": 25,
+        "fixture_scored_vectors": 16,
+        "runs": {
+          "drey-1": 16,
+          "drey-2": 16,
+          "naive-1": 16,
+          "naive-2": 16
+        },
+        "node_types": [
+          "nt_00"
+        ],
+        "property_filter": [
+          "p_cat",
+          {
+            "str": "cat_common"
+          }
+        ]
+      },
+      {
+        "bucket": "similar_nodes:cand=1000",
+        "plan": 125,
+        "fixture_probe_nodes": 250,
+        "fixture_scored_vectors": 125,
+        "runs": {
+          "drey-1": 125,
+          "drey-2": 125,
+          "naive-1": 125,
+          "naive-2": 125
+        },
+        "node_types": [
+          "nt_00"
+        ],
+        "property_filter": null
+      },
+      {
+        "bucket": "similar_nodes:cand=10000",
+        "plan": 513,
+        "fixture_probe_nodes": 1000,
+        "fixture_scored_vectors": 513,
+        "runs": {
+          "drey-1": 513,
+          "drey-2": 513,
+          "naive-1": 513,
+          "naive-2": 513
+        },
+        "node_types": [
+          "nt_00",
+          "nt_01",
+          "nt_02",
+          "nt_03"
+        ],
+        "property_filter": null
+      }
+    ],
+    "decay_realized_edges": {
+      "1000": {
+        "samples": 1000,
+        "min": 181,
+        "p50": 403,
+        "p95": 2127,
+        "p99": 2127,
+        "max": 2127,
+        "last": 403
+      },
+      "10000": {
+        "samples": 1000,
+        "min": 181,
+        "p50": 298,
+        "p95": 2127,
+        "p99": 2127,
+        "max": 2127,
+        "last": 919
+      },
+      "100000": {
+        "samples": 1000,
+        "min": 181,
+        "p50": 298,
+        "p95": 2127,
+        "p99": 2127,
+        "max": 2127,
+        "last": 919
+      }
+    },
+    "budget_failures": {
+      "1": [],
+      "2": []
+    },
+    "files": {
+      "workload.mixed.jsonl": "fe3c02a090d11c5316a1a35aab071d17ede22ef08566c76333fd3ffa9b127844",
+      "workload.update_heavy.jsonl": "dc0d9cf98b42f1ad2689c628091005b7d977970b26342f6473e0743ebfd2cead",
+      "workload.similarity_heavy.jsonl": "2aa447fefdef60f34f642809468d9de6de8422864b20db3c6b70614b874cbb89",
+      "workload.traversal_heavy.jsonl": "299d0aa681a6f49f5e445143516553bac1d8980f41bc1e12c45c10ae636864fa",
+      "workload.measurement.jsonl": "df62051aa09a86a099debad66fb3c4f3b2df2519731bbf8e6f5add900efd259b",
+      "manifest.json": "3e6092eac7866fc588f62d400d0ae0ee8ea9c3bb770c72050e4a9da3b2fcb03a",
+      "embeddings.bin": "ba610d5d821167a2febb148ae2561e1adb24565e292ebb79009a66365a3b2720",
+      "edges.jsonl": "4f393a8d9de0a4a497fa07e29d787c4c0ab17d327e1271ba436177b065465cff",
+      "nodes.jsonl": "ca0229076fa781bee6a2d0f6869a665e01017937ad78fcbd54635318e50978c3"
+    }
+  },
+  "representative": {
+    "plan_header": {
+      "plan_version": 2
+    },
+    "plan_ops": 23100,
+    "fixture_counts": {
+      "nodes": 50000,
+      "edges": 250000,
+      "embeddings": 25066,
+      "dimensions": [
+        1024
+      ]
+    },
+    "counters_repeat_exactly": {
+      "drey": true,
+      "naive": true
+    },
+    "shared_final_counters_match": {
+      "neighbors": true,
+      "property_eq:sel=common": true,
+      "property_eq:sel=rare": true,
+      "property_eq:sel=uncommon": true,
+      "similar_nodes:cand=100": true,
+      "similar_nodes:cand=1000": true,
+      "similar_nodes:cand=10000": true,
+      "update_edge_weight": true
+    },
+    "candidate_crosscheck": [
+      {
+        "bucket": "similar_nodes:cand=100",
+        "plan": 209,
+        "fixture_probe_nodes": 417,
+        "fixture_scored_vectors": 209,
+        "runs": {
+          "drey-1": 209,
+          "drey-2": 209,
+          "naive-1": 209,
+          "naive-2": 209
+        },
+        "node_types": [
+          "nt_00"
+        ],
+        "property_filter": [
+          "p_cat",
+          {
+            "str": "cat_common"
+          }
+        ]
+      },
+      {
+        "bucket": "similar_nodes:cand=1000",
+        "plan": 2060,
+        "fixture_probe_nodes": 4167,
+        "fixture_scored_vectors": 2060,
+        "runs": {
+          "drey-1": 2060,
+          "drey-2": 2060,
+          "naive-1": 2060,
+          "naive-2": 2060
+        },
+        "node_types": [
+          "nt_00"
+        ],
+        "property_filter": null
+      },
+      {
+        "bucket": "similar_nodes:cand=10000",
+        "plan": 10453,
+        "fixture_probe_nodes": 20835,
+        "fixture_scored_vectors": 10453,
+        "runs": {
+          "drey-1": 10453,
+          "drey-2": 10453,
+          "naive-1": 10453,
+          "naive-2": 10453
+        },
+        "node_types": [
+          "nt_00",
+          "nt_01",
+          "nt_02",
+          "nt_03",
+          "nt_04"
+        ],
+        "property_filter": null
+      }
+    ],
+    "decay_realized_edges": {
+      "1000": {
+        "samples": 1000,
+        "min": 1848,
+        "p50": 3841,
+        "p95": 37109,
+        "p99": 84323,
+        "max": 84323,
+        "last": 2482
+      },
+      "10000": {
+        "samples": 1000,
+        "min": 1848,
+        "p50": 4393,
+        "p95": 37109,
+        "p99": 84323,
+        "max": 84323,
+        "last": 6086
+      },
+      "100000": {
+        "samples": 1000,
+        "min": 1848,
+        "p50": 4393,
+        "p95": 37109,
+        "p99": 84323,
+        "max": 84323,
+        "last": 2179
+      }
+    },
+    "budget_failures": {
+      "1": [
+        {
+          "op": "decay_edges:batch=1000",
+          "status": "ok",
+          "params": {
+            "batch": "1000"
+          },
+          "samples": 1000,
+          "p50_us": 436.078,
+          "p95_us": 6507.597,
+          "p99_us": 15526.381,
+          "throughput_per_s": 690.1224805224147,
+          "budget_us": 1000.0,
+          "budget_throughput_per_s": null,
+          "budget_source": "synthetic",
+          "pass": false,
+          "counters": {
+            "edges_decayed": 2482
+          }
+        },
+        {
+          "op": "similar_nodes:cand=10000",
+          "status": "ok",
+          "params": {
+            "cand_target": "10000"
+          },
+          "samples": 1000,
+          "p50_us": 24822.244,
+          "p95_us": 25072.502,
+          "p99_us": 25299.481,
+          "throughput_per_s": 40.261480400452626,
+          "budget_us": 10000.0,
+          "budget_throughput_per_s": null,
+          "budget_source": "synthetic",
+          "pass": false,
+          "counters": {
+            "candidates": 10453,
+            "results": 10
+          }
+        }
+      ],
+      "2": [
+        {
+          "op": "decay_edges:batch=1000",
+          "status": "ok",
+          "params": {
+            "batch": "1000"
+          },
+          "samples": 1000,
+          "p50_us": 437.988,
+          "p95_us": 6292.448,
+          "p99_us": 15338.752,
+          "throughput_per_s": 698.2108644037485,
+          "budget_us": 1000.0,
+          "budget_throughput_per_s": null,
+          "budget_source": "synthetic",
+          "pass": false,
+          "counters": {
+            "edges_decayed": 2482
+          }
+        },
+        {
+          "op": "similar_nodes:cand=10000",
+          "status": "ok",
+          "params": {
+            "cand_target": "10000"
+          },
+          "samples": 1000,
+          "p50_us": 24823.724,
+          "p95_us": 25077.833,
+          "p99_us": 25954.398,
+          "throughput_per_s": 40.231365052628114,
+          "budget_us": 10000.0,
+          "budget_throughput_per_s": null,
+          "budget_source": "synthetic",
+          "pass": false,
+          "counters": {
+            "candidates": 10453,
+            "results": 10
+          }
+        }
+      ]
+    },
+    "files": {
+      "workload.mixed.jsonl": "ff5ba9658f3173c8798c0a6b509e7d35123bfff86048538fdaece63f58890a8c",
+      "workload.update_heavy.jsonl": "871bedd133c06ca9e9deb8c3b2da6949168a45be17643ab1987d4b1675b4f9aa",
+      "workload.similarity_heavy.jsonl": "1d46f23c36555d36923bc5fbb36421a55d62505b8bdd559222ec8b88b0a04d3d",
+      "workload.traversal_heavy.jsonl": "4ef8dd947bab5bee51de9ab0ad39930958d8c3015cad5786d5ef10a45f3240af",
+      "workload.measurement.jsonl": "d9c77b812a0c8f12afe7cdd45415b36df9fb88293d112fd5f3ed6fb39cda73a1",
+      "manifest.json": "dfe904fb826a63824c05c672b823ba4a082b12b79bef61f3dded7669f27c58b9",
+      "embeddings.bin": "d7e45d9a5599dce1de75c25456707f5befc87cc848813bbdab7efa398df8e31f",
+      "edges.jsonl": "59f3195d5b18fb3cc85401d0676d3ff53ce774e5a5bd98636b38ade720c8b9bb",
+      "nodes.jsonl": "b66d047739d741c4a062458003b9aac90cb03bedd4fe3f5a82481cd5f5ba6336"
+    }
+  }
+}
