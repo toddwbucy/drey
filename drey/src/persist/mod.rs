@@ -25,7 +25,7 @@ mod seal;
 use sha2::{Digest, Sha256};
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -104,6 +104,8 @@ pub(crate) mod fail {
         pub static WAL_SYNC: Cell<bool> = const { Cell::new(false) };
         pub static SEAL_WRITE: Cell<bool> = const { Cell::new(false) };
         pub static SEAL_PUBLISHED: Cell<bool> = const { Cell::new(false) };
+        /// Count full snapshot loads to pin the constant-work rejection path.
+        pub static SNAPSHOT_LOADS: Cell<usize> = const { Cell::new(0) };
         /// Fail the post-cutover directory fsync in `snapshot`.
         pub static CUTOVER_DIR_FSYNC: Cell<bool> = const { Cell::new(false) };
     }
@@ -610,14 +612,35 @@ impl Graph {
             )));
         }
 
-        // 1. Replay snapshot if present; its epoch bounds which WAL is current.
-        let mut snap_epoch = 0u64;
-        if snapshot_present {
-            let bytes = fs::read(dir.join(SNAPSHOT_FILE))?;
-            let (store, epoch) = load_snapshot(&bytes, &graph.store.indexed, config)?;
+        // Read only the headers and seal before reconstructing any records.
+        // Keep the snapshot handle: a lock-free reader racing rename must not
+        // combine one image's header with another image's body (issue #28).
+        let mut snapshot = if snapshot_present {
+            let mut file = File::open(dir.join(SNAPSHOT_FILE))?;
+            let prefix = read_prefix(&mut file, 16)?;
+            Some((file, prefix))
+        } else {
+            None
+        };
+        let snap_epoch = match &snapshot {
+            Some((_, prefix)) => snapshot_header(prefix)?.0,
+            None => 0,
+        };
+        let mut wal = File::open(dir.join(WAL_FILE))?;
+        let mut bytes = read_prefix(&mut wal, WAL_HEADER_LEN)?;
+        let seal = seal::read(dir, &bytes)?;
+        // This precheck can only refuse. Even a newer-looking snapshot must
+        // pass its checksum and every structural check before any WAL is skipped.
+        seal.reject_newer_epoch(snap_epoch)?;
+
+        // 1. Fully validate the same snapshot image before accepting its state.
+        if let Some((file, bytes)) = &mut snapshot {
+            file.read_to_end(bytes)?;
+            let (store, epoch) = load_snapshot(bytes, &graph.store.indexed, config)?;
+            debug_assert_eq!(epoch, snap_epoch);
             graph.store = store;
-            snap_epoch = epoch;
         }
+        drop(snapshot); // Do not retain the full image alongside the WAL input.
 
         // 2. Replay the committed WAL prefix, unless the WAL is stale (its epoch
         //    predates the snapshot, i.e. a crash left it un-truncated).
@@ -628,8 +651,8 @@ impl Graph {
         // that only existed in the missing snapshot (PRD §10.2.1). The callers
         // refine that error into the missing-snapshot diagnostic once their
         // retry policy is exhausted (`refine_generation_mismatch`).
-        let bytes = fs::read(dir.join(WAL_FILE))?;
-        let replay = match seal::verify(dir, &bytes, snap_epoch)? {
+        wal.read_to_end(&mut bytes)?;
+        let replay = match seal.verify(&bytes, snap_epoch)? {
             Some(len) => {
                 let replay = replay_wal(&mut graph, &bytes[..len], snap_epoch)?;
                 if replay.stale || replay.valid_len != len {
@@ -1563,31 +1586,9 @@ fn save_snapshot(store: &Store, epoch: u64) -> Vec<u8> {
     w.buf
 }
 
-/// Decode and fully validate a snapshot image, returning the reconstructed
-/// store and the snapshot's epoch (its generation).
-///
-/// The image is decoded into a **fresh store** — never the caller's — and
-/// handed over only after every check passes, so a failed load can never leave
-/// a half-installed graph behind (PRD §10.2.1). Beyond structural decoding,
-/// every invariant the public mutation API enforces is re-checked, because a
-/// checksum only proves the bytes are what was written, not that what was
-/// written is well-formed: duplicate ids, dangling endpoints, unsafe
-/// allocators, out-of-range type ids, undeclared/mismatched embeddings,
-/// non-finite weights, and trailing bytes are each a typed `Codec` error.
-///
-/// `base_indexed` carries the opening config's indexed-property registrations
-/// (the snapshot's own registrations union in during decode); `config` gates
-/// embedding dims exactly as the live `register_node_type` does.
-fn load_snapshot(
-    bytes: &[u8],
-    base_indexed: &std::collections::HashSet<(String, String)>,
-    config: &GraphConfig,
-) -> Result<(Store, u64)> {
-    let mut store = Store {
-        indexed: base_indexed.clone(),
-        ..Store::default()
-    };
-
+/// Validate magic/version and extract an epoch for rejection only. The epoch
+/// is covered by the full payload checksum, which has not been checked here.
+fn snapshot_header(bytes: &[u8]) -> Result<(u64, Reader<'_>)> {
     let mut r = Reader::new(bytes);
     let magic = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
     if &magic != MAGIC {
@@ -1600,11 +1601,38 @@ fn load_snapshot(
             supported: FORMAT_VERSION,
         });
     }
+    Ok((r.u64()?, r))
+}
+
+fn read_prefix(file: &mut File, len: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(len);
+    file.take(len as u64).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Decode and fully validate a snapshot image, returning a fresh store and its
+/// epoch. A failed load never installs partial state (PRD §10.2.1). In addition
+/// to the checksum, recheck duplicate IDs, endpoints, allocators, type IDs,
+/// embedding declarations/dimensions, finite weights and trailing bytes.
+/// `base_indexed` unions opening-config indexes with persisted registrations;
+/// `config` gates dimensions exactly as live registration does.
+fn load_snapshot(
+    bytes: &[u8],
+    base_indexed: &std::collections::HashSet<(String, String)>,
+    config: &GraphConfig,
+) -> Result<(Store, u64)> {
+    #[cfg(test)]
+    fail::SNAPSHOT_LOADS.with(|n| n.set(n.get() + 1));
+    let (epoch, mut r) = snapshot_header(bytes)?;
+    let mut store = Store {
+        indexed: base_indexed.clone(),
+        ..Store::default()
+    };
     // Verify the trailing payload checksum before decoding the body, so a
     // corrupt or truncated snapshot fails explicitly instead of loading altered
     // data (PRD §10.2.1). The CRC covers bytes[8..len-4]; magic+version are
     // excluded (handled above) and the trailing 4 bytes are the checksum itself.
-    if bytes.len() < 12 {
+    if bytes.len() < 20 {
         return Err(Error::Codec("snapshot too short for checksum".into()));
     }
     let split = bytes.len() - 4;
@@ -1612,7 +1640,6 @@ fn load_snapshot(
     if crc32(&bytes[8..split]) != stored {
         return Err(Error::Codec("snapshot checksum mismatch".into()));
     }
-    let epoch = r.u64()?;
     store.next_node_id = r.u64()?;
     store.next_edge_id = r.u64()?;
 
@@ -1827,6 +1854,130 @@ mod tests {
 
     fn no_props() -> BTreeMap<String, Value> {
         BTreeMap::new()
+    }
+
+    fn two_snapshots(name: &str) -> (PathBuf, Vec<u8>) {
+        let dir = tmp(name);
+        let mut g = Graph::create(&dir, GraphConfig::default()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.add_node(person(), no_props()).unwrap();
+        g.snapshot().unwrap();
+        let old = fs::read(dir.join(SNAPSHOT_FILE)).unwrap();
+        g.add_node(person(), no_props()).unwrap();
+        g.snapshot().unwrap();
+        (dir, old)
+    }
+
+    fn persisted_bytes(dir: &Path) -> Vec<Vec<u8>> {
+        [SNAPSHOT_FILE, WAL_FILE, seal::FILE]
+            .map(|name| fs::read(dir.join(name)).unwrap())
+            .into()
+    }
+
+    #[test]
+    fn generation_mismatch_skips_snapshot_decode_on_every_open_attempt() {
+        let (dir, old) = two_snapshots("precheck_mismatch");
+        fs::write(dir.join(SNAPSHOT_FILE), old).unwrap();
+        let before = persisted_bytes(&dir);
+        for read_only in [false, true] {
+            fail::SNAPSHOT_LOADS.with(|n| n.set(0));
+            assert!(matches!(
+                Graph::open(
+                    &dir,
+                    GraphConfig {
+                        read_only,
+                        ..Default::default()
+                    }
+                ),
+                Err(Error::GenerationMismatch {
+                    wal_epoch: 2,
+                    snapshot_epoch: 1
+                })
+            ));
+            assert_eq!(fail::SNAPSHOT_LOADS.with(|n| n.get()), 0);
+            assert_eq!(persisted_bytes(&dir), before);
+        }
+    }
+
+    #[test]
+    fn matching_generation_still_decodes_the_complete_snapshot() {
+        let (dir, _) = two_snapshots("precheck_matching");
+        for read_only in [false, true] {
+            fail::SNAPSHOT_LOADS.with(|n| n.set(0));
+            let g = Graph::open(
+                &dir,
+                GraphConfig {
+                    read_only,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(g.counts(), (2, 0));
+            assert_eq!(fail::SNAPSHOT_LOADS.with(|n| n.get()), 1);
+        }
+    }
+
+    #[test]
+    fn precheck_cannot_accept_or_repair_from_an_invalid_newer_snapshot() {
+        let (dir, _) = two_snapshots("precheck_invalid_snapshot");
+        let good = fs::read(dir.join(SNAPSHOT_FILE)).unwrap();
+        for epoch in [2u64, 3] {
+            for valid_checksum in [false, true] {
+                let mut bad = good.clone();
+                bad[8..16].copy_from_slice(&epoch.to_le_bytes());
+                // An unsafe next-node allocator must fail structural validation
+                // even when a checksum-valid snapshot looks newer than the seal.
+                bad[16..24].copy_from_slice(&0u64.to_le_bytes());
+                if valid_checksum {
+                    let split = bad.len() - 4;
+                    let crc = crc32(&bad[8..split]);
+                    bad[split..].copy_from_slice(&crc.to_le_bytes());
+                }
+                fs::write(dir.join(SNAPSHOT_FILE), bad).unwrap();
+                let before = persisted_bytes(&dir);
+                for read_only in [false, true] {
+                    fail::SNAPSHOT_LOADS.with(|n| n.set(0));
+                    assert!(matches!(
+                        Graph::open(
+                            &dir,
+                            GraphConfig {
+                                read_only,
+                                ..Default::default()
+                            }
+                        ),
+                        Err(Error::Codec(_))
+                    ));
+                    assert_eq!(
+                        fail::SNAPSHOT_LOADS.with(|n| n.get()),
+                        if read_only { READ_ONLY_OPEN_RETRIES } else { 1 }
+                    );
+                    assert_eq!(persisted_bytes(&dir), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precheck_rejects_a_corrupt_seal_before_using_its_epoch() {
+        let (dir, old) = two_snapshots("precheck_invalid_seal");
+        fs::write(dir.join(SNAPSHOT_FILE), old).unwrap();
+        let mut seal = fs::read(dir.join(seal::FILE)).unwrap();
+        seal[8] ^= 1;
+        fs::write(dir.join(seal::FILE), seal).unwrap();
+        let before = persisted_bytes(&dir);
+        for read_only in [false, true] {
+            assert!(matches!(
+                Graph::open(
+                    &dir,
+                    GraphConfig {
+                        read_only,
+                        ..Default::default()
+                    }
+                ),
+                Err(Error::Codec(_))
+            ));
+            assert_eq!(persisted_bytes(&dir), before);
+        }
     }
 
     /// The critical audit finding's exact scenario, now exercised: a failed

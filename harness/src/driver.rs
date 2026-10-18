@@ -104,6 +104,24 @@ fn scalar(v: &PropVal) -> Scalar {
     }
 }
 
+/// Match the scalar semantics used by DreyDriver without coercing integers to
+/// f64: that loses equality above 2^53. JSON floats must also match equivalent
+/// integer predicates. Keep strings borrowed on the measured naive scan path.
+fn property_eq(value: Option<&Json>, predicate: &PropVal) -> bool {
+    match (value, predicate) {
+        (Some(Json::String(a)), PropVal::Str(b)) => a == b,
+        (Some(Json::Number(n)), PropVal::I64(_) | PropVal::F64(_)) => {
+            // Same numeric representation as fixture ingestion (`to_value`).
+            let stored = match n.as_i64() {
+                Some(i) => Scalar::I64(i),
+                None => Scalar::F64(n.as_f64().unwrap()),
+            };
+            stored.total_order(&scalar(predicate)).is_eq()
+        }
+        _ => false,
+    }
+}
+
 fn dir(d: Dir) -> DirectionOpt {
     match d {
         Dir::Outbound => DirectionOpt::Outbound,
@@ -692,14 +710,7 @@ impl GraphDriver for NaiveDriver {
                     if &n.node_type != node_type {
                         continue;
                     }
-                    let m = match value {
-                        PropVal::I64(i) => n.props.get(key).and_then(|v| v.as_i64()) == Some(*i),
-                        PropVal::F64(f) => n.props.get(key).and_then(|v| v.as_f64()) == Some(*f),
-                        PropVal::Str(s) => {
-                            n.props.get(key).and_then(|v| v.as_str()) == Some(s.as_str())
-                        }
-                    };
-                    if m {
+                    if property_eq(n.props.get(key), value) {
                         hits += 1;
                     }
                 }
@@ -768,13 +779,7 @@ impl GraphDriver for NaiveDriver {
                         if Some(&n.node_type) != node_types.first() {
                             continue;
                         }
-                        let matches = match (n.props.get(pk), pv) {
-                            (Some(Json::String(s)), PropVal::Str(t)) => s == t,
-                            (Some(Json::Number(num)), PropVal::I64(i)) => num.as_i64() == Some(*i),
-                            (Some(Json::Number(num)), PropVal::F64(f)) => num.as_f64() == Some(*f),
-                            _ => false,
-                        };
-                        if !matches {
+                        if !property_eq(n.props.get(pk), pv) {
                             continue;
                         }
                     }
@@ -804,5 +809,187 @@ impl GraphDriver for NaiveDriver {
             // the rest report n/a rather than fabricate a measurement.
             _ => Ok(OpOutcome::na()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generator::FixtureNode;
+    use crate::params::{Fanout, Parameters, SizeClass};
+    use serde_json::json;
+
+    /// Tiny in-memory cases, with explicit expected counts rather than just
+    /// driver agreement: a shared comparator must not make the oracle vacuous.
+    fn equality_cases() -> Vec<(Vec<Json>, PropVal, u64)> {
+        vec![
+            (vec![json!(5), json!(5.0), json!(6)], PropVal::I64(5), 2),
+            (vec![json!(5), json!(5.0), json!(6)], PropVal::F64(5.0), 2),
+            (
+                vec![json!(-0.0), json!(0.0), json!(0), json!(-1)],
+                PropVal::I64(0),
+                3,
+            ),
+            (
+                vec![json!(-0.0), json!(0.0), json!(0), json!(-1)],
+                PropVal::F64(0.0),
+                3,
+            ),
+            (
+                vec![json!(-1.5), json!(-1), json!(1.5)],
+                PropVal::I64(-1),
+                1,
+            ),
+            (
+                vec![json!(-1.5), json!(-1), json!(1.5)],
+                PropVal::F64(1.5),
+                1,
+            ),
+            (
+                vec![
+                    json!(9_007_199_254_740_992i64),
+                    json!(9_007_199_254_740_993i64),
+                ],
+                PropVal::F64(9_007_199_254_740_992.0),
+                1,
+            ),
+            (
+                vec![
+                    json!(9_007_199_254_740_992.0),
+                    json!(9_007_199_254_740_993i64),
+                ],
+                PropVal::I64(9_007_199_254_740_993),
+                1,
+            ),
+            (
+                vec![json!(i64::MAX), json!(9_223_372_036_854_775_808.0)],
+                PropVal::I64(i64::MAX),
+                1,
+            ),
+            (
+                vec![json!(i64::MAX), json!(9_223_372_036_854_775_808.0)],
+                PropVal::F64(9_223_372_036_854_775_808.0),
+                1,
+            ),
+            (
+                vec![json!(i64::MIN), json!(-9_223_372_036_854_775_808.0)],
+                PropVal::I64(i64::MIN),
+                2,
+            ),
+            (
+                vec![json!(i64::MIN), json!(-9_223_372_036_854_775_808.0)],
+                PropVal::F64(-9_223_372_036_854_775_808.0),
+                2,
+            ),
+            (
+                vec![json!("5"), json!(5), json!(5.0)],
+                PropVal::Str("5".into()),
+                1,
+            ),
+            (vec![json!("5"), json!(5), json!(5.0)], PropVal::I64(5), 2),
+        ]
+    }
+
+    fn equality_fixture(key: &str, values: Vec<Json>) -> Fixture {
+        let decoy = values[0].clone();
+        let mut nodes: Vec<_> = values
+            .into_iter()
+            .enumerate()
+            .map(|(id, v)| FixtureNode {
+                id: id as u64,
+                node_type: "nt_00".into(),
+                props: serde_json::Map::from_iter([(key.into(), v)]),
+            })
+            .collect();
+        // Missing keys and matching properties on a different type must not
+        // inflate either the property hits or the scored-candidate count.
+        nodes.push(FixtureNode {
+            id: nodes.len() as u64,
+            node_type: "nt_00".into(),
+            props: Default::default(),
+        });
+        nodes.push(FixtureNode {
+            id: nodes.len() as u64,
+            node_type: "nt_01".into(),
+            props: serde_json::Map::from_iter([(key.into(), decoy)]),
+        });
+        Fixture {
+            params: Parameters {
+                nodes: nodes.len() as u64,
+                edges: 0,
+                node_types: 2,
+                embed_dim: 2,
+                ..Parameters::new(SizeClass::Small, Fanout::Low, 42)
+            },
+            embeddings: nodes.iter().map(|n| (n.id, vec![1.0, 0.0])).collect(),
+            nodes,
+            edges: vec![],
+        }
+    }
+
+    fn check_equality(similar: bool) {
+        // Exercise DREY's indexed and scan paths against the naive scan.
+        for key in ["p_seq", "p_score"] {
+            for (values, predicate, expected) in equality_cases() {
+                let fx = equality_fixture(key, values);
+                let op = if similar {
+                    WorkloadOp::Similar {
+                        seed_node: 0,
+                        k: 100,
+                        node_types: vec!["nt_00".into(), "nt_01".into()],
+                        prop_filter: Some((key.into(), predicate)),
+                        cand_target: 100,
+                        candidates: 999,
+                    }
+                } else {
+                    WorkloadOp::PropertyEq {
+                        node_type: "nt_00".into(),
+                        key: key.into(),
+                        value: predicate,
+                        sel: "probe".into(),
+                    }
+                };
+                for mut driver in [
+                    Box::new(DreyDriver::new()) as Box<dyn GraphDriver>,
+                    Box::new(NaiveDriver::new()),
+                ] {
+                    driver.load_fixture(&fx).unwrap();
+                    driver.prepare_op(&op).unwrap();
+                    let result = driver.run_op(&op).unwrap();
+                    assert_eq!(result.status, OpStatus::Ok);
+                    if similar {
+                        assert_eq!(
+                            result.counters["candidates"],
+                            expected,
+                            "{} {op:?}",
+                            driver.name()
+                        );
+                        assert_eq!(
+                            result.counters["results"],
+                            expected,
+                            "{} {op:?}",
+                            driver.name()
+                        );
+                    } else {
+                        assert_eq!(
+                            result.counters["hits"],
+                            expected,
+                            "{} {op:?}",
+                            driver.name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn property_equality_preserves_cross_variant_and_large_integer_semantics() {
+        check_equality(false);
+    }
+
+    #[test]
+    fn similar_filter_preserves_cross_variant_and_large_integer_semantics() {
+        check_equality(true);
     }
 }
