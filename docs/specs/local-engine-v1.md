@@ -151,6 +151,18 @@ engine executes all selection, scoring, expansion, and projection against one gr
 It does not offer arbitrary operator reordering or filtering after an intermediate
 top-k. Filter indexes are owned and maintained by the same mutation/recovery paths.
 
+For type selection, the first configured indexed filter supplies the candidate
+seed. Equality seeks its value directly; ranges seek their inclusive bounds and
+visit only matching value buckets. Inverted ranges are empty. Every candidate is
+still checked against all filters. If no filter is indexed, selection scans the
+type. Filter order can affect work; cost-based index choice is deferred.
+
+Indexes are explicit `(node_type, property_key)` entries in `DatabaseConfig.indexes`,
+persisted with the engine schema and rebuilt on open. They are non-unique and no
+property name is automatically indexed. For the lower-level `Graph` API, supply
+`GraphConfig.indexed_properties` again on every open/import to select its indexed
+query path; snapshot registrations alone do not enable that path.
+
 Unranked results order by node ID; ranked results order by score, with ascending node
 ID as tie-break. Dot/cosine are descending; Euclidean distance is ascending. Walks are
 breadth-first, include the start in reachability, visit each node once, and retain each
@@ -160,8 +172,13 @@ identity/endpoints/type/weight/properties and depth. Returned document IDs and s
 preserve provenance within the single database; cross-database identity is deferred.
 
 Resource exhaustion fails the entire request rather than returning a truncated success.
-`max_query_work` counts selected/index/adjacency visits; `max_candidates` separately
-bounds scored records, and dimensions bound work per record. Projection/output byte
+`max_query_work` counts one unit per indexed seek (including misses/empty indexes),
+one per matching range bucket, and selected-node/adjacency visits. Equality charges
+the seek plus each candidate; it does not visit unrelated index values. These are
+logical work units, not tree-comparison, CPU-time, or serialization measurements.
+All candidate visits count even when later filters reject them, and a winner limit
+does not bypass the work ceiling. `max_candidates` separately bounds retained
+candidates, and dimensions bound work per record. Projection/output byte
 limits are enforced alongside these. A caller may lower the work limit, never raise
 the database ceiling. The response does not claim a completeness guarantee beyond the
 explicit winner limit, projection, and walk depth requested.

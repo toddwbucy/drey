@@ -1,6 +1,9 @@
 use super::*;
-use crate::{Direction, NodeId, Scalar};
-use std::collections::{BTreeSet, VecDeque};
+use crate::{types::ScalarKey, Direction, NodeId, Scalar};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    ops::Bound,
+};
 
 type WalkResult = (BTreeSet<u64>, Vec<(u64, u64, usize)>);
 
@@ -134,12 +137,39 @@ impl Engine {
                         .contains(&(node_type.clone(), f.key.clone()))
                 });
                 if let Some(f) = indexed {
+                    // Charge the seek even for a missing value/empty index. Do
+                    // not materialize matches before enforcing the work bound.
+                    work.tick()?;
                     if let Some(tree) = self.graph.store.prop_index.get(&(tid, f.key.clone())) {
-                        for (key, ids) in tree {
-                            work.tick()?;
-                            if matches(&key.0, &f.predicate) {
-                                for id in ids {
-                                    consider(*id, &mut work)?;
+                        match &f.predicate {
+                            Predicate::Eq(value) => {
+                                if let Some(ids) = tree.get(&ScalarKey(value.clone())) {
+                                    for id in ids {
+                                        consider(*id, &mut work)?;
+                                    }
+                                }
+                            }
+                            Predicate::Range { min, max }
+                                if min
+                                    .as_ref()
+                                    .zip(max.as_ref())
+                                    .is_some_and(|(lo, hi)| lo.total_order(hi).is_gt()) =>
+                            {
+                                // Inverted bounds match nothing; BTreeMap::range
+                                // would panic. This matches the scan predicate.
+                            }
+                            Predicate::Range { min, max } => {
+                                let lower = min.as_ref().map_or(Bound::Unbounded, |v| {
+                                    Bound::Included(ScalarKey(v.clone()))
+                                });
+                                let upper = max.as_ref().map_or(Bound::Unbounded, |v| {
+                                    Bound::Included(ScalarKey(v.clone()))
+                                });
+                                for (_, ids) in tree.range((lower, upper)) {
+                                    work.tick()?; // each matching range bucket
+                                    for id in ids {
+                                        consider(*id, &mut work)?;
+                                    }
                                 }
                             }
                         }

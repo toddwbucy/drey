@@ -47,6 +47,9 @@ pub struct IndexedProperty {
 #[derive(Clone, Debug)]
 pub struct GraphConfig {
     /// Properties to maintain a scalar index over (PRD §8).
+    /// Supply these on each `Graph::create`, `open`, or `import` call: query
+    /// dispatch uses this configuration even if a snapshot retains additional
+    /// index registrations. Unconfigured property queries fall back to a scan.
     pub indexed_properties: Vec<IndexedProperty>,
     /// Similarity scan bound (PRD §13.1).
     pub scan_ceiling: ScanCeiling,

@@ -1,0 +1,27 @@
+{"p50_us":0.11,"p95_us":0.12,"p99_us":0.14,"path":"graph_id","population":100,"samples":1000,"warmup":200}
+{"p50_us":0.31,"p95_us":0.34,"p99_us":0.35,"path":"graph_indexed_key","population":100,"samples":1000,"warmup":200}
+{"p50_us":4.05,"p95_us":4.179,"p99_us":4.3,"path":"graph_unindexed_key","population":100,"samples":1000,"warmup":200}
+{"p50_us":0.19,"p95_us":0.22,"p99_us":0.23,"path":"graph_import_same_config","population":100,"samples":1000,"warmup":200}
+{"p50_us":3.88,"p95_us":3.96,"p99_us":4.01,"path":"graph_import_default_config","population":100,"samples":1000,"warmup":200}
+{"p50_us":1.86,"p95_us":1.93,"p99_us":1.96,"path":"engine_indexed_key","population":100,"samples":1000,"warmup":200}
+{"p50_us":2.19,"p95_us":2.39,"p99_us":2.45,"path":"engine_indexed_range","population":100,"samples":1000,"warmup":200}
+{"p50_us":0.98,"p95_us":1.05,"p99_us":1.07,"path":"engine_id","population":100,"samples":1000,"warmup":200}
+{"details":[{"candidates":1,"hits":1,"missing":false,"work":101,"work_limit_8_result":"Err(ResourceLimit(\"query work\"))"},{"candidates":0,"hits":0,"missing":true,"work":100,"work_limit_8_result":"Err(ResourceLimit(\"query work\"))"}],"engine_reopen_hits":1,"engine_reopen_work":101,"population":100,"single_value_range_work":101}
+{"p50_us":0.19,"p95_us":0.36,"p99_us":0.43,"path":"graph_id","population":1000,"samples":1000,"warmup":200}
+{"p50_us":0.39,"p95_us":0.58,"p99_us":0.71,"path":"graph_indexed_key","population":1000,"samples":1000,"warmup":200}
+{"p50_us":45.7,"p95_us":47.38,"p99_us":52.289,"path":"graph_unindexed_key","population":1000,"samples":1000,"warmup":200}
+{"p50_us":0.23,"p95_us":0.4,"p99_us":0.53,"path":"graph_import_same_config","population":1000,"samples":1000,"warmup":200}
+{"p50_us":43.149,"p95_us":44.39,"p99_us":48.11,"path":"graph_import_default_config","population":1000,"samples":1000,"warmup":200}
+{"p50_us":8.72,"p95_us":8.83,"p99_us":9.21,"path":"engine_indexed_key","population":1000,"samples":1000,"warmup":200}
+{"p50_us":11.09,"p95_us":12.84,"p99_us":13.79,"path":"engine_indexed_range","population":1000,"samples":1000,"warmup":200}
+{"p50_us":0.96,"p95_us":1.03,"p99_us":1.08,"path":"engine_id","population":1000,"samples":1000,"warmup":200}
+{"details":[{"candidates":1,"hits":1,"missing":false,"work":1001,"work_limit_8_result":"Err(ResourceLimit(\"query work\"))"},{"candidates":0,"hits":0,"missing":true,"work":1000,"work_limit_8_result":"Err(ResourceLimit(\"query work\"))"}],"engine_reopen_hits":1,"engine_reopen_work":1001,"population":1000,"single_value_range_work":1001}
+{"p50_us":0.16,"p95_us":0.37,"p99_us":0.45,"path":"graph_id","population":10000,"samples":1000,"warmup":200}
+{"p50_us":0.47,"p95_us":0.71,"p99_us":0.88,"path":"graph_indexed_key","population":10000,"samples":1000,"warmup":200}
+{"p50_us":622.487,"p95_us":630.277,"p99_us":642.577,"path":"graph_unindexed_key","population":10000,"samples":1000,"warmup":200}
+{"p50_us":0.49,"p95_us":0.79,"p99_us":0.97,"path":"graph_import_same_config","population":10000,"samples":1000,"warmup":200}
+{"p50_us":558.238,"p95_us":564.837,"p99_us":570.247,"path":"graph_import_default_config","population":10000,"samples":1000,"warmup":200}
+{"p50_us":91.33,"p95_us":95.64,"p99_us":96.7,"path":"engine_indexed_key","population":10000,"samples":1000,"warmup":200}
+{"p50_us":113.56,"p95_us":129.42,"p99_us":132.209,"path":"engine_indexed_range","population":10000,"samples":1000,"warmup":200}
+{"p50_us":0.98,"p95_us":1.14,"p99_us":1.27,"path":"engine_id","population":10000,"samples":1000,"warmup":200}
+{"details":[{"candidates":1,"hits":1,"missing":false,"work":10001,"work_limit_8_result":"Err(ResourceLimit(\"query work\"))"},{"candidates":0,"hits":0,"missing":true,"work":10000,"work_limit_8_result":"Err(ResourceLimit(\"query work\"))"}],"engine_reopen_hits":1,"engine_reopen_work":10001,"population":10000,"single_value_range_work":10001}
