@@ -351,12 +351,11 @@ fn fsync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// On non-Unix platforms a directory cannot be opened with `File::open` (on
-/// Windows it needs `FILE_FLAG_BACKUP_SEMANTICS`), and NTFS does not expose a
-/// directory-fsync durability point the way POSIX does — rename durability is
-/// handled by the filesystem journal. A no-op keeps `create`/`open`/`snapshot`
-/// operable instead of failing on every call; the (weaker) durability posture
-/// on those platforms is documented in `docs/specs/m2-durability.md`.
+/// Directory synchronization is not implemented on non-Unix targets. File
+/// contents are still fsynced, but publication of snapshot and commit-seal
+/// renames lacks the Unix ordering guarantee. This includes ordinary v4
+/// commits, not only checkpoints. This does not enforce a platform refusal;
+/// see the platform scope in `docs/specs/m2-durability.md` (issue #26).
 #[cfg(not(unix))]
 fn fsync_dir(_dir: &Path) -> Result<()> {
     Ok(())
