@@ -106,7 +106,7 @@ the audit's damaged length prefix and a damaged final marker, refuse without rep
 Only bytes beyond a validated seal are unacknowledged and may be discarded.
 
 Checkpoint first commits, then writes/fsyncs/renames a full snapshot with a new epoch,
-fsyncs its directory, and atomically resets WAL and seal. A newer validated snapshot
+fsyncs its directory, then replaces WAL and seal in recoverable order. A newer validated snapshot
 supersedes the old epoch's WAL and seal after an interrupted rotation. A corrupt or
 missing seal is not guessed away. Failures after publication may recover either the
 old or complete new operation, and retry receipts resolve that ambiguity. Tests inject
@@ -169,6 +169,8 @@ and index overhead; it is not a hard RSS limit. Allocator capacity, transport bu
 staging, snapshot encoding, and recovery input add to residency. The service has at
 most eight 32 MiB input frames in flight, plus bounded responses and one executing
 engine operation. Size the database ceiling with those peaks and model memory in mind.
+WAL history grows until an explicit checkpoint; recovery currently reads the complete
+WAL into memory. Schedule checkpoints to bound that history and its recovery peak.
 There is no transparent offload: close/reopen is full unload/reload. Allocation failure
 may terminate the process; recovery retains the last acknowledged commit.
 

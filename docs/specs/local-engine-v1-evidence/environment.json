@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-18",
+  "base_commit": "7b21aa7e486f6f7f9a2784f7efc66eb99ce8acfc",
+  "branch": "feat/local-engine-v1",
+  "cpu": "AMD Ryzen Threadripper 7960X",
+  "physical_cores": 24,
+  "logical_cpus": 48,
+  "ram_approx_gib": 248.91,
+  "os": "Linux x86-64",
+  "filesystem": "zfs",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "profile": "release",
+  "inference_load": "not measured; background OS load uncontrolled",
+  "commands": [
+    "cargo build --release --workspace --locked --offline",
+    "local_bench NEW_DIRECTORY 1000 256 512",
+    "local_bench NEW_DIRECTORY 10000 1024 4096"
+  ],
+  "binary_sha256": {
+    "drey-local": "ff817b2fa7c742b606b36c28cb6832457fb97c06e2e1d92aaba86414535844a3",
+    "local_bench": "b06331c1277fc25fcd129ef27abdc2e1c2e757decaf7811159e6f518495a98e3"
+  },
+  "notes": [
+    "One timing run per fixture; nearest-rank percentiles, 100 warmups and 1000 retained samples per bucket.",
+    "Background writer submits a durable single-node replacement, then sleeps 1 ms; requests serialize at the owner.",
+    "RSS is process-wide; pre-query high-water includes fixture ingestion, checkpoint and reopen.",
+    "No decoder-window target or speedup comparison.",
+    "Code was committed before the final measurements. Subsequent commits contain documentation/evidence only."
+  ],
+  "source_commit": "b0ac70b063b0841980654eb39117a2079ed4ef86",
+  "ram_bytes": 267268870144
+}
