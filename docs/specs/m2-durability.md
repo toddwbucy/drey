@@ -1,5 +1,23 @@
 # M2 Durability & Persistence - Decision Record
 
+## Current format: v4 commit seal (2026-10-18)
+
+The [local-engine contract](local-engine-v1.md#persistence-format-4-and-recovery)
+supersedes the historical v1-v3 tail-classification rules below. A mandatory,
+checksummed `commit.seal` records the epoch, acknowledged WAL length, and SHA-256
+of that exact prefix. Commit fsyncs the WAL, atomically publishes/fsyncs the seal,
+and only then acknowledges. Recovery validates the complete prefix before replay
+or truncation. Corrupt acknowledged lengths, payloads, final markers, or headers
+now refuse without changing history; only bytes beyond a valid seal are discarded.
+This resolves the length-prefix loss reproduced in issue #29. Version-3 directories
+are refused explicitly; `Graph::import_v3_snapshot` provides a read-only snapshot
+conversion bridge without guessing about legacy WAL acknowledgements.
+
+The remaining text records the original design and format evolution. Where it
+classifies damage from following frames alone or describes a remaining length-prefix
+limitation, that is historical behavior before the v4 seal, not current recovery.
+
+
 Status: retroactive record, 2026-07-03; revised 2026-07-16 for the issue #22 /
 repo-review hardening pass (recovery-matrix corrections, snapshot-load
 validation, open-time locking order, export preconditions). The M2

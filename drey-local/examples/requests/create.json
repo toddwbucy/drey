@@ -1,0 +1,21 @@
+{
+  "op": "create",
+  "config": {
+    "types": {
+      "passage": {
+        "model": "example",
+        "revision": "1",
+        "dimensions": 2,
+        "metric": "cosine",
+        "unit_normalized": false
+      },
+      "source": null
+    },
+    "indexes": [
+      [
+        "passage",
+        "category"
+      ]
+    ]
+  }
+}

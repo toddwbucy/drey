@@ -8,6 +8,7 @@ description = "M0 fixture generator and measurement harness for drey. Test appar
 
 [dependencies]
 drey = { path = "../drey" }
+drey-local = { path = "../drey-local" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"

@@ -3,7 +3,7 @@
 # (spec §5.1). Keep it that way: nothing in `drey/` may depend on `harness`.
 [workspace]
 resolver = "2"
-members = ["drey", "harness"]
+members = ["drey", "drey-local", "harness"]
 
 [workspace.package]
 edition = "2021"

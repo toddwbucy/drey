@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**v0.1 implemented.** `docs/drey-PRD-v0_8.md` is the authoritative spec; `docs/specs/` holds the
+**v0.1 implemented; local engine v1 added for issue #29.** The governing extension is
+`docs/specs/local-engine-v1.md`: atomic batches, format-4 commit seals, bounded combined
+queries, and an optional Linux Unix-socket service/client in `drey-local/`.
+
+`docs/drey-PRD-v0_8.md` is the authoritative spec; `docs/specs/` holds the
 implementation specs beneath it. The crate is named `drey` (renamed 2026-07-02 from the
 working name `weaver-graph`). Read the PRD before structural work - it records not just
 decisions but their rationale and the rejected alternatives.
@@ -21,7 +25,7 @@ history, and failure semantics are recorded in `docs/specs/m2-durability.md`; ev
 open question is dispositioned in `docs/specs/open-questions-ledger.md`.
 
 ### Workspace layout
-- `drey/` - the publishable crate. Single crate, `serde` its only dependency.
+- `drey/` - the publishable crate. Resident graph and engine; dependencies are `serde`, `serde_json`, and `sha2`.
   - `types` `error` `config` `mutation` - data model and API-support types (PRD §7, §9, §19).
   - `store` `interner` - memory-primary graph + §8 index set (nested `node → edge_type →
     [edge]` adjacency, ordered scalar property index).
@@ -29,6 +33,7 @@ open question is dispositioned in `docs/specs/open-questions-ledger.md`.
   - `query` `traverse` `similarity` - reads (PRD §9.3, §9.4).
   - `export` (`GraphFeatureExport`, M4) `read` (`PropertyGraphRead` seam, M5).
   - `persist/` - WAL + snapshot durability, hand-rolled binary codec (M2).
+- `drey-local/` - optional Unix-socket owner and versioned client; depends on `drey`, never the reverse.
 - `harness/` - **throwaway M0 apparatus, `publish = false`, never a `drey` dependency**
   (the dependency arrow points harness → drey only). Fixture generator, workload plans,
   `GraphDriver` (`NaiveDriver`/`DreyDriver`), runner, JSON output; `generate` + `bench` bins.
@@ -67,7 +72,7 @@ as an executable conformance suite, not here.
    ranking policy - belongs to the consumer. This razor decides most API questions.
 2. **Memory-primary.** All queries run against RAM. Disk is reconstruction-only, never on
    the query path. A design that reads storage to answer a query is wrong.
-3. **One process, one graph, single writer.** Isolation is the OS process boundary, not an
+3. **One process, one graph, single writer.** The optional service serializes all engine operations; its versioned contract is in the extension above. Isolation is the OS process boundary, not an
    internal access-control model. Synchronous API, no async runtime dependency.
 4. **SQLite-class weight.** Link size, resident memory, open time, and zero operational
    surface are judged; heaviness is a defect even when performance is adequate.

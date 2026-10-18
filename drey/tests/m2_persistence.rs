@@ -48,6 +48,29 @@ fn create_open_distinctness() {
 }
 
 #[test]
+fn explicit_v3_snapshot_conversion_preserves_source_and_ids() {
+    let dir = tmp("convert_v3");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("legacy.bin");
+    let mut graph = Graph::in_memory(config());
+    graph.register_node_type(person(), None).unwrap();
+    let id = graph.add_node(person(), props(&[])).unwrap();
+    graph.export(&path).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+    fs::write(&path, &bytes).unwrap();
+    assert!(matches!(
+        Graph::import(&path, config()),
+        Err(Error::VersionMismatch { .. })
+    ));
+    let converted = Graph::import_v3_snapshot(&path, config()).unwrap();
+    assert!(converted.node(id).unwrap().is_some());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    converted.export(dir.join("converted.bin")).unwrap();
+    assert!(Graph::import(dir.join("converted.bin"), config()).is_ok());
+}
+
+#[test]
 fn round_trip_preserves_everything_byte_exact() {
     let dir = tmp("round_trip");
     let (a, b, e);
@@ -122,12 +145,14 @@ fn recovery_crash_during_commit_loads_prior() {
     let dir = tmp("crash_during_commit");
     let a;
     let size_after_first;
+    let prior_seal;
     {
         let mut g = Graph::create(&dir, config()).unwrap();
         g.register_node_type(person(), None).unwrap();
         a = g.add_node(person(), props(&[])).unwrap();
         g.commit().unwrap();
         size_after_first = fs::metadata(dir.join("wal.log")).unwrap().len();
+        prior_seal = fs::read(dir.join("commit.seal")).unwrap();
         // A second committed batch...
         let _b = g.add_node(person(), props(&[])).unwrap();
         g.commit().unwrap();
@@ -140,6 +165,8 @@ fn recovery_crash_during_commit_loads_prior() {
     f.set_len(size_after_first + 5).unwrap();
     drop(f);
 
+    // Simulate interruption BEFORE publication of the second acknowledgement.
+    fs::write(dir.join("commit.seal"), prior_seal).unwrap();
     let g = Graph::open(&dir, config()).unwrap();
     // Never a partial blend: exactly the prior committed graph loads.
     assert_eq!(g.counts().0, 1);
@@ -257,6 +284,7 @@ fn recovery_snapshot_crash_before_wal_truncation_skips_stale_wal() {
     let b;
     let e;
     let stale_wal;
+    let stale_seal;
     {
         let mut g = Graph::create(&dir, config()).unwrap();
         g.register_node_type(person(), None).unwrap();
@@ -268,11 +296,13 @@ fn recovery_snapshot_crash_before_wal_truncation_skips_stale_wal() {
         g.commit().unwrap();
         // Capture the pre-snapshot WAL (old epoch, contains the decay).
         stale_wal = fs::read(dir.join("wal.log")).unwrap();
+        stale_seal = fs::read(dir.join("commit.seal")).unwrap();
         // Snapshot bakes weight 0.5 in and bumps to epoch 1, resetting the WAL.
         g.snapshot().unwrap();
     }
     // Simulate the crash: restore the old-epoch WAL as if truncation never ran.
     fs::write(dir.join("wal.log"), &stale_wal).unwrap();
+    fs::write(dir.join("commit.seal"), &stale_seal).unwrap();
 
     let c;
     {
@@ -353,11 +383,8 @@ fn collect_nodes(g: &Graph) -> Vec<Node> {
 }
 
 #[test]
-fn wal_crc_byteflip_inside_frame_loads_only_prior_prefix() {
-    // A bit-flip inside a committed frame's payload (length prefix intact) must
-    // reach the CRC check and be rejected — replay stops at the bad frame and
-    // loads only the prior committed prefix, never a blended/corrupt graph
-    // (PRD §10.2.1). Exercises the crc32 branch the framing-break tests miss.
+fn wal_crc_byteflip_inside_acknowledged_frame_refuses() {
+    // The v4 seal proves the final batch was acknowledged. Never discard it.
     let dir = tmp("wal_crc_flip");
     let a;
     let size_after_first;
@@ -381,9 +408,9 @@ fn wal_crc_byteflip_inside_frame_loads_only_prior_prefix() {
     bytes[flip] ^= 0xFF;
     fs::write(&path, &bytes).unwrap();
 
-    let g = Graph::open(&dir, config()).unwrap();
-    assert_eq!(g.counts().0, 1, "corrupt batch 2 must be discarded");
-    assert!(g.node(a).unwrap().is_some());
+    let _ = a;
+    assert!(matches!(Graph::open(&dir, config()), Err(Error::Codec(_))));
+    assert_eq!(fs::read(&path).unwrap(), bytes, "refusal preserves history");
 }
 
 #[test]
@@ -686,12 +713,14 @@ fn recovery_mutation_frames_without_commit_marker_are_discarded() {
     let dir = tmp("staged_discard");
     let a;
     let size_after_first;
+    let prior_seal;
     {
         let mut g = Graph::create(&dir, config()).unwrap();
         g.register_node_type(person(), None).unwrap();
         a = g.add_node(person(), props(&[])).unwrap();
         g.commit().unwrap();
         size_after_first = fs::metadata(dir.join("wal.log")).unwrap().len();
+        prior_seal = fs::read(dir.join("commit.seal")).unwrap();
         let _b = g.add_node(person(), props(&[])).unwrap();
         g.commit().unwrap();
     }
@@ -710,6 +739,8 @@ fn recovery_mutation_frames_without_commit_marker_are_discarded() {
         .set_len(size_after_second - 9)
         .unwrap();
 
+    // Simulate interruption BEFORE publication of the second acknowledgement.
+    fs::write(dir.join("commit.seal"), prior_seal).unwrap();
     let g = Graph::open(&dir, config()).unwrap();
     assert_eq!(
         g.counts().0,
@@ -792,23 +823,14 @@ fn legacy_16_byte_v2_wal_fails_with_version_mismatch_not_silent_stale() {
 }
 
 #[test]
-fn torn_header_write_recovers_as_empty_stale_wal() {
-    // A crash mid-header-write leaves a prefix of a valid v3 header. Both torn
-    // shapes — under 8 bytes (no version to check) and 8..20 bytes (valid
-    // magic+version, missing epoch/CRC) — must recover as a stale empty WAL,
-    // not error: there is no committed content to lose.
-    for &torn_at in &[5usize, 12] {
+fn damaged_acknowledged_header_refuses_without_repair() {
+    for torn_at in [5usize, 12] {
         let dir = tmp(&format!("torn_header_{torn_at}"));
-        {
-            let mut g = Graph::create(&dir, config()).unwrap();
-            g.register_node_type(person(), None).unwrap();
-        }
+        drop(Graph::create(&dir, config()).unwrap());
         let bytes = fs::read(dir.join("wal.log")).unwrap();
         fs::write(dir.join("wal.log"), &bytes[..torn_at]).unwrap();
-
-        let g = Graph::open(&dir, config())
-            .unwrap_or_else(|e| panic!("torn {torn_at}-byte header must recover, got {e}"));
-        assert_eq!(g.counts(), (0, 0), "torn at {torn_at}");
+        assert!(Graph::open(&dir, config()).is_err());
+        assert_eq!(fs::read(dir.join("wal.log")).unwrap(), &bytes[..torn_at]);
     }
 }
 
@@ -971,11 +993,8 @@ fn corrupt_final_marker_with_bytes_after_fails_open() {
 }
 
 #[test]
-fn corrupt_final_marker_at_eof_recovers_as_torn_commit() {
-    // The counterpart guard (the over-refusal direction): a corrupt final
-    // marker with NOTHING after it is byte-indistinguishable from a torn
-    // commit whose marker page landed as garbage — recovery discards that
-    // batch and loads the prior state, it must not refuse.
+fn corrupt_acknowledged_final_marker_at_eof_refuses() {
+    // The v4 seal proves the final batch was acknowledged. Never discard it.
     let dir = tmp("final_marker_eof");
     let a;
     {
@@ -992,13 +1011,9 @@ fn corrupt_final_marker_at_eof_recovers_as_torn_commit() {
     bytes[last] ^= 0xFF; // final marker payload garbled, nothing after
     fs::write(&path, &bytes).unwrap();
 
-    let g = Graph::open(&dir, config()).unwrap();
-    assert_eq!(
-        g.counts().0,
-        1,
-        "torn final commit must be discarded, not refused"
-    );
-    assert!(g.node(a).unwrap().is_some());
+    let _ = a;
+    assert!(matches!(Graph::open(&dir, config()), Err(Error::Codec(_))));
+    assert_eq!(fs::read(&path).unwrap(), bytes, "refusal preserves history");
 }
 
 #[test]
@@ -1037,12 +1052,8 @@ fn torn_fragment_after_damaged_final_batch_fails_open() {
 }
 
 #[test]
-fn corruption_in_final_batch_still_recovers_as_torn_commit() {
-    // The counterpart cell: damage confined to the FINAL batch with nothing
-    // after it is byte-indistinguishable from a torn, unacknowledged commit
-    // (the kernel may persist a batch's pages in any order before fsync
-    // returns), so recovery discards that batch instead of refusing — the
-    // long-standing crash-recovery contract.
+fn corruption_in_acknowledged_final_batch_refuses() {
+    // The v4 seal proves the final batch was acknowledged. Never discard it.
     let dir = tmp("final_batch_corruption");
     let a;
     let size_after_first;
@@ -1062,9 +1073,9 @@ fn corruption_in_final_batch_still_recovers_as_torn_commit() {
     bytes[off + 8 + len - 1] ^= 0xFF;
     fs::write(&path, &bytes).unwrap();
 
-    let g = Graph::open(&dir, config()).unwrap();
-    assert_eq!(g.counts().0, 1);
-    assert!(g.node(a).unwrap().is_some());
+    let _ = a;
+    assert!(matches!(Graph::open(&dir, config()), Err(Error::Codec(_))));
+    assert_eq!(fs::read(&path).unwrap(), bytes, "refusal preserves history");
 }
 
 #[test]
@@ -1161,34 +1172,20 @@ fn missing_wal_beside_snapshot_fails_open() {
 }
 
 #[test]
-fn torn_wal_reheader_after_snapshot_recovers_at_snapshot_state() {
-    // The legitimate crash window the missing-WAL refusal must NOT catch: a
-    // crash mid-way through snapshot()'s WAL re-header leaves wal.log torn
-    // below the 20-byte header. Everything is already folded into the new
-    // snapshot, so opening at snapshot state is exact recovery, not loss.
+fn damaged_wal_header_after_snapshot_refuses_without_repair() {
     let dir = tmp("torn_reheader");
-    let a;
-    {
-        let mut g = Graph::create(&dir, config()).unwrap();
-        g.register_node_type(person(), None).unwrap();
-        a = g.add_node(person(), props(&[])).unwrap();
-        g.commit().unwrap();
-        g.snapshot().unwrap();
-    }
+    let mut graph = Graph::create(&dir, config()).unwrap();
+    graph.register_node_type(person(), None).unwrap();
+    graph.add_node(person(), props(&[])).unwrap();
+    graph.snapshot().unwrap();
+    drop(graph);
     let wal = dir.join("wal.log");
     let bytes = fs::read(&wal).unwrap();
-    fs::write(&wal, &bytes[..7]).unwrap(); // torn mid-header
-
-    let c;
-    {
-        let mut g = Graph::open(&dir, config()).unwrap();
-        assert_eq!(g.counts().0, 1);
-        assert!(g.node(a).unwrap().is_some());
-        c = g.add_node(person(), props(&[])).unwrap();
-        g.commit().unwrap();
-    }
-    let g = Graph::open(&dir, config()).unwrap();
-    assert!(g.node(c).unwrap().is_some(), "post-recovery commit lost");
+    fs::write(&wal, &bytes[..7]).unwrap();
+    // Reset is atomic; a torn published header is corruption, not a valid
+    // crash window. The earlier-epoch seal/snapshot window is tested separately.
+    assert!(Graph::open(&dir, config()).is_err());
+    assert_eq!(fs::read(&wal).unwrap(), &bytes[..7]);
 }
 
 #[test]

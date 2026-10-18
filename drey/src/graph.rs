@@ -128,6 +128,17 @@ impl Graph {
         })
     }
 
+    /// Clear a vector atomically with other mutations at the next commit.
+    pub fn clear_node_embedding(&mut self, node: NodeId) -> Result<()> {
+        self.ensure_writable()?;
+        self.store
+            .nodes
+            .get_mut(&node.0)
+            .ok_or(Error::NodeNotFound(node))?
+            .embedding = None;
+        self.log(Mutation::ClearNodeEmbedding { node })
+    }
+
     pub fn remove_node(&mut self, node: NodeId, mode: RemoveNodeMode) -> Result<()> {
         self.ensure_writable()?;
         let remove_incident = mode == RemoveNodeMode::RemoveIncidentEdges;
@@ -369,6 +380,9 @@ pub(crate) fn validate_min_weight(min_weight: Option<f32>) -> Result<()> {
 /// mutation API and the persistence layer share one vocabulary.
 #[derive(Clone, Debug)]
 pub(crate) enum Mutation {
+    ClearNodeEmbedding {
+        node: NodeId,
+    },
     RegisterNodeType {
         node_type: NodeType,
         embedding_dim: Option<usize>,
