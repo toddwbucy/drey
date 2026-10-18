@@ -115,8 +115,11 @@ impl Store {
         properties: Properties,
     ) -> Result<NodeId> {
         let id = self.next_node_id;
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| Error::ResourceLimit("node ID space exhausted".into()))?;
         self.insert_node_checked(id, node_type, properties)?;
-        self.next_node_id += 1;
+        self.next_node_id = next;
         Ok(NodeId(id))
     }
 
@@ -188,8 +191,11 @@ impl Store {
         properties: Properties,
     ) -> Result<EdgeId> {
         let id = self.next_edge_id;
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| Error::ResourceLimit("edge ID space exhausted".into()))?;
         self.insert_edge_checked(id, from, to, edge_type, weight, properties)?;
-        self.next_edge_id += 1;
+        self.next_edge_id = next;
         Ok(EdgeId(id))
     }
 
@@ -448,6 +454,20 @@ impl Store {
             .or_default()
             .push(id);
         self.edges.insert(id, rec);
+    }
+
+    /// Rebuild configured property indexes after engine metadata discovery.
+    pub(crate) fn rebuild_property_indexes(&mut self) {
+        self.prop_index.clear();
+        let ids: Vec<_> = self.nodes.keys().copied().collect();
+        for id in ids {
+            let n = &self.nodes[&id];
+            let tid = n.node_type;
+            let label = NodeType::new(self.node_types.label(tid).unwrap());
+            let props = n.properties.clone();
+            self.index_node_properties(tid, &label, id, &props);
+        }
+        self.sort_indexes();
     }
 
     /// After raw inserts, adjacency/type buckets are in insertion order. Sort

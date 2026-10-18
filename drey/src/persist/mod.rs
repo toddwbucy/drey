@@ -6,7 +6,9 @@
 //! - `wal.log` — framed mutation records since the snapshot, terminated by
 //!   commit markers.
 //!
-//! Open replays `snapshot.bin` then the WAL up to its last commit marker.
+//! Format 4 validates `commit.seal` (epoch, committed WAL length and SHA-256)
+//! before replay or repair. Corrupt acknowledged bytes refuse unchanged.
+//! Open replays `snapshot.bin` then the sealed WAL prefix.
 //! Records after the last commit marker are an incomplete commit and are
 //! discarded, which is what makes the recovery matrix (PRD §10.2.1) hold.
 //!
@@ -19,6 +21,8 @@
 //! operation offer fsync-backed durability at the turn/consolidation boundary.
 
 mod codec;
+mod seal;
+use sha2::{Digest, Sha256};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -50,7 +54,9 @@ use crate::types::{EdgeId, EdgeType, NodeId, NodeType, Value};
 /// every acknowledged commit since the snapshot; the CRC turns that into a clean
 /// load-time `Codec` error. v2 WALs (16-byte header, no CRC) fail cleanly with
 /// `VersionMismatch`.
-pub const FORMAT_VERSION: u32 = 3;
+/// v4: mandatory independently published commit seal protects the entire
+/// acknowledged WAL prefix, including frame lengths. Snapshot payload unchanged.
+pub const FORMAT_VERSION: u32 = 4;
 
 const MAGIC: &[u8; 4] = b"DREY";
 const SNAPSHOT_FILE: &str = "snapshot.bin";
@@ -96,6 +102,8 @@ pub(crate) mod fail {
         pub static WAL_WRITE: Cell<bool> = const { Cell::new(false) };
         /// Fail the next WAL fsync in `commit`.
         pub static WAL_SYNC: Cell<bool> = const { Cell::new(false) };
+        pub static SEAL_WRITE: Cell<bool> = const { Cell::new(false) };
+        pub static SEAL_PUBLISHED: Cell<bool> = const { Cell::new(false) };
         /// Fail the post-cutover directory fsync in `snapshot`.
         pub static CUTOVER_DIR_FSYNC: Cell<bool> = const { Cell::new(false) };
     }
@@ -165,6 +173,8 @@ pub(crate) struct WalPersistence {
     /// that are not on disk, so the consumer must reopen to recover rather than
     /// keep writing behind torn or stale bytes.
     poisoned: bool,
+    wal_hash: Sha256,
+    wal_len: u64,
 }
 
 impl WalPersistence {
@@ -223,7 +233,13 @@ impl Persistence for WalPersistence {
         marker.u8(TAG_COMMIT);
         write_frame(&mut frame_buf, &marker.buf)?;
 
-        let durable = (|| -> std::io::Result<()> {
+        let mut next_hash = self.wal_hash.clone();
+        next_hash.update(&frame_buf);
+        let next_len = self
+            .wal_len
+            .checked_add(frame_buf.len() as u64)
+            .ok_or_else(|| Error::Storage("WAL length exhausted".into()))?;
+        let durable = (|| -> Result<()> {
             // The injected write failure is TORN: part of the frame reaches the
             // file before the "device" errors, so the fault test's reopen also
             // exercises truncation-to-last-good-prefix through a realistic tail.
@@ -233,19 +249,22 @@ impl Persistence for WalPersistence {
             #[cfg(test)]
             if fail::hit(&fail::WAL_WRITE).is_err() {
                 let _ = self.wal.write_all(&frame_buf[..frame_buf.len() / 2]);
-                return Err(std::io::Error::other("injected fault: torn WAL write"));
+                return Err(std::io::Error::other("injected fault: torn WAL write").into());
             }
             self.wal.write_all(&frame_buf)?;
             #[cfg(test)]
             fail::hit(&fail::WAL_SYNC)?;
-            self.wal.sync_all()
+            self.wal.sync_all()?;
+            seal::write(&self.dir, self.epoch, next_len, &next_hash)
         })();
         if let Err(e) = durable {
             self.poisoned = true;
-            return Err(e.into());
+            return Err(e);
         }
         // Durable now — safe to forget the batch.
         self.pending.clear();
+        self.wal_hash = next_hash;
+        self.wal_len = next_len;
         Ok(())
     }
 
@@ -259,7 +278,10 @@ impl Persistence for WalPersistence {
     fn snapshot(&mut self, store: &Store) -> Result<()> {
         // Flush anything pending first so the snapshot reflects all commits.
         self.commit()?;
-        let new_epoch = self.epoch + 1;
+        let new_epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| Error::Storage("snapshot epoch exhausted".into()))?;
         let dir = self.dir.clone();
 
         let bytes = save_snapshot(store, new_epoch);
@@ -288,6 +310,8 @@ impl Persistence for WalPersistence {
             let new_wal = OpenOptions::new().append(true).open(dir.join(WAL_FILE))?;
             self.wal = new_wal;
             self.epoch = new_epoch;
+            self.wal_hash = Sha256::new_with_prefix(wal_header(new_epoch));
+            self.wal_len = WAL_HEADER_LEN as u64;
             self.pending.clear();
             Ok(())
         })();
@@ -368,6 +392,12 @@ fn reset_wal(dir: &Path, epoch: u64) -> Result<()> {
         &wal_header(epoch),
     )?;
     fsync_dir(dir)?;
+    seal::write(
+        dir,
+        epoch,
+        WAL_HEADER_LEN as u64,
+        &Sha256::new_with_prefix(wal_header(epoch)),
+    )?;
     Ok(())
 }
 
@@ -416,6 +446,14 @@ impl Graph {
         }
         let mut graph = Graph::in_memory(config.clone());
         let locked = acquire_lock(&dir, &config)?;
+        if dir.join(SNAPSHOT_FILE).exists()
+            || dir.join(WAL_FILE).exists()
+            || dir.join(seal::FILE).exists()
+        {
+            return Err(Error::Storage(
+                "graph appeared while acquiring ownership; use open()".into(),
+            ));
+        }
         // A fresh graph starts at epoch 0; write the WAL header up front so the
         // file is always version-tagged before any frame is appended.
         reset_wal(&dir, 0)?;
@@ -427,6 +465,8 @@ impl Graph {
             pending: Vec::new(),
             _lock: locked,
             poisoned: false,
+            wal_hash: Sha256::new_with_prefix(wal_header(0)),
+            wal_len: WAL_HEADER_LEN as u64,
         }));
         graph.origin_dir = Some(dir);
         Ok(graph)
@@ -517,6 +557,7 @@ impl Graph {
             replay.epoch
         };
         let wal = OpenOptions::new().append(true).open(&wal_path)?;
+        let committed_bytes = fs::read(&wal_path)?;
         graph.persist = Some(Box::new(WalPersistence {
             dir: dir.clone(),
             wal,
@@ -524,6 +565,8 @@ impl Graph {
             pending: Vec::new(),
             _lock: locked,
             poisoned: false,
+            wal_hash: Sha256::new_with_prefix(&committed_bytes),
+            wal_len: committed_bytes.len() as u64,
         }));
         graph.origin_dir = Some(dir);
         Ok(graph)
@@ -586,7 +629,22 @@ impl Graph {
         // refine that error into the missing-snapshot diagnostic once their
         // retry policy is exhausted (`refine_generation_mismatch`).
         let bytes = fs::read(dir.join(WAL_FILE))?;
-        let replay = replay_wal(&mut graph, &bytes, snap_epoch)?;
+        let replay = match seal::verify(dir, &bytes, snap_epoch)? {
+            Some(len) => {
+                let replay = replay_wal(&mut graph, &bytes[..len], snap_epoch)?;
+                if replay.stale || replay.valid_len != len {
+                    return Err(Error::Codec(
+                        "sealed WAL does not end at a complete commit".into(),
+                    ));
+                }
+                replay
+            }
+            None => WalReplay {
+                epoch: snap_epoch,
+                valid_len: WAL_HEADER_LEN,
+                stale: true,
+            },
+        };
 
         graph.store.sort_indexes();
         graph.loaded_epoch = replay.epoch.max(snap_epoch);
@@ -648,6 +706,8 @@ impl Graph {
                 WAL_FILE,
                 WAL_TMP_FILE,
                 LOCK_FILE,
+                seal::FILE,
+                seal::TMP,
             ] {
                 let reserved = dir.join(reserved);
                 if paths_alias(path, &reserved) {
@@ -698,6 +758,32 @@ impl Graph {
     /// in-memory graph, restoring the exact id space (PRD §10.2, §22).
     pub fn import(path: impl AsRef<Path>, config: GraphConfig) -> Result<Self> {
         let bytes = fs::read(path)?;
+        let mut graph = Graph::in_memory(config);
+        let (store, epoch) = load_snapshot(&bytes, &graph.store.indexed, &graph.config)?;
+        graph.store = store;
+        graph.store.sort_indexes();
+        graph.loaded_epoch = epoch;
+        Ok(graph)
+    }
+
+    /// Explicit, read-only conversion of a v3 snapshot/export. Never opens or
+    /// repairs a legacy WAL, whose acknowledgement boundary was ambiguous.
+    /// Export the returned in-memory graph to a NEW path to retain the source.
+    pub fn import_v3_snapshot(path: impl AsRef<Path>, config: GraphConfig) -> Result<Self> {
+        let mut bytes = fs::read(path)?;
+        if bytes.len() < 8 || &bytes[..4] != MAGIC {
+            return Err(Error::Codec("invalid legacy snapshot header".into()));
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if version != 3 {
+            return Err(Error::VersionMismatch {
+                found: version,
+                supported: 3,
+            });
+        }
+        // The v4 snapshot payload is unchanged; its checksum excludes the
+        // magic/version prefix. All payload validation still runs below.
+        bytes[4..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         let mut graph = Graph::in_memory(config);
         let (store, epoch) = load_snapshot(&bytes, &graph.store.indexed, &graph.config)?;
         graph.store = store;
@@ -863,7 +949,8 @@ impl RawFrame<'_> {
 ///   in fsync'd history — and open refuses with a typed error rather than
 ///   truncating acknowledged commits away.
 ///
-/// Residual limit: damage to a frame's *length prefix* mid-file can derail the
+/// Historical v3 limit (closed by the mandatory v4 seal verified before this
+/// decoder): damage to a frame's *length prefix* mid-file can derail the
 /// structural scan itself; the scan then can't see past the damage, and the
 /// tail beyond it is treated as torn. Distinguishing that from a torn write
 /// would need per-frame sequencing — recorded as a known limit in
@@ -1089,6 +1176,13 @@ fn apply_replay(
 ) -> Result<()> {
     let store = &mut graph.store;
     match m {
+        Mutation::ClearNodeEmbedding { node } => {
+            store
+                .nodes
+                .get_mut(&node.0)
+                .ok_or(Error::NodeNotFound(node))?
+                .embedding = None;
+        }
         Mutation::RegisterNodeType {
             node_type,
             embedding_dim,
@@ -1107,7 +1201,10 @@ fn apply_replay(
             // The live add_node's gate set, with the WAL's explicit id
             // restored instead of allocated (PRD §7.4).
             store.insert_node_checked(id.0, &node_type, properties)?;
-            *max_node = (*max_node).max(id.0 + 1);
+            *max_node = (*max_node).max(
+                id.0.checked_add(1)
+                    .ok_or_else(|| Error::Codec("node ID overflow".into()))?,
+            );
         }
         Mutation::SetNodeEmbedding { node, embedding } => {
             store.set_node_embedding(node, embedding)?;
@@ -1129,7 +1226,10 @@ fn apply_replay(
         } => {
             // The live add_edge's gate set, id restored instead of allocated.
             store.insert_edge_checked(id.0, from, to, &edge_type, weight, properties)?;
-            *max_edge = (*max_edge).max(id.0 + 1);
+            *max_edge = (*max_edge).max(
+                id.0.checked_add(1)
+                    .ok_or_else(|| Error::Codec("edge ID overflow".into()))?,
+            );
         }
         Mutation::SetEdgeWeight { edge, weight } => {
             store.set_edge_weight(edge, weight)?;
@@ -1201,6 +1301,10 @@ fn read_patch(r: &mut Reader) -> Result<std::collections::BTreeMap<String, Optio
 
 fn write_mutation(w: &mut Writer, m: &Mutation) {
     match m {
+        Mutation::ClearNodeEmbedding { node } => {
+            w.u8(10);
+            w.u64(node.0);
+        }
         Mutation::RegisterNodeType {
             node_type,
             embedding_dim,
@@ -1296,6 +1400,9 @@ fn write_mutation(w: &mut Writer, m: &Mutation) {
 
 fn read_mutation(r: &mut Reader) -> Result<Mutation> {
     Ok(match r.u8()? {
+        10 => Mutation::ClearNodeEmbedding {
+            node: NodeId(r.u64()?),
+        },
         0 => {
             let node_type = NodeType::new(r.str()?);
             let embedding_dim = match r.u8()? {
@@ -2129,7 +2236,15 @@ mod tests {
     fn open_with_wal(name: &str, muts: &[Mutation]) -> Result<Graph> {
         let dir = tmp(name);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(WAL_FILE), wal_bytes(0, muts)).unwrap();
+        let bytes = wal_bytes(0, muts);
+        fs::write(dir.join(WAL_FILE), &bytes).unwrap();
+        seal::write(
+            &dir,
+            0,
+            bytes.len() as u64,
+            &Sha256::new_with_prefix(&bytes),
+        )
+        .unwrap();
         Graph::open(&dir, GraphConfig::default())
     }
 
@@ -2304,6 +2419,13 @@ mod tests {
         wal.extend_from_slice(&[0u8; 16]);
         wal.extend_from_slice(&marker);
         fs::write(dir.join(WAL_FILE), &wal).unwrap();
+        seal::write(
+            &dir,
+            0,
+            WAL_HEADER_LEN as u64,
+            &Sha256::new_with_prefix(wal_header(0)),
+        )
+        .unwrap();
         let g = Graph::open(&dir, GraphConfig::default())
             .unwrap_or_else(|e| panic!("zeroed torn commit must recover, got {e}"));
         assert_eq!(g.counts(), (0, 0), "the torn batch must be discarded");
@@ -2319,6 +2441,7 @@ mod tests {
         wal.extend_from_slice(&frame_of(&add(0)));
         wal.extend_from_slice(&marker);
         fs::write(dir.join(WAL_FILE), &wal).unwrap();
+        seal::write(&dir, 0, wal.len() as u64, &Sha256::new_with_prefix(&wal)).unwrap();
         match Graph::open(&dir, GraphConfig::default()) {
             Err(Error::Codec(m)) => assert!(m.contains("acknowledged"), "{m}"),
             Err(other) => panic!("expected Codec refusal, got {other}"),

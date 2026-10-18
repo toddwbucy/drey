@@ -30,6 +30,7 @@ mod persist;
 mod store;
 
 pub mod config;
+pub mod engine;
 pub mod error;
 pub mod export;
 pub mod mutation;

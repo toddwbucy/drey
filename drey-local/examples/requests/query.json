@@ -1,0 +1,53 @@
+{
+  "op": "query",
+  "query": {
+    "selection": {
+      "select": "type",
+      "node_type": "passage"
+    },
+    "filters": [
+      {
+        "key": "category",
+        "predicate": {
+          "eq": {
+            "String": "demo"
+          }
+        }
+      }
+    ],
+    "rank": {
+      "vector": {
+        "space": {
+          "model": "example",
+          "revision": "1",
+          "dimensions": 2,
+          "metric": "cosine",
+          "unit_normalized": false
+        },
+        "values": [
+          1.0,
+          0.0
+        ]
+      },
+      "k": 5
+    },
+    "limit": 5,
+    "expand": {
+      "direction": "Outbound",
+      "edge_types": [
+        "supports"
+      ],
+      "max_hops": 1,
+      "min_weight": null
+    },
+    "projection": {
+      "fields": null,
+      "document": true
+    },
+    "related_projection": {
+      "fields": null,
+      "document": true
+    },
+    "work_limit": null
+  }
+}

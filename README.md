@@ -1,8 +1,14 @@
 # drey
 
-An embedded property graph for Rust. For when your data is local and you need it in-process.
+An embedded, RAM-first property graph for Rust, with an optional local engine service.
 
-drey links into your process as a library and holds the working graph in memory. Nodes and edges are typed and carry properties, edges carry mutable weights, and a single query can compose traversal, property predicates, and vector similarity over stored embeddings. The graph persists to a local path your process owns and reloads with the same durable IDs it saved. There is no server, no daemon, no network listener, no service account, and nothing to operate. One process, one graph, single writer.
+drey links into your process as a library and holds the working graph in memory. Nodes and edges are typed and carry properties, edges carry mutable weights, and a single query can compose traversal, property predicates, and vector similarity over stored embeddings. The graph persists to a local path your process owns and reloads with the same durable IDs it saved. One process, one graph, single writer. The optional `drey-local` service exposes the same resident engine through Unix sockets on Linux; it has no TCP or HTTP listener.
+
+## Local engine v1
+
+`drey::engine::Engine` adds atomic durable batches, persistent retry tokens, embedding-space validation, intact JSON documents, and bounded combined retrieval. `drey-local` supplies a versioned Rust client and command-line client, lifecycle operations, and serialized requests from one application's foreground and background connections.
+
+Read the [implemented contract](docs/specs/local-engine-v1.md) for runnable request examples, limits, failures, and the distinction between library primitives and engine batches. [Reproducible service measurements](docs/specs/local-engine-v1-evidence/README.md) include full retrieval responses and background durable writes. Weaver's schema, SQLite relationship, and actual inference timing remain integration decisions.
 
 ## Embeddings live on the node
 
@@ -10,7 +16,7 @@ The embedding is part of the node record, not a companion system. Each node type
 
 That co-location is a latency and correctness position, not a storage detail:
 
-- **Recall is a function call.** No network hop, no serialization, no separate vector service. Structural filters are hash and index lookups; scoring is a linear pass over `f32` slices already in RAM. Measured end-to-end: sub-millisecond at 100 candidates, ~4 ms at 1,000 (dim 1024, representative fixture - see [`docs/specs/m3-findings.md`](docs/specs/m3-findings.md)).
+- **Embedded recall is a function call.** Structural filters use resident indexes; scoring is a linear pass over `f32` slices already in RAM. The optional service adds socket transport and serialization. Historical library measurements are in [`docs/specs/m3-findings.md`](docs/specs/m3-findings.md); they do not measure the service round trip.
 - **Filters run first, and the result is exact.** A similarity query composes node-type, property, and reachability filters *before* scoring, so it returns the true top-k of the filtered set - not an over-fetched approximation from a vector store, intersected with the graph after the fact.
 - **One commit domain.** The embedding and the structure it belongs to go through the same write-ahead log and the same `commit`. There is no vector-store/graph-store drift to reconcile, because there is only one store.
 
@@ -18,7 +24,9 @@ Similarity is a bounded exhaustive scan by design: exact, deterministic, no inde
 
 ## Durability
 
-`commit` is an fsync-backed durability point. Persistence is a CRC-framed write-ahead log plus snapshots, with a hand-rolled binary encoding for byte-exact `f32`/`Bytes` round-trips, crash-safe OS advisory locking, and recovery that loads the last committed state or fails explicitly - never a silent partial load. A persister that hits a durable-write failure poisons itself: reads keep working, writes refuse until reopen, and `commit` never reports durability it did not achieve. `NodeId`/`EdgeId` survive close and reopen exactly.
+`commit` is an fsync-backed durability point. Format 4 combines CRC-framed WAL records and snapshots with an independently published SHA-256 commit seal. Recovery validates acknowledged bytes before replay or truncation. Durable internal IDs and byte-exact `f32`/`Bytes` values survive reopen. A failed persister refuses further writes; the higher-level engine refuses both reads and writes until recovery, preventing uncertain batch state from being served.
+
+Format 3 database directories are refused unchanged. `Graph::import_v3_snapshot` explicitly converts a trusted legacy snapshot/export in memory, preserving the source and IDs; legacy WAL recovery and mapping a graph into an engine schema are separate migration steps. See the [format and migration contract](docs/specs/local-engine-v1.md#persistence-format-4-and-recovery).
 
 ## Status
 

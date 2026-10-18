@@ -1,0 +1,57 @@
+{
+  "op": "write",
+  "batch": {
+    "token": "example-batch-1",
+    "operations": [
+      {
+        "op": "create_node",
+        "key": "passage",
+        "node_type": "passage",
+        "properties": {
+          "category": {
+            "String": "demo"
+          }
+        },
+        "document": "{\"content\":\"An intact example\", \"nested\":[null,{\"keep\":true}]}",
+        "embedding": {
+          "space": {
+            "model": "example",
+            "revision": "1",
+            "dimensions": 2,
+            "metric": "cosine",
+            "unit_normalized": false
+          },
+          "values": [
+            0.8,
+            0.2
+          ]
+        }
+      },
+      {
+        "op": "create_node",
+        "key": "source",
+        "node_type": "source",
+        "properties": {
+          "uri": {
+            "String": "example://source"
+          }
+        },
+        "document": null,
+        "embedding": null
+      },
+      {
+        "op": "create_edge",
+        "key": "support",
+        "from": {
+          "created": "passage"
+        },
+        "to": {
+          "created": "source"
+        },
+        "edge_type": "supports",
+        "weight": 1.0,
+        "properties": {}
+      }
+    ]
+  }
+}

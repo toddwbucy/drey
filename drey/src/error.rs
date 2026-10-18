@@ -20,6 +20,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// Malformed or unsupported engine request; no batch was applied.
+    InvalidRequest(String),
+    /// A configured bound was exceeded; no partial results are returned.
+    ResourceLimit(String),
+    /// A durable retry token was reused with a different payload.
+    Conflict(String),
+    /// The engine cannot serve until it has been reopened after an I/O failure.
+    Unavailable(String),
     /// A persistence/storage-layer failure (I/O, etc.).
     Storage(String),
     /// Encoding or decoding of the on-disk format failed.
@@ -57,6 +65,10 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::InvalidRequest(m) => write!(f, "invalid request: {m}"),
+            Error::ResourceLimit(m) => write!(f, "resource limit: {m}"),
+            Error::Conflict(m) => write!(f, "conflict: {m}"),
+            Error::Unavailable(m) => write!(f, "unavailable: {m}"),
             Error::Storage(m) => write!(f, "storage error: {m}"),
             Error::Codec(m) => write!(f, "codec error: {m}"),
             Error::NodeNotFound(id) => write!(f, "node not found: {id:?}"),

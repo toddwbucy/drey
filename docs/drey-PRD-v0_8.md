@@ -1,5 +1,13 @@
 # drey: Embedded Graph Substrate Crate
 
+> **2026-10-18 extension:** [Local engine/service contract v1](specs/local-engine-v1.md)
+> governs the issue #29 engine milestone: atomic durable batches, explicit vector
+> spaces, a bounded typed combined query, and an optional Linux Unix-socket owner.
+> It supersedes embedded-only/query-layer-deferred wording for those components.
+> The existing Graph API remains the lower-level primitive; the core stays RAM-first,
+> synchronous, single-owner, and independent of all consumer meaning and policy.
+
+
 Status: PRD draft v0.8, 2026-07-02. Independent project. The crate is named
 `drey` (renamed 2026-07-02 from the working name `weaver-graph`). The crate is
 developed on its own track and integrated by consumers, WeaverTools among

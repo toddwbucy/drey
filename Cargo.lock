@@ -51,6 +51,18 @@ name = "drey"
 version = "0.0.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "drey-local"
+version = "0.1.0"
+dependencies = [
+ "drey",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -79,6 +91,7 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "drey",
+ "drey-local",
  "rand",
  "rand_xoshiro",
  "serde",
