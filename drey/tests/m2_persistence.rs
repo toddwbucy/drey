@@ -861,6 +861,72 @@ fn empty_committed_graph_roundtrips() {
 
 // ---- Regression coverage: issue #22 + 2026-07 repo review ----
 
+/// Issue #26: a damaged length can swallow a mutation and realign at the final
+/// marker. The v3 classifier could discard both acknowledged batches as a torn
+/// tail; v4 must refuse without repairing any persistence file.
+#[test]
+fn acknowledged_wal_length_realignment_refuses_without_modifying_history() {
+    let dir = tmp("length_realignment");
+    let first_end;
+    {
+        let mut g = Graph::create(&dir, config()).unwrap();
+        g.register_node_type(person(), None).unwrap();
+        g.snapshot().unwrap();
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+        first_end = fs::metadata(dir.join("wal.log")).unwrap().len() as usize;
+        g.add_node(person(), props(&[])).unwrap();
+        g.commit().unwrap();
+    }
+    assert_eq!(
+        Graph::open(&dir, config().read_only()).unwrap().counts(),
+        (2, 0)
+    );
+
+    let wal_path = dir.join("wal.log");
+    let mut wal = fs::read(&wal_path).unwrap();
+    let snapshot = fs::read(dir.join("snapshot.bin")).unwrap();
+    let seal = fs::read(dir.join("commit.seal")).unwrap();
+    // Each commit ends in len(4) + crc(4) + the one-byte marker payload.
+    let first_marker = first_end - 9;
+    let final_marker = wal.len() - 9;
+    for offset in [first_marker, final_marker] {
+        assert_eq!(&wal[offset..offset + 4], &1u32.to_le_bytes());
+    }
+    let next_len = u32::from_le_bytes(wal[first_end..first_end + 4].try_into().unwrap());
+    assert_eq!(first_end + 8 + next_len as usize, final_marker);
+
+    // Change only M1's length: [m1][M1][m2][M2] becomes [m1][M1+m2][M2].
+    // The new boundary lands exactly on intact M2, not beyond EOF. Leave the
+    // original CRC and seal intact, as a length-prefix corruption would.
+    let swallowed_len = u32::try_from(final_marker - first_marker - 8).unwrap();
+    assert!(swallowed_len > 1);
+    wal[first_marker..first_marker + 4].copy_from_slice(&swallowed_len.to_le_bytes());
+    fs::write(&wal_path, &wal).unwrap();
+
+    for cfg in [config().read_only(), config()] {
+        match Graph::open(&dir, cfg) {
+            Err(Error::Codec(message)) => assert!(message.contains("acknowledged"), "{message}"),
+            Err(other) => panic!("expected acknowledged-corruption refusal, got {other}"),
+            Ok(g) => panic!(
+                "realigned corruption silently accepted with {} nodes",
+                g.counts().0
+            ),
+        }
+        assert_eq!(fs::read(&wal_path).unwrap(), wal, "WAL changed on refusal");
+        assert_eq!(
+            fs::read(dir.join("snapshot.bin")).unwrap(),
+            snapshot,
+            "snapshot changed on refusal"
+        );
+        assert_eq!(
+            fs::read(dir.join("commit.seal")).unwrap(),
+            seal,
+            "seal changed on refusal"
+        );
+    }
+}
+
 #[test]
 fn mid_wal_corruption_in_acknowledged_batch_fails_open_without_truncation() {
     // Issue #22 item 7: three committed batches; a bit flips inside batch 2's

@@ -116,6 +116,17 @@ not certify hardware power-loss behavior or detect restoration of an entire cohe
 older backup. Checksums are corruption detection, not authentication against a process
 that can rewrite all database files.
 
+The supported service target is Linux, with filesystems/devices that honor the
+file and directory synchronization used above. The embedded crate's non-Unix
+`fsync_dir` is currently a no-op, so equivalent crash durability is not established
+there. Every nonempty v4 commit publishes a seal; avoiding checkpoints does not
+remove that publication dependency. Losing a new seal can make recovery accept an
+older prefix and discard newer WAL bytes. The remaining work in
+[issue #26](https://github.com/toddwbucy/drey/issues/26) covers a complete platform
+publication/recovery protocol, including seal publication and safe generation
+retention, before any such guarantee. See the
+[platform scope](m2-durability.md#platform-durability-scope-current-v4-issue-26).
+
 Version 3 directories are refused without modification. For a trusted v3 snapshot or
 export, `Graph::import_v3_snapshot` validates and converts it in memory; export to a
 new path to retain the original. It never opens or repairs an ambiguous legacy WAL.

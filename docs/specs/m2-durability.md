@@ -9,9 +9,15 @@ of that exact prefix. Commit fsyncs the WAL, atomically publishes/fsyncs the sea
 and only then acknowledges. Recovery validates the complete prefix before replay
 or truncation. Corrupt acknowledged lengths, payloads, final markers, or headers
 now refuse without changing history; only bytes beyond a valid seal are discarded.
-This resolves the length-prefix loss reproduced in issue #29. Version-3 directories
-are refused explicitly; `Graph::import_v3_snapshot` provides a read-only snapshot
-conversion bridge without guessing about legacy WAL acknowledgements.
+PR #30 resolves the length-prefix loss from issues #26 and #29. Frame CRCs remain
+payload-only; the seal supplies protection for the complete committed byte sequence.
+`acknowledged_wal_length_corruption_refuses_without_modifying_history` in
+`drey/tests/engine.rs` covers scan derailment;
+`acknowledged_wal_length_realignment_refuses_without_modifying_history` in
+`drey/tests/m2_persistence.rs` covers swallowing a frame and landing on the final
+marker, with unchanged WAL, snapshot, and seal after writable and read-only refusal.
+Version-3 directories are refused explicitly; `Graph::import_v3_snapshot` provides
+a read-only snapshot conversion bridge without guessing about legacy WAL acknowledgements.
 
 Open first reads the snapshot prefix, WAL header and validated commit seal. A
 seal newer than the snapshot prefix rejects before record decoding, including
@@ -21,9 +27,9 @@ stale WAL still requires the complete snapshot checksum and structural validatio
 replay still requires the sealed WAL hash. Header and body reads use the same file
 handle so a concurrent rename cannot mix snapshot images.
 
-The remaining text records the original design and format evolution. Where it
-classifies damage from following frames alone or describes a remaining length-prefix
-limitation, that is historical behavior before the v4 seal, not current recovery.
+The sections below retain the original design and format evolution, with current
+platform and migration notes. Classification based on following frames alone is
+historical v1-v3 behavior; the v4 seal governs current recovery.
 
 
 Status: retroactive record, 2026-07-03; revised 2026-07-16 for the issue #22 /
@@ -54,23 +60,37 @@ Supporting guarantees, all load-bearing for the level above:
 - `export` uses the same temp+fsync+rename discipline, so a failed export
   cannot destroy the previous export at the destination path.
 
-Platform note: directory fsync is a POSIX durability point; on non-Unix
-targets `fsync_dir` is a no-op (Windows cannot open a directory via
-`File::open`, and NTFS handles rename durability through its journal). File
-contents are still fsynced everywhere; the rename-durability guarantee above
-is formally Unix-only. **Concretely, off Unix the snapshot cutover's ordering
-premise does not hold**: the WAL re-header can become durable while the
-snapshot rename is lost to a power cut (exFAT; NTFS is saved only by its own
-journal ordering), leaving `snapshot(N) + WAL(N+1)` on disk — a state the
-generation gate then refuses on every open (`GenerationMismatch`), with the
-pre-rotation commits unrecoverable because the old WAL was reset. On non-Unix
-targets, treat `snapshot()` as carrying this residual risk (or avoid it and
-rely on WAL-only durability + `export` for compaction); a structural fix
-(epoch-named WAL files, so the old WAL survives until the new generation is
-verifiably durable) is a format change deferred until a non-Unix consumer
-exists. This is also the third possible cause of `GenerationMismatch`,
-alongside a backup-restored older snapshot and a lock-free read racing a
-rotation.
+### Platform durability scope (current v4; issue #26)
+
+The local service targets Linux. On Unix, `fsync_dir` synchronizes the containing
+directory after publication; the crash-durability contract assumes the filesystem
+and device honor file and directory synchronization. CI exercises Linux, and the
+failure-injection/process-kill tests do not certify hardware power-loss behavior.
+
+On non-Unix targets, `fsync_dir` returns success without synchronizing directory
+metadata. The core does not enforce a platform refusal, but equivalent crash
+durability is not established. Two publication failures matter:
+
+- Losing a snapshot rename after replacing the WAL and seal can leave
+  `snapshot(N) + WAL/seal(N+1)`. Recovery refuses the mismatched generations, but
+  cannot reconstruct pre-checkpoint commits whose old WAL has been replaced.
+- Losing a newer seal's publication while retaining its WAL bytes can leave a
+  valid older seal in the same epoch. Recovery accepts that older prefix and
+  treats the newer bytes as unacknowledged; writable open truncates them. The
+  seal checksum does not establish that the latest acknowledged seal survived.
+
+Thus v4 depends on durable seal publication on every nonempty commit. Avoiding
+snapshots and using WAL-only writes does not remove this dependency. No filesystem
+journal is assumed to supply ordering missing from the implementation.
+
+Issue #26's length-corruption objective is satisfied by PR #30. Its remaining
+platform work is deferred until a non-Unix consumer or a release promising format
+stability, whichever comes first. Epoch-named WAL files remain a candidate for
+retaining pre-checkpoint history, but require a complete snapshot/WAL/seal
+publication protocol, recovery-generation selection, safe pruning, and platform
+crash tests before equivalent durability can be claimed. They do not by themselves
+solve ordinary commit-seal publication. No additional format bump is required for
+the already protected length prefixes.
 
 ### Export preconditions (issue #22 item 4 / review)
 
@@ -147,15 +167,14 @@ the structure:
   The repair truncation is in-place (`set_len`), so the discarded
   unacknowledged tail is not preserved; copy `wal.log` aside before a
   writable open if the torn tail has forensic value.
-  Known limit - length prefixes are outside the frame CRC, so prefix damage
+  **Historical v3 limit:** length prefixes are outside the frame CRC, so prefix damage
   has two forms: scan *derailment* (everything beyond is unreachable and
   treated as torn tail), and - rarer, needing the mutated length to land
   exactly on a later frame boundary - clean *realignment* that swallows a
   following frame and can classify acknowledged damage as a torn final
-  commit, silently truncating it. Both forms close only by covering the
-  prefix in the frame CRC or adding per-frame sequence numbers - format
-  changes deferred (this branch deliberately ships format-compatible);
-  revisit at the next FORMAT_VERSION bump.
+  commit, silently truncating it. Issue #26 proposed extending the frame CRC or
+  adding per-frame sequence numbers. V4 instead verifies the complete sealed
+  prefix before this classifier runs, closing both forms of acknowledged loss.
   Threat-model note: appending batch N+1 rewrites the final filesystem block
   shared with batch N's fsynced tail, so on media without powersafe
   overwrite (SQLite's `POWERSAFE_OVERWRITE` concern) an ordinary power loss
@@ -219,13 +238,15 @@ CRC32 and the float round-trip).
 | 1 | Initial WAL+snapshot format | M2 |
 | 2 | Snapshot trailing CRC | PR #9 (issue #5 remediation) |
 | 3 | WAL header CRC (epoch protection) | PR #17 (ultrareview) |
+| 4 | Mandatory commit seal: epoch, committed WAL length and SHA-256, including frame lengths | PR #30 (local engine) |
 
 **There is no in-place migration.** `open` on an older-version graph fails
-explicitly with `VersionMismatch`; the upgrade path is export from a build
-that reads the old format, import into the new. This is a deliberate v0.x
-posture - migration machinery is weight (design commitment 4) that
-pre-release format churn does not justify. Revisit before the first release
-that promises format stability.
+explicitly with `VersionMismatch`. For a trusted v3 snapshot/export,
+`Graph::import_v3_snapshot` validates and converts the image in memory; export to
+a new path to preserve the original. It does not replay or repair a legacy WAL,
+or map a graph image into an engine schema. Ordinary `import` does not migrate
+older formats. This remains a deliberate v0.x posture; revisit migration
+machinery before the first release that promises format stability.
 
 ## Locking
 
